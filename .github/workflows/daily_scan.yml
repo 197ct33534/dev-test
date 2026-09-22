@@ -1,0 +1,114 @@
+# Daily EPL Value Bet scanner → Telegram (no Streamlit UI).
+#
+# Runs twice per day (UTC), roughly 2h before typical PL afternoon / evening slots.
+# Required GitHub Secrets:
+#   TELEGRAM_BOT_TOKEN
+#   TELEGRAM_CHAT_ID
+# Optional Secrets / Variables:
+#   BANKROLL, MIN_EV, KELLY_FRACTION, N_SEASONS, N_TRAIN, USE_ML, ALLOWED_MARKETS
+
+name: Daily EPL Value Scan
+
+on:
+  schedule:
+    # 11:00 UTC ≈ 2h before many 13:00 UK kicks (BST) / early Saturday block
+    - cron: "0 11 * * *"
+    # 17:00 UTC ≈ 2h before 19:00–20:00 UK evening fixtures
+    - cron: "0 17 * * *"
+  workflow_dispatch:
+    inputs:
+      force_refresh:
+        description: "Force re-download football-data / odds"
+        type: boolean
+        default: true
+      dry_run:
+        description: "Print only — do not send Telegram"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: epl-daily-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    name: Scan & Telegram alert
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install system libs (LightGBM)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgomp1
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ensure data directory
+        run: mkdir -p data
+
+      - name: Restore SQLite (history + paper journal)
+        uses: actions/cache@v4
+        with:
+          path: data/epl_matches.db
+          # One shared cache key so PENDING bets / CLV survive across daily runs
+          key: epl-sqlite-${{ runner.os }}-v1
+          restore-keys: |
+            epl-sqlite-${{ runner.os }}-
+
+      - name: Run auto scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BANKROLL: ${{ vars.BANKROLL }}
+          MIN_EV: ${{ vars.MIN_EV }}
+          KELLY_FRACTION: ${{ vars.KELLY_FRACTION }}
+          N_SEASONS: ${{ vars.N_SEASONS }}
+          N_TRAIN: ${{ vars.N_TRAIN }}
+          XI: ${{ vars.XI }}
+          USE_ML: ${{ vars.USE_ML }}
+          W_ML: ${{ vars.W_ML }}
+          MIN_ODDS: ${{ vars.MIN_ODDS }}
+          MAX_ODDS: ${{ vars.MAX_ODDS }}
+          ALLOWED_MARKETS: ${{ vars.ALLOWED_MARKETS }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
+          EXTRA_ARGS="--force-refresh"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.force_refresh }}" != "true" ]; then
+              EXTRA_ARGS=""
+            fi
+            if [ "${{ inputs.dry_run }}" = "true" ]; then
+              EXTRA_ARGS="${EXTRA_ARGS} --dry-run"
+            fi
+          fi
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            EXTRA_ARGS="--force-refresh"
+          fi
+          echo "Running: python scripts/auto_scanner.py ${EXTRA_ARGS}"
+          python scripts/auto_scanner.py ${EXTRA_ARGS}
+
+      - name: Upload SQLite artifact (debug / backup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: epl-matches-db-${{ github.run_id }}
+          path: data/epl_matches.db
+          if-no-files-found: ignore
+          retention-days: 30

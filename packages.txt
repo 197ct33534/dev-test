@@ -1,0 +1,2 @@
+# Apt packages for Streamlit Community Cloud (LightGBM needs OpenMP)
+libgomp1

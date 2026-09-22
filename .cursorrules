@@ -1,0 +1,26 @@
+# EPL Value Betting & Corner Recommender System
+
+## Project Overview
+This project predicts Premier League match outcomes, goal distributions, and corner counts using statistical models (Dixon-Coles Poisson model) and identifies Value Bets by comparing model probabilities against bookmaker odds.
+
+## Tech Stack
+- **Language**: Python 3.10+
+- **Data & Math**: Pandas, NumPy, SciPy (`scipy.optimize.minimize`), Statsmodels
+- **UI Framework**: Streamlit
+- **Data Source**: Direct CSV download from `football-data.co.uk`
+
+## Core Domain Logic
+1. **Dixon-Coles Model**:
+   - Predicts goals for Home (\(X\)) and Away (\(Y\)) teams using attack/defense strengths and home advantage (\(\gamma\)).
+   - Uses tau adjustment \(\tau(x, y)\) for low scores (0-0, 1-0, 0-1, 1-1) with parameter \(\rho\).
+2. **Value Betting Engine**:
+   - Fair Odds = \(1 / P_{\text{model}}\)
+   - Expected Value (\(\text{EV}\)) = \((P_{\text{model}} \times \text{Odds}_{\text{bookmaker}}) - 1\)
+   - Recommend bet ONLY when \(\text{EV} \ge 0.05\) (\(5\%\)).
+3. **Corner Prediction**:
+   - Poisson regression based on 3-season home/away corner stats (`HC`, `AC`).
+
+## Coding Conventions
+- Use clean, modular Python functions with Type Hints.
+- Document functions using Docstrings describing math parameters (e.g., \(\lambda\), \(\mu\), \(\rho\)).
+- Keep Streamlit UI logic (`app.py`) separate from statistical calculation modules (`src/`).
