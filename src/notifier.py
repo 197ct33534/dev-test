@@ -231,3 +231,67 @@ def send_telegram_value_bets(
             errors.append(msg)
 
     return {"sent": sent, "skipped": skipped, "errors": errors}
+
+
+def format_recheck_summary(
+    *,
+    league: str = "EPL",
+    settled: int = 0,
+    wins: int = 0,
+    losses: int = 0,
+    pushes: int = 0,
+    session_pnl: float = 0.0,
+    hit_rate: float | None = None,
+    realised_pnl: float | None = None,
+    roi: float | None = None,
+    avg_clv: float | None = None,
+    brier: float | None = None,
+    retrain_ok: bool | None = None,
+    retrain_detail: str | None = None,
+    skipped: int = 0,
+) -> str:
+    """Short HTML Telegram summary after post-match recheck / retrain."""
+    tag = str(league or "EPL").strip().upper() or "EPL"
+    decided = int(wins) + int(losses)
+    if hit_rate is None:
+        hit = (float(wins) / decided) if decided else float("nan")
+    else:
+        hit = float(hit_rate)
+
+    def _pct(x: float | None, digits: int = 1) -> str:
+        if x is None or x != x:  # NaN
+            return "n/a"
+        return f"{float(x) * 100.0:+.{digits}f}%"
+
+    def _num(x: float | None, digits: int = 2) -> str:
+        if x is None or x != x:
+            return "n/a"
+        return f"{float(x):+.{digits}f}"
+
+    def _brier(x: float | None) -> str:
+        if x is None or x != x:
+            return "n/a"
+        return f"{float(x):.3f}"
+
+    hit_s = f"{hit * 100:.0f}%" if hit == hit else "n/a"
+    pnl_show = realised_pnl if realised_pnl is not None else session_pnl
+    lines = [
+        f"📊 <b>[{tag} Recheck]</b>",
+        (
+            f"Settled: <b>{int(settled)}</b> "
+            f"({int(wins)}W/{int(losses)}L/{int(pushes)}P) · Hit <b>{hit_s}</b>"
+        ),
+        f"PnL: <b>{_num(pnl_show)}</b> · ROI: <b>{_pct(roi)}</b>",
+        f"Avg CLV: <b>{_pct(avg_clv)}</b> · Brier: <b>{_brier(brier)}</b>",
+    ]
+    if skipped:
+        lines.append(f"Skipped (no result yet): {int(skipped)}")
+    if retrain_ok is True:
+        detail = retrain_detail or "DC + LGBM"
+        lines.append(f"Retrain: <b>OK</b> ({detail})")
+    elif retrain_ok is False:
+        detail = retrain_detail or "failed"
+        lines.append(f"Retrain: <b>FAIL</b> — {detail}")
+    elif retrain_ok is None and retrain_detail:
+        lines.append(f"Retrain: {retrain_detail}")
+    return "\n".join(lines)

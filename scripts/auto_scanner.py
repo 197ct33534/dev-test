@@ -53,16 +53,20 @@ from src.config import (
     DEFAULT_KELLY_FRACTION,
     DEFAULT_MIN_EV,
     DEFAULT_W_ML,
+    MAX_BETS_PER_DAY,
     MAX_STAKE_PCT,
 )
 from src.dixon_coles import DixonColesModel
 from src.journal import (
     add_recommendations_to_journal,
+    count_bets_on_vn_day,
+    snapshot_closing_odds_near_kickoff,
     sync_closing_odds_from_results,
 )
 from src.models import ensemble_weight_for_sample
 from src.notifier import send_telegram_message, send_telegram_value_bets
 from src.recommender import recommend_upcoming
+from src.strategy import select_value_bets
 
 logging.basicConfig(
     level=logging.INFO,
@@ -194,8 +198,8 @@ def scan_value_bets(
     use_ml: bool,
     w_ml: float,
     markets: tuple[str, ...],
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load data, fit models, return (recommendations, full_history_for_clv)."""
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Load data, fit models, return (recommendations, history, fixtures)."""
     code = normalize_league(league)
     db_path = league_db_path(code)
     print(
@@ -255,7 +259,7 @@ def scan_value_bets(
         include_ah=include_ah,
     )
     if recs.empty and "Corners" not in markets:
-        return recs, full_history
+        return recs, full_history, fixtures
 
     # Optional Ensemble override for 1X2 rows
     if (not recs.empty) and ml is not None and "1X2" in markets:
@@ -358,7 +362,7 @@ def scan_value_bets(
             print(f"      Corners scan skipped: {exc}")
 
     if recs.empty:
-        return recs, full_history
+        return recs, full_history, fixtures
 
     # Market + EV + odds band filters
     allowed = list(markets) if markets else list(goal_markets)
@@ -367,14 +371,28 @@ def scan_value_bets(
     mask &= recs["bookmaker_odds"].between(float(min_odds), float(max_odds))
     out = recs.loc[mask].copy()
     if out.empty:
-        return out, full_history
+        return out, full_history, fixtures
     out["stake"] = out["kelly_fraction"] * float(bankroll)
     # Cap stake at MAX_STAKE_PCT bankroll (same safety as strategy / backtester)
     max_stake = float(bankroll) * float(MAX_STAKE_PCT)
     out["stake"] = out["stake"].clip(upper=max_stake)
     out["kelly_fraction"] = out["stake"] / float(bankroll)
     out["kelly_pct"] = out["kelly_fraction"] * 100.0
-    return out.sort_values("ev", ascending=False).reset_index(drop=True), full_history
+
+    # Correlation filter + daily exposure cap (journal-aware slots)
+    already = count_bets_on_vn_day(db_path)
+    n_before = len(out)
+    out = select_value_bets(
+        out,
+        max_per_day=MAX_BETS_PER_DAY,
+        already_today=already,
+        one_per_match=True,
+    )
+    print(
+        f"      Risk filter: {n_before} → {len(out)} "
+        f"(1/match, top {MAX_BETS_PER_DAY}/day, already_today={already})"
+    )
+    return out.sort_values("ev", ascending=False).reset_index(drop=True), full_history, fixtures
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -395,7 +413,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"League={league} ({league_label(league)}) · DB={db_path}")
 
     try:
-        recs, history = scan_value_bets(
+        recs, history, fixtures = scan_value_bets(
             league=league,
             force_refresh=bool(args.force_refresh),
             n_seasons=n_seasons,
@@ -432,6 +450,15 @@ def main(argv: list[str] | None = None) -> int:
         )
     except Exception as exc:  # noqa: BLE001
         print(f"CLV sync skipped: {exc}")
+
+    # Near-kickoff (15–30 min) snapshot of live book odds → closing_odds
+    try:
+        snap = snapshot_closing_odds_near_kickoff(fixtures, db_path)
+        print(
+            f"Close-odds snapshot: updated={snap['updated']} skipped={snap['skipped']}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"Close-odds snapshot skipped: {exc}")
 
     n = len(recs)
     print(f"\nFound {n} Value Bet(s) after filters.")

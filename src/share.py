@@ -221,3 +221,47 @@ def pick_top_bet_for_share(
         if rec:
             pool = rec
     return max(pool, key=lambda b: float(getattr(b, "ev", float("-inf"))))
+
+
+def build_lite_share_text(
+    *,
+    home: str,
+    away: str,
+    league: str,
+    kickoff_vn: str,
+    selection: str,
+    odds: float | None,
+    ev: float | None,
+    share_url: str,
+    p_model: float | None = None,
+    fatigue_label: str | None = None,
+    insight_lines: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    """Compact Telegram/Zalo blurb for Lite Mode cards (pick-focused).
+
+    ``ev`` is a fraction (e.g. ``0.08`` → ``+8.0%``). When full 1X2 probs are
+    unavailable, falls back to a single-line pick summary. Optional
+    ``insight_lines`` (from :func:`src.strategy.generate_match_insights`) are
+    appended under a short reason header before the link.
+    """
+    lines = [
+        f"⚽ {home} vs {away}",
+        f"🏆 {league} · 🕒 {kickoff_vn}",
+    ]
+    if fatigue_label:
+        lines.append(f"😴 {fatigue_label}")
+    odds_txt = f"{float(odds):.2f}" if odds is not None else "n/a"
+    if ev is not None:
+        ev_txt = f"{float(ev):+.1%}"
+    else:
+        ev_txt = "n/a"
+    p_txt = f"{float(p_model):.0%}" if p_model is not None else "n/a"
+    lines.append(f"💎 AI pick: {selection} @ {odds_txt}")
+    lines.append(f"📊 Model {p_txt} · EV {ev_txt}")
+    cleaned = [str(x).strip() for x in (insight_lines or []) if str(x).strip()]
+    if cleaned:
+        lines.append("💡 Tại sao AI chọn cửa này?")
+        lines.extend(f"• {line}" for line in cleaned[:3])
+    lines.append(f"🔗 {share_url}")
+    lines.append("⚠️ Nghiên cứu / không đảm bảo thắng cược")
+    return "\n".join(lines)

@@ -106,9 +106,12 @@ def test_rolling_features_no_lookahead() -> None:
     assert "rolling_corners_away" in feat.columns
     assert "corner_total_avg" in feat.columns
 
-    # First appearance of a team must have NaN rolling (no prior games).
+    # Debut rows are imputed with league means (LightGBM-safe); values are
+    # finite and must not equal the *current* match's own SOT (no lookahead).
     first = feat.iloc[0]
-    assert np.isnan(first["rolling_sot_home"]) or first["rolling_sot_home"] != first["rolling_sot_home"]
+    assert np.isfinite(first["rolling_sot_home"])
+    if "HST" in data.columns and pd.notna(data.iloc[0]["HST"]):
+        assert float(first["rolling_sot_home"]) != float(data.iloc[0]["HST"])
 
     # After enough games, rolling means are finite.
     late = feat.dropna(subset=["rolling_sot_home", "rolling_corners_home"]).tail(5)

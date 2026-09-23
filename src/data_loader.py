@@ -8,18 +8,22 @@ odds comparison, and corner modelling.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -151,43 +155,131 @@ LEAGUE_CONFIG: dict[str, dict[str, object]] = {
 }
 
 
+def _resolved_league(league: str | None) -> tuple[str, dict[str, object]]:
+    """Resolve via ``config/leagues.json`` (preferred) with ``LEAGUE_CONFIG`` fallback."""
+    try:
+        from src.league_registry import resolve_league_config
+
+        return resolve_league_config(league or "EPL")
+    except Exception:
+        # Registry import / JSON failure → hardcoded EPL/UWCL only.
+        raw = str(league or "EPL").strip().upper()
+        aliases = {
+            "EPL": "EPL",
+            "PL": "EPL",
+            "PREMIER": "EPL",
+            "PREMIER LEAGUE": "EPL",
+            "E0": "EPL",
+            "UWCL": "UWCL",
+            "UWCL - UEFA WOMEN'S CHAMPIONS LEAGUE": "UWCL",
+            "WOMEN'S CHAMPIONS LEAGUE": "UWCL",
+            "UEFA WOMEN'S CHAMPIONS LEAGUE": "UWCL",
+            "WCL": "UWCL",
+        }
+        key = aliases.get(raw, raw)
+        if key not in LEAGUE_CONFIG:
+            raise ValueError(
+                f"Unsupported league={league!r}. Choose one of {list(LEAGUE_CONFIG)}"
+            ) from None
+        return key, LEAGUE_CONFIG[key]
+
+
 def normalize_league(league: str | None) -> str:
-    """Map user input → canonical league code (``EPL`` / ``UWCL``)."""
-    raw = str(league or "EPL").strip().upper()
-    aliases = {
-        "EPL": "EPL",
-        "PL": "EPL",
-        "PREMIER": "EPL",
-        "PREMIER LEAGUE": "EPL",
-        "E0": "EPL",
-        "UWCL": "UWCL",
-        "UWCL - UEFA WOMEN'S CHAMPIONS LEAGUE": "UWCL",
-        "WOMEN'S CHAMPIONS LEAGUE": "UWCL",
-        "UEFA WOMEN'S CHAMPIONS LEAGUE": "UWCL",
-        "WCL": "UWCL",
-    }
-    key = aliases.get(raw, raw)
-    if key not in LEAGUE_CONFIG:
-        raise ValueError(
-            f"Unsupported league={league!r}. Choose one of {list(LEAGUE_CONFIG)}"
-        )
-    return key
+    """Map user input → canonical league code (``EPL`` / ``UWCL`` / JSON keys)."""
+    code, _cfg = _resolved_league(league)
+    return code
+
+
+def get_league_config(league: str | None = "EPL") -> dict[str, object]:
+    """Return merged league config (JSON overlay on ``LEAGUE_CONFIG``)."""
+    _code, cfg = _resolved_league(league)
+    return cfg
 
 
 def league_db_path(league: str | None = "EPL") -> Path:
     """SQLite path for a league (EPL → ``epl_matches.db``, UWCL → ``uwcl_matches.db``)."""
-    code = normalize_league(league)
-    return Path(LEAGUE_CONFIG[code]["db_path"])  # type: ignore[arg-type]
+    cfg = get_league_config(league)
+    return Path(cfg["db_path"])  # type: ignore[arg-type]
 
 
 def league_label(league: str | None = "EPL") -> str:
-    code = normalize_league(league)
-    return str(LEAGUE_CONFIG[code]["label"])
+    return str(get_league_config(league)["label"])
+
+
+def get_team_profile_data(
+    team_id: int | str,
+    limit: int = 5,
+    *,
+    db_path: Path | str | None = None,
+    as_of: Any = None,
+    gender: str | None = None,
+    comp_id: str | None = None,
+) -> dict[str, Any]:
+    """Thin re-export of :func:`src.global_db.get_team_profile_data`."""
+    from src.global_db import get_team_profile_data as _impl
+
+    return _impl(
+        team_id,
+        limit,
+        db_path=db_path,
+        as_of=as_of,
+        gender=gender,
+        comp_id=comp_id,
+    )
+
+
+def has_team_history(
+    team_id: int | str,
+    *,
+    db_path: Path | str | None = None,
+    gender: str | None = None,
+    comp_id: str | None = None,
+) -> bool:
+    """True if any finished match exists for ``team_id`` in ``global_matches.db``.
+
+    Re-export of :func:`src.global_db.has_team_history` — single source of truth
+    for ``[⚠️ Thiếu Data Đội]`` badges.
+    """
+    from src.global_db import has_team_history as _impl
+
+    return _impl(team_id, db_path=db_path, gender=gender, comp_id=comp_id)
+
+
+def has_sufficient_team_data(
+    team_id: int | str,
+    *,
+    upcoming_date: Any = None,
+    min_matches: int = 1,
+    db_path: Path | str | None = None,
+    gender: str | None = None,
+    comp_id: str | None = None,
+) -> bool:
+    """Thin re-export of :func:`src.global_db.has_sufficient_team_data`.
+
+    Prefer :func:`has_team_history` for UI badges.
+    """
+    from src.global_db import has_sufficient_team_data as _impl
+
+    return _impl(
+        team_id,
+        upcoming_date=upcoming_date,
+        min_matches=min_matches,
+        db_path=db_path,
+        gender=gender,
+        comp_id=comp_id,
+    )
 
 
 def league_telegram_tag(league: str | None = "EPL") -> str:
-    code = normalize_league(league)
-    return str(LEAGUE_CONFIG[code]["telegram_tag"])
+    cfg = get_league_config(league)
+    return str(cfg.get("telegram_tag") or normalize_league(league))
+
+
+def get_available_leagues() -> list[dict]:
+    """Leagues available in the UI — prefers ``config/leagues.json``."""
+    from src.league_registry import get_available_leagues as _from_registry
+
+    return _from_registry()
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +552,53 @@ def db_has_matches(db_path: Path | str = DEFAULT_DB_PATH) -> bool:
         return bool(row and int(row[0]) > 0)
     except sqlite3.Error:
         return False
+
+
+def read_matches_prefer_global(
+    league: str = "EPL",
+    *,
+    seasons: Sequence[int] | None = None,
+    n_seasons: int | None = None,
+    db_path: Path | str | None = None,
+    prefer_global: bool = True,
+) -> pd.DataFrame:
+    """Read matches from ``global_matches.db`` when available, else league DB.
+
+    Compatibility adapter for Streamlit / scanner / recheck: returns the same
+    flat column layout as :func:`read_matches_from_db`. Pass
+    ``prefer_global=False`` or a concrete ``db_path`` to force the legacy file.
+    """
+    code = normalize_league(league)
+    # Explicit override → legacy path only.
+    if db_path is not None:
+        return read_matches_from_db(
+            db_path, seasons=seasons, n_seasons=n_seasons
+        )
+
+    if prefer_global:
+        try:
+            from src.global_db import (
+                GLOBAL_DB_PATH,
+                global_db_has_matches,
+                read_matches_as_legacy,
+            )
+
+            if global_db_has_matches(GLOBAL_DB_PATH, comp_id=code):
+                df = read_matches_as_legacy(
+                    GLOBAL_DB_PATH,
+                    comp_id=code,
+                    seasons=seasons,
+                    n_seasons=n_seasons,
+                )
+                if not df.empty:
+                    df.attrs["data_source"] = "sqlite_global"
+                    df.attrs["db_path"] = str(GLOBAL_DB_PATH)
+                    return df
+        except Exception:  # noqa: BLE001 — fall through to league DB
+            pass
+
+    path = league_db_path(code)
+    return read_matches_from_db(path, seasons=seasons, n_seasons=n_seasons)
 
 
 def read_matches_from_db(
@@ -756,38 +895,48 @@ def load_league_data(
     force_refresh: bool = False,
     db_path: Path | str | None = None,
 ) -> pd.DataFrame:
-    """Load historical matches for ``EPL`` or ``UWCL`` with SQLite fallback.
+    """Load historical matches for any registry league with SQLite fallback.
 
     Parameters
     ----------
     league:
-        ``EPL`` (football-data.co.uk) or ``UWCL`` (Fotmob id 9375).
+        ``EPL``, ``UWCL``, ``LALIGA``, or any key in ``config/leagues.json``.
     n_seasons / seasons / force_refresh:
         Same semantics as :func:`load_epl_data`.
     db_path:
-        Override SQLite path (default per-league: ``epl_matches.db`` /
-        ``uwcl_matches.db``).
+        Override SQLite path (default per-league). ``None`` prefers
+        ``global_matches.db`` when present.
     """
     code = normalize_league(league)
-    path = Path(db_path) if db_path is not None else league_db_path(code)
-    cfg = LEAGUE_CONFIG[code]
+    cfg = get_league_config(code)
+    path = Path(db_path) if db_path is not None else Path(cfg["db_path"])  # type: ignore[arg-type]
 
     if seasons is None:
         season_starts = list(default_season_starts(n_seasons))
     else:
         season_starts = [int(s) for s in seasons]
 
+    history_source = str(cfg.get("history_source") or "").lower()
+    if not history_source:
+        if code == "EPL" or cfg.get("fd_div"):
+            history_source = "football-data"
+        elif cfg.get("fotmob_id"):
+            history_source = "fotmob"
+        else:
+            history_source = "flashscore"
+
     def _attach_meta(
         df: pd.DataFrame,
         *,
         source: str,
         warnings: list[str] | None = None,
+        resolved_db: Path | str | None = None,
     ) -> pd.DataFrame:
         out = df.copy()
         if "league_id" not in out.columns:
             out["league_id"] = code
         out.attrs["data_source"] = source
-        out.attrs["db_path"] = str(path)
+        out.attrs["db_path"] = str(resolved_db if resolved_db is not None else path)
         out.attrs["league"] = code
         out.attrs["league_label"] = str(cfg["label"])
         out.attrs["n_matches"] = int(len(out))
@@ -795,29 +944,129 @@ def load_league_data(
             out.attrs["download_warnings"] = warnings
         return out
 
-    if not force_refresh and db_has_matches(path):
-        local = read_matches_from_db(
-            path,
-            seasons=season_starts if seasons is not None else None,
-            n_seasons=n_seasons,
-        )
-        if not local.empty:
-            return _attach_meta(local, source="sqlite_local")
+    def _persist_global(cleaned: pd.DataFrame) -> None:
+        """Best-effort upsert into global_matches.db + register competition."""
+        try:
+            from src.global_db import (
+                GLOBAL_DB_PATH,
+                connect_global_db,
+                import_legacy_matches_df,
+                upsert_competition,
+            )
+
+            weight = float(cfg.get("league_weight") or 1.0)
+            conn = connect_global_db(GLOBAL_DB_PATH, init=True)
+            try:
+                upsert_competition(conn, code, str(cfg["label"]), weight)
+                import_legacy_matches_df(conn, cleaned, comp_id=code)
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Prefer global_matches.db when present (multi-comp), else league DB.
+    # Explicit ``db_path`` skips global so callers can force a legacy file.
+    if not force_refresh:
+        if db_path is None:
+            local = read_matches_prefer_global(
+                code,
+                seasons=season_starts if seasons is not None else None,
+                n_seasons=n_seasons,
+                prefer_global=True,
+            )
+            if not local.empty:
+                src = str(local.attrs.get("data_source") or "sqlite_local")
+                resolved = local.attrs.get("db_path") or path
+                return _attach_meta(local, source=src, resolved_db=resolved)
+        elif db_has_matches(path):
+            local = read_matches_from_db(
+                path,
+                seasons=season_starts if seasons is not None else None,
+                n_seasons=n_seasons,
+            )
+            if not local.empty:
+                return _attach_meta(local, source="sqlite_local")
 
     try:
-        if code == "EPL":
-            cleaned, errors = _download_epl_seasons(season_starts)
-            cleaned["league_id"] = "EPL"
+        errors: list[str] = []
+        if history_source in {"flashscore", "flashscore+fd", "hybrid"} or (
+            history_source == "football-data"
+            and code not in LEAGUE_CONFIG
+            and cfg.get("flashscore_id")
+        ):
+            # JSON / Flashscore-id leagues (e.g. LALIGA): use fetcher module.
+            from src.fetchers.flashscore_league import (
+                fetch_league_history,
+                persist_league_matches,
+                register_league_aliases_globally,
+            )
+
+            register_league_aliases_globally(code)
+            cleaned = fetch_league_history(code, n_seasons=n_seasons)
+            errors = list(cleaned.attrs.get("download_warnings") or [])
+            if cleaned.empty:
+                raise RuntimeError(
+                    f"Flashscore/FD history empty for {code}: {'; '.join(errors) or 'no rows'}"
+                )
+            source = str(cleaned.attrs.get("data_source") or "flashscore")
+            save_matches_to_db(cleaned, path)
+            persist_league_matches(code, cleaned, also_legacy=False)
+            return _attach_meta(cleaned, source=source, warnings=errors or None)
+
+        if history_source == "football-data" or code == "EPL":
+            if code == "EPL" and (not cfg.get("fd_div") or cfg.get("fd_div") == "E0"):
+                cleaned, errors = _download_epl_seasons(season_starts)
+            else:
+                from src.fetchers.flashscore_league import _download_fd_div_seasons
+
+                cleaned, errors = _download_fd_div_seasons(
+                    str(cfg["fd_div"]), season_starts, league_key=code
+                )
+                if cleaned.empty:
+                    raise RuntimeError(
+                        f"Failed to download {cfg.get('fd_div')} seasons"
+                    )
+            cleaned["league_id"] = code
             source = "football-data.co.uk"
-        else:
+        elif history_source == "fotmob" or code == "UWCL":
+            fotmob_id = cfg.get("fotmob_id")
+            if fotmob_id is None:
+                raise RuntimeError(f"{code} missing fotmob_id")
             cleaned, errors = _download_uwcl_seasons(
                 n_seasons=n_seasons if seasons is None else len(season_starts),
-                fotmob_id=int(cfg["fotmob_id"]),  # type: ignore[arg-type]
+                fotmob_id=int(fotmob_id),
             )
+            cleaned["league_id"] = code
             source = "fotmob"
+        else:
+            raise RuntimeError(
+                f"Unknown history_source={history_source!r} for league={code}"
+            )
+
         save_matches_to_db(cleaned, path)
+        _persist_global(cleaned)
         return _attach_meta(cleaned, source=source, warnings=errors or None)
     except Exception as exc:  # noqa: BLE001
+        # Network failed — try global then league-specific offline cache.
+        if db_path is None:
+            local = read_matches_prefer_global(
+                code,
+                seasons=season_starts if seasons is not None else None,
+                n_seasons=n_seasons,
+                prefer_global=True,
+            )
+            if not local.empty:
+                src = str(local.attrs.get("data_source") or "sqlite_fallback")
+                if not src.endswith("fallback"):
+                    src = "sqlite_fallback"
+                out = _attach_meta(
+                    local,
+                    source=src,
+                    warnings=[f"network/refresh failed: {exc}"],
+                    resolved_db=local.attrs.get("db_path") or path,
+                )
+                return out
         if db_has_matches(path):
             local = read_matches_from_db(
                 path,
@@ -1354,6 +1603,12 @@ def fetch_flashscore_fixture_events(
                 "AwayTeam": away,
                 "FlashscoreEventId": fields["AA"],
                 "Source": "flashscore",
+                "HomeFlashscoreHash": str(fields.get("PX") or "").strip() or None,
+                "AwayFlashscoreHash": str(fields.get("PY") or "").strip() or None,
+                "HomeFlashscoreSlug": str(fields.get("WU") or "").strip().strip("/")
+                or None,
+                "AwayFlashscoreSlug": str(fields.get("WV") or "").strip().strip("/")
+                or None,
             }
         )
 
@@ -1593,6 +1848,46 @@ def fetch_flashscore_match_odds(
     return out
 
 
+def fetch_flashscore_odds_for_events(
+    event_ids: Sequence[str],
+    *,
+    max_workers: int = 5,
+) -> dict[str, dict[str, float | str]]:
+    """Fetch Flashscore odds for many event IDs in parallel.
+
+    Returns a mapping ``event_id → odds dict`` (failures omitted). Keeps the
+    same per-match timeouts/retries as :func:`fetch_flashscore_match_odds`.
+    """
+    ids = [str(e).strip() for e in event_ids if e is not None and str(e).strip()]
+    if not ids:
+        return {}
+
+    workers = max(1, min(int(max_workers), len(ids)))
+    out: dict[str, dict[str, float | str]] = {}
+
+    def _one(eid: str) -> tuple[str, dict[str, float | str] | None]:
+        try:
+            odds = fetch_flashscore_match_odds(eid)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Flashscore odds %s failed: %s", eid, exc)
+            return eid, None
+        if not odds:
+            return eid, None
+        return eid, odds
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_one, eid) for eid in ids]
+        for fut in as_completed(futures):
+            try:
+                eid, odds = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Flashscore odds worker failed: %s", exc)
+                continue
+            if odds:
+                out[eid] = odds
+    return out
+
+
 def fetch_flashscore_odds(
     *,
     fixtures_url: str = FLASHSCORE_FIXTURES_URL,
@@ -1600,10 +1895,14 @@ def fetch_flashscore_odds(
     max_events: int = 24,
     request_delay_s: float = 0.25,
     normalize_women: bool = False,
+    max_workers: int = 5,
 ) -> pd.DataFrame:
     """Load Flashscore fixture event IDs then pull Odds-tab markets for each.
 
     Prefers **bet365** (bookmaker id 16) as listed on the Flashscore GB comparison.
+    Odds requests run via :func:`fetch_flashscore_odds_for_events` (thread pool).
+    ``request_delay_s`` is retained for API compatibility but unused when
+    ``max_workers > 1``.
     """
     empty_cols = [
         "HomeTeam",
@@ -1632,24 +1931,52 @@ def fetch_flashscore_odds(
     if events.empty:
         return pd.DataFrame(columns=empty_cols)
 
-    events = events.head(max_events)
-    rows: list[dict] = []
-    for idx, (_, ev) in enumerate(events.iterrows()):
-        if idx and request_delay_s > 0:
-            time.sleep(request_delay_s)
-        try:
-            odds = fetch_flashscore_match_odds(str(ev["FlashscoreEventId"]))
-        except Exception:  # noqa: BLE001
-            continue
+    events = events.head(max_events).reset_index(drop=True)
+    if "FlashscoreEventId" not in events.columns:
+        return pd.DataFrame(columns=empty_cols)
+
+    # Serial fallback only when explicitly requested (max_workers <= 1).
+    if int(max_workers) <= 1:
+        rows: list[dict] = []
+        for idx, (_, ev) in enumerate(events.iterrows()):
+            if idx and request_delay_s > 0:
+                time.sleep(request_delay_s)
+            try:
+                odds = fetch_flashscore_match_odds(str(ev["FlashscoreEventId"]))
+            except Exception:  # noqa: BLE001
+                continue
+            if not odds or pd.isna(odds.get("B365H", float("nan"))):
+                continue
+            rows.append(
+                {
+                    "HomeTeam": ev["HomeTeam"],
+                    "AwayTeam": ev["AwayTeam"],
+                    "Kickoff": ev["Kickoff"],
+                    **odds,
+                }
+            )
+        if not rows:
+            return pd.DataFrame(columns=empty_cols)
+        return pd.DataFrame(rows).reset_index(drop=True)
+
+    odds_by_id = fetch_flashscore_odds_for_events(
+        [str(x) for x in events["FlashscoreEventId"].tolist()],
+        max_workers=int(max_workers),
+    )
+    rows = []
+    for _, ev in events.iterrows():
+        eid = str(ev["FlashscoreEventId"])
+        odds = odds_by_id.get(eid)
         if not odds or pd.isna(odds.get("B365H", float("nan"))):
             continue
-        row = {
-            "HomeTeam": ev["HomeTeam"],
-            "AwayTeam": ev["AwayTeam"],
-            "Kickoff": ev["Kickoff"],
-            **odds,
-        }
-        rows.append(row)
+        rows.append(
+            {
+                "HomeTeam": ev["HomeTeam"],
+                "AwayTeam": ev["AwayTeam"],
+                "Kickoff": ev["Kickoff"],
+                **odds,
+            }
+        )
 
     if not rows:
         return pd.DataFrame(columns=empty_cols)
@@ -1970,25 +2297,74 @@ def load_upcoming_fixtures(
     now: datetime | None = None,
     include_odds: bool = True,
 ) -> pd.DataFrame:
-    """Load upcoming fixtures + bookmaker odds for ``EPL`` or ``UWCL``.
+    """Load upcoming fixtures + bookmaker odds for a registry league.
 
     Schedule source
-        Fotmob league API — mirrors Flashscore calendars
-        (EPL / UEFA Women's Champions League).
+        Fotmob league API when ``fotmob_id`` is set; otherwise Flashscore
+        fixtures HTML (``flashscore_path`` / ``flashscore_fixtures_url``).
 
     Odds sources (merged in order)
         1. **Flashscore Odds tab** (GraphQL ``oce``) — prefer bet365.
         2. ESPN scoreboard JSON (DraftKings) — **EPL only**.
-        3. football-data.co.uk/fixtures.csv — **EPL only**.
+        3. football-data.co.uk/fixtures.csv — when ``fd_div`` is set.
     """
     code = normalize_league(league)
-    cfg = LEAGUE_CONFIG[code]
-    fotmob_id = int(cfg["fotmob_id"])  # type: ignore[arg-type]
-    fs_url = str(cfg["flashscore_fixtures_url"])
+    cfg = get_league_config(code)
+    fotmob_raw = cfg.get("fotmob_id")
+    fs_url = cfg.get("flashscore_fixtures_url")
+    if not fs_url and cfg.get("flashscore_path"):
+        fs_url = (
+            "https://www.flashscore.com"
+            f"{str(cfg['flashscore_path']).rstrip('/')}/fixtures/"
+        )
+    fs_url = str(fs_url or "")
     is_uwcl = code == "UWCL"
     fd_div = cfg.get("fd_div") or div
 
     known = list_teams(results) if results is not None and not results.empty else None
+
+    ref = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    if getattr(ref, "tzinfo", None) is not None:
+        ref = ref.replace(tzinfo=None)
+    ref_ts = pd.Timestamp(ref)
+
+    # Prefer Flashscore fixtures for JSON leagues that rely on flashscore_path
+    # when Fotmob is unavailable / secondary (e.g. LALIGA).
+    use_fs_schedule = fotmob_raw is None or (
+        code not in LEAGUE_CONFIG and bool(fs_url)
+    )
+    if use_fs_schedule and fs_url:
+        try:
+            from src.fetchers.flashscore_league import fetch_league_upcoming
+
+            upcoming = fetch_league_upcoming(
+                code,
+                within_hours=24 * 14,
+                include_odds=include_odds,
+                now=ref,
+            )
+            if not upcoming.empty:
+                if only_future and "Kickoff" in upcoming.columns:
+                    kick = pd.to_datetime(upcoming["Kickoff"], errors="coerce")
+                    upcoming = upcoming.loc[kick >= ref_ts].reset_index(drop=True)
+                upcoming.attrs["source_url"] = fs_url
+                upcoming.attrs["odds_url"] = FLASHSCORE_ODDS_URL
+                upcoming.attrs["odds_sources"] = ["Flashscore"]
+                upcoming.attrs["league"] = code
+                upcoming.attrs["as_of"] = ref_ts
+                return upcoming
+        except Exception:  # noqa: BLE001
+            pass
+
+    if fotmob_raw is None:
+        empty = pd.DataFrame()
+        empty.attrs["source_url"] = fs_url
+        empty.attrs["league"] = code
+        empty.attrs["as_of"] = ref_ts
+        empty.attrs["odds_sources"] = []
+        return empty
+
+    fotmob_id = int(fotmob_raw)
     schedule = fetch_fotmob_league_schedule(
         fotmob_id=fotmob_id,
         known_teams=known,
@@ -1996,16 +2372,11 @@ def load_upcoming_fixtures(
         normalize_women=is_uwcl,
     )
 
-    ref = now or datetime.now(timezone.utc).replace(tzinfo=None)
-    if getattr(ref, "tzinfo", None) is not None:
-        ref = ref.replace(tzinfo=None)
-    ref_ts = pd.Timestamp(ref)
-
     odds_sources: list[str] = []
 
     if schedule.empty:
-        # Fallback: football-data feed only (EPL); UWCL has no FD division.
-        if is_uwcl:
+        # Fallback: football-data feed when a division code exists.
+        if not fd_div:
             fixtures = pd.DataFrame()
         else:
             fixtures = _load_fd_odds_fixtures(div=str(fd_div))
@@ -2014,7 +2385,7 @@ def load_upcoming_fixtures(
                 odds_sources.append("football-data")
     else:
         fixtures = schedule.copy()
-        if include_odds:
+        if include_odds and fs_url:
             # 1) Flashscore Odds tab
             try:
                 fs_df = fetch_flashscore_odds(
@@ -2030,7 +2401,7 @@ def load_upcoming_fixtures(
                 odds_sources.append("Flashscore")
 
             # 2) ESPN / DraftKings — EPL only
-            if not is_uwcl:
+            if code == "EPL":
                 try:
                     espn_df = fetch_espn_epl_odds(
                         dates=fixtures["Kickoff"],
@@ -2059,7 +2430,8 @@ def load_upcoming_fixtures(
                         mask = fixtures["OddsProvider"].isna() & fixtures["B365H"].notna()
                         fixtures.loc[mask, "OddsProvider"] = "ESPN/DraftKings"
 
-                # 3) football-data fixtures.csv
+            # 3) football-data fixtures.csv
+            if fd_div:
                 odds_df = _load_fd_odds_fixtures(div=str(fd_div))
                 if not odds_df.empty:
                     before = (
@@ -2092,6 +2464,13 @@ def load_upcoming_fixtures(
         fixtures.attrs["as_of"] = ref_ts
         fixtures.attrs["odds_sources"] = odds_sources
         return fixtures
+
+    try:
+        from src.fetchers.flashscore_league import apply_league_team_aliases
+
+        fixtures = apply_league_team_aliases(fixtures, code)
+    except Exception:  # noqa: BLE001
+        pass
 
     fixtures["is_future"] = fixtures["Kickoff"] >= ref_ts
     fixtures["is_played"] = False

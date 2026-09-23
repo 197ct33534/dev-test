@@ -5,6 +5,7 @@ from __future__ import annotations
 import pandas as pd
 
 from src.share import (
+    build_lite_share_text,
     build_share_text,
     build_share_url,
     fallback_match_id,
@@ -158,3 +159,45 @@ def test_pick_top_bet_prefers_recommended() -> None:
     top = pick_top_bet_for_share([_B(0.20, False), _B(0.08, True), _B(0.05, True)])
     assert top is not None
     assert top.ev == 0.08
+
+
+def test_build_lite_share_text_includes_fatigue() -> None:
+    text = build_lite_share_text(
+        home="Arsenal",
+        away="Chelsea",
+        league="Premier League",
+        kickoff_vn="23/09 02:00",
+        selection="1X2 · Chủ nhà",
+        odds=2.05,
+        ev=0.12,
+        share_url="?match_id=x",
+        p_model=0.55,
+        fatigue_label="Arsenal nghỉ 3 ngày / Chelsea cày 3 trận/14 ngày",
+    )
+    assert "⚽ Arsenal vs Chelsea" in text
+    assert "Premier League" in text
+    assert "😴 Arsenal nghỉ 3 ngày" in text
+    assert "💎 AI pick: 1X2 · Chủ nhà @ 2.05" in text
+    assert "EV +12.0%" in text
+
+
+def test_build_lite_share_text_includes_insight_lines() -> None:
+    text = build_lite_share_text(
+        home="Arsenal",
+        away="Chelsea",
+        league="Premier League",
+        kickoff_vn="23/09 02:00",
+        selection="1X2 · Chủ nhà",
+        odds=2.05,
+        ev=0.12,
+        share_url="?match_id=x",
+        p_model=0.55,
+        insight_lines=[
+            "Thể lực: Arsenal nghỉ 5 ngày — Arsenal tươi hơn",
+            "EV: Model 55% vs nhà cái ~49% (@2.05) → lệch +6đ, EV +13%",
+        ],
+    )
+    assert "💡 Tại sao AI chọn cửa này?" in text
+    assert "• Thể lực: Arsenal nghỉ 5 ngày" in text
+    assert "• EV: Model 55%" in text
+    assert text.index("💡") < text.index("🔗")

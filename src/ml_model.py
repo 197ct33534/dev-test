@@ -73,6 +73,19 @@ def _rest_days(history: list[dict[str, Any]], match_date: pd.Timestamp) -> float
     return float((match_date - last_date).days)
 
 
+def _matches_last_n_days(
+    history: list[dict[str, Any]],
+    match_date: pd.Timestamp,
+    *,
+    days: int = 14,
+) -> float:
+    """Count prior matches with ``date`` in ``[match_date - days, match_date)``."""
+    if not history:
+        return 0.0
+    cutoff = match_date - pd.Timedelta(days=int(days))
+    return float(sum(1 for row in history if row["date"] >= cutoff))
+
+
 def feature_column_names(windows: Sequence[int] = ROLL_WINDOWS) -> list[str]:
     """Ordered feature names used by the classifier."""
     cols: list[str] = []
@@ -87,6 +100,8 @@ def feature_column_names(windows: Sequence[int] = ROLL_WINDOWS) -> list[str]:
                 ]
             )
         cols.append(f"{side}_rest_days")
+        cols.append(f"{side}_matches_last_14d")
+        cols.append(f"{side}_is_rotation_risk")
         cols.append(f"{side}_form_{FORM_WINDOW}")
     return cols
 
@@ -96,6 +111,8 @@ def _side_features(
     history: list[dict[str, Any]],
     match_date: pd.Timestamp,
     windows: Sequence[int],
+    *,
+    upcoming_is_cup: bool = False,
 ) -> dict[str, float]:
     """Rolling / rest / form features for one side of a fixture."""
     series = {k: [row[k] for row in history] for k in _STAT_KEYS}
@@ -105,7 +122,12 @@ def _side_features(
         out[f"{prefix}_ga_r{n}"] = _mean_last(series["ga"], n)
         out[f"{prefix}_cf_r{n}"] = _mean_last(series["cf"], n)
         out[f"{prefix}_ca_r{n}"] = _mean_last(series["ca"], n)
+    n14 = _matches_last_n_days(history, match_date, days=14)
     out[f"{prefix}_rest_days"] = _rest_days(history, match_date)
+    out[f"{prefix}_matches_last_14d"] = n14
+    out[f"{prefix}_is_rotation_risk"] = (
+        1.0 if (n14 >= 4.0 and upcoming_is_cup) else 0.0
+    )
     out[f"{prefix}_form_{FORM_WINDOW}"] = _sum_last(series["points"], FORM_WINDOW)
     return out
 
@@ -208,20 +230,51 @@ def engineer_match_features(
     rows: list[dict[str, Any]] = []
     feat_names = feature_column_names(windows)
 
+    try:
+        from src.league_registry import is_cup_competition as _is_cup
+    except Exception:  # noqa: BLE001
+        def _is_cup(c: str | None) -> bool:
+            return str(c or "").strip().upper() in {
+                "EMPERORS_CUP",
+                "J_LEAGUE_CUP",
+                "UWCL",
+            }
+
     for idx, row in df.iterrows():
         home = str(row["HomeTeam"])
         away = str(row["AwayTeam"])
         match_date = row["Date"]
         home_hist = history[home]
         away_hist = history[away]
+        upcoming_cup = False
+        for key in ("comp_id", "league_id", "league"):
+            if key in df.columns and pd.notna(row.get(key)):
+                upcoming_cup = _is_cup(str(row.get(key)))
+                break
 
         if (
             len(home_hist) >= min_prior_matches
             and len(away_hist) >= min_prior_matches
         ):
             feats = {}
-            feats.update(_side_features("home", home_hist, match_date, windows))
-            feats.update(_side_features("away", away_hist, match_date, windows))
+            feats.update(
+                _side_features(
+                    "home",
+                    home_hist,
+                    match_date,
+                    windows,
+                    upcoming_is_cup=upcoming_cup,
+                )
+            )
+            feats.update(
+                _side_features(
+                    "away",
+                    away_hist,
+                    match_date,
+                    windows,
+                    upcoming_is_cup=upcoming_cup,
+                )
+            )
             record: dict[str, Any] = {
                 "Date": match_date,
                 "HomeTeam": home,
@@ -268,14 +321,41 @@ def features_for_fixture(
     match_date: pd.Timestamp | datetime | str,
     *,
     windows: Sequence[int] = ROLL_WINDOWS,
+    upcoming_comp_id: str | None = None,
 ) -> dict[str, float]:
     """Compute the feature vector for an upcoming (or held-out) fixture."""
     match_ts = _as_timestamp(match_date)
     home = str(home_team).strip()
     away = str(away_team).strip()
+    try:
+        from src.league_registry import is_cup_competition
+
+        upcoming_cup = is_cup_competition(upcoming_comp_id)
+    except Exception:  # noqa: BLE001
+        upcoming_cup = str(upcoming_comp_id or "").strip().upper() in {
+            "EMPERORS_CUP",
+            "J_LEAGUE_CUP",
+            "UWCL",
+        }
     feats: dict[str, float] = {}
-    feats.update(_side_features("home", history.get(home, []), match_ts, windows))
-    feats.update(_side_features("away", history.get(away, []), match_ts, windows))
+    feats.update(
+        _side_features(
+            "home",
+            history.get(home, []),
+            match_ts,
+            windows,
+            upcoming_is_cup=upcoming_cup,
+        )
+    )
+    feats.update(
+        _side_features(
+            "away",
+            history.get(away, []),
+            match_ts,
+            windows,
+            upcoming_is_cup=upcoming_cup,
+        )
+    )
     return feats
 
 

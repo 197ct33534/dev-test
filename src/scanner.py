@@ -19,7 +19,12 @@ from src.config import (
 )
 from src.dixon_coles import DixonColesModel
 from src.recommender import expected_value, recommend_upcoming
-from src.strategy import capped_kelly_fraction
+from src.strategy import (
+    attach_fair_line_fields,
+    calculate_model_fair_lines,
+    capped_kelly_fraction,
+    select_value_bets,
+)
 from src.timezone_utils import filter_matches_today_tomorrow, format_kickoff_vn, kickoff_to_vn
 
 DEFAULT_ALLOWED_MARKETS: tuple[str, ...] = ("1X2",)
@@ -115,8 +120,13 @@ def _enrich_display_rows(
     league: str,
     bankroll: float,
     max_stake_pct: float,
+    dc_model: DixonColesModel | None = None,
 ) -> pd.DataFrame:
-    """Add kickoff_vn, match_id, stake, league columns for the landing UI."""
+    """Add kickoff_vn, match_id, stake, league, thin-data flags for the landing UI.
+
+    When ``dc_model`` is provided, also attaches model fair O/U + AH lines and
+    bookie line disparity (``model_fair_line``, ``line_edge``, …).
+    """
     if recs.empty:
         return recs
 
@@ -124,6 +134,39 @@ def _enrich_display_rows(
     if fixtures is not None and not fixtures.empty:
         for _, fx in fixtures.iterrows():
             fx_index[(str(fx["HomeTeam"]), str(fx["AwayTeam"]))] = fx
+
+    fair_cache: dict[tuple[str, str], Any] = {}
+
+    def _bookie_float(fx_row: pd.Series | None, *cols: str) -> float | None:
+        if fx_row is None:
+            return None
+        for c in cols:
+            if c not in fx_row.index:
+                continue
+            val = fx_row.get(c)
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _fair_for(home: str, away: str):
+        key = (home, away)
+        if key in fair_cache:
+            return fair_cache[key]
+        if dc_model is None:
+            fair_cache[key] = None
+            return None
+        try:
+            lam, mu = dc_model.expected_goals(home, away)
+            mat = dc_model.predict_score_matrix(home, away)
+            fair = calculate_model_fair_lines(lam, mu, mat)
+        except Exception:  # noqa: BLE001
+            fair = None
+        fair_cache[key] = fair
+        return fair
 
     rows: list[dict[str, Any]] = []
     for _, r in recs.iterrows():
@@ -156,6 +199,45 @@ def _enrich_display_rows(
         d["p_model"] = float(d.get("p_model") or 0.0)
         d["market"] = str(d.get("market", ""))
         d["selection"] = str(d.get("selection", ""))
+        # Badge flags = missing global-DB finished history (not DC thin priors).
+        try:
+            from src.global_db import has_team_history
+
+            d["home_thin"] = not has_team_history(home, comp_id=league)
+            d["away_thin"] = not has_team_history(away, comp_id=league)
+        except Exception:  # noqa: BLE001
+            d["home_thin"] = False
+            d["away_thin"] = False
+        thin_names = [
+            t for t, flag in ((home, d["home_thin"]), (away, d["away_thin"])) if flag
+        ]
+        d["thin_teams"] = thin_names
+
+        # Model fair lines vs bookie O/U + AH (once per match, cached).
+        fair = _fair_for(home, away)
+        if fair is not None:
+            # Prefer fixture book lines; fall back to the bet's own ``line``.
+            bookie_ou = _bookie_float(fx, "OU_Line", "ou_line")
+            bookie_ah = _bookie_float(fx, "AHh", "AH_Line", "ah_line")
+            mkt = str(d.get("market") or "").upper()
+            bet_line = d.get("line")
+            try:
+                bet_line_f = float(bet_line) if bet_line is not None else None
+                if bet_line_f is not None and bet_line_f != bet_line_f:
+                    bet_line_f = None
+            except (TypeError, ValueError):
+                bet_line_f = None
+            if mkt == "OU" and bookie_ou is None and bet_line_f is not None:
+                bookie_ou = bet_line_f
+            if mkt == "AH" and bookie_ah is None and bet_line_f is not None:
+                bookie_ah = bet_line_f
+            attach_fair_line_fields(
+                d,
+                fair,
+                bookie_ou_line=bookie_ou,
+                bookie_ah_line=bookie_ah,
+            )
+
         rows.append(d)
 
     out = pd.DataFrame(rows)
@@ -376,15 +458,24 @@ def scan_top_value_bets(
         league=league,
         bankroll=bankroll,
         max_stake_pct=max_stake_pct,
+        dc_model=dc_model,
     )
 
-    value = enriched.loc[enriched["ev"] >= float(min_ev)].copy()
-    value = value.sort_values("ev", ascending=False).head(int(top_n)).reset_index(drop=True)
-
-    fallback = (
-        enriched.sort_values("ev", ascending=False)
-        .head(int(top_n))
-        .reset_index(drop=True)
+    # Display ranking (Lite / Top-N): sanity → multi-market OK → Top-N by EV%.
+    # Staking caps (1/match · ≤MAX_BETS_PER_DAY) stay in auto_scanner / journal.
+    display_cap = int(max(1, int(top_n)))
+    value_pool = enriched.loc[enriched["ev"] >= float(min_ev)].copy()
+    value = select_value_bets(
+        value_pool,
+        max_per_day=display_cap,
+        already_today=0,
+        allow_multi_picks_per_match=True,
+    )
+    fallback = select_value_bets(
+        enriched,
+        max_per_day=display_cap,
+        already_today=0,
+        allow_multi_picks_per_match=True,
     )
 
     below = value.empty
@@ -399,4 +490,100 @@ def scan_top_value_bets(
         window_start_utc=win_start,
         window_end_utc=win_end,
         odds_missing=False,
+    )
+
+
+def merge_top_scan_results(
+    results: Sequence[TopScanResult],
+    *,
+    top_n: int = 20,
+    min_ev: float = DEFAULT_MIN_EV,
+) -> TopScanResult:
+    """Combine per-league :class:`TopScanResult` into one Top-N ranking.
+
+    Concatenates candidate rows, applies :func:`select_value_bets` with
+    multi-market picks allowed, then keeps at most ``top_n`` by EV descending.
+    Used by the Streamlit landing when scanning **EPL + UWCL** together.
+    """
+    frames: list[pd.DataFrame] = []
+    win_starts: list[pd.Timestamp] = []
+    win_ends: list[pd.Timestamp] = []
+    any_odds_missing = False
+
+    for res in results:
+        if res.window_start_utc is not None:
+            win_starts.append(pd.Timestamp(res.window_start_utc))
+        if res.window_end_utc is not None:
+            win_ends.append(pd.Timestamp(res.window_end_utc))
+        any_odds_missing = any_odds_missing or bool(res.odds_missing)
+        # Prefer the full ranked pool (fallback includes below-threshold legs)
+        # so multi-league merge can still fill Top-N when one league has no EV≥min.
+        pool = res.fallback_bets
+        if pool is None or getattr(pool, "empty", True):
+            pool = res.display_bets
+        if pool is not None and not getattr(pool, "empty", True):
+            frames.append(pool.copy())
+
+    empty = pd.DataFrame()
+    win_start = min(win_starts) if win_starts else None
+    win_end = max(win_ends) if win_ends else None
+
+    if not frames:
+        return TopScanResult(
+            value_bets=empty,
+            fallback_bets=empty,
+            display_bets=empty,
+            below_threshold=True,
+            n_value=0,
+            window_start_utc=win_start,
+            window_end_utc=win_end,
+            odds_missing=any_odds_missing,
+        )
+
+    combined = pd.concat(frames, ignore_index=True)
+    # Drop pure odds-missing placeholder rows when real EV legs exist.
+    if "ev" in combined.columns and combined["ev"].notna().any():
+        combined = combined.loc[combined["ev"].notna()].copy()
+
+    display_cap = int(max(1, int(top_n)))
+    fallback = select_value_bets(
+        combined,
+        max_per_day=display_cap,
+        already_today=0,
+        allow_multi_picks_per_match=True,
+    )
+    if "ev" in fallback.columns:
+        value = select_value_bets(
+            fallback.loc[fallback["ev"] >= float(min_ev)].copy(),
+            max_per_day=display_cap,
+            already_today=0,
+            allow_multi_picks_per_match=True,
+        )
+    else:
+        value = empty
+
+    below = value.empty
+    display = value if not below else fallback
+    # If every league lacked scannable odds, surface placeholder fixture rows.
+    if display.empty and any_odds_missing and frames:
+        placeholders = pd.concat(frames, ignore_index=True)
+        display = placeholders.head(int(top_n)).reset_index(drop=True)
+        fallback = display
+        below = True
+
+    odds_missing_out = False
+    if below and not display.empty and "odds_missing" in display.columns:
+        odds_missing_out = bool(display["odds_missing"].fillna(False).all())
+    elif below and any_odds_missing and display.empty:
+        odds_missing_out = True
+
+    return TopScanResult(
+        value_bets=value,
+        fallback_bets=fallback,
+        display_bets=display,
+        below_threshold=below,
+        n_value=int(len(value)),
+        window_start_utc=win_start,
+        window_end_utc=win_end,
+        odds_missing=odds_missing_out,
     )

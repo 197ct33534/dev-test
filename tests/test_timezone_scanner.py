@@ -298,3 +298,145 @@ def test_scan_no_odds_still_lists_fixtures(monkeypatch: pytest.MonkeyPatch) -> N
     assert bool(result.display_bets.iloc[0]["odds_missing"]) is True
     assert pd.isna(result.display_bets.iloc[0]["ev"])
     assert "02:00" in str(result.display_bets.iloc[0]["kickoff_vn"])
+
+
+def test_scan_multi_market_picks_per_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Multiple value legs on one fixture → all retained, sorted by EV desc."""
+    from src import scanner as scanner_mod
+
+    def _fake_recommend(model, fixtures, **kwargs):
+        rows = []
+        for _, fx in fixtures.iterrows():
+            home, away = str(fx["HomeTeam"]), str(fx["AwayTeam"])
+            # Two correlated 1X2 legs; Away EV higher
+            for sel, p, odds in (
+                ("Home", 0.40, 2.50),  # EV = 0.00
+                ("Away", 0.30, 4.00),  # EV = 0.20
+                ("Draw", 0.25, 4.50),  # EV = 0.125
+            ):
+                ev = p * odds - 1.0
+                rows.append(
+                    {
+                        "home_team": home,
+                        "away_team": away,
+                        "market": "1X2",
+                        "selection": sel,
+                        "p_model": p,
+                        "fair_odds": 1.0 / p,
+                        "bookmaker_odds": odds,
+                        "ev": ev,
+                        "ev_pct": ev * 100.0,
+                        "kelly_fraction": 0.01,
+                        "kelly_pct": 1.0,
+                        "recommended": ev >= 0.05,
+                        "kickoff": fx["Kickoff"],
+                        "match_date": fx["Kickoff"],
+                    }
+                )
+        return pd.DataFrame(rows)
+
+    monkeypatch.setattr(scanner_mod, "recommend_upcoming", _fake_recommend)
+
+    now_vn = datetime(2026, 9, 22, 10, 0, tzinfo=VN_TZ)
+    fixtures = pd.DataFrame(
+        [
+            {
+                "Kickoff": pd.Timestamp("2026-09-22 12:00:00"),
+                "HomeTeam": "Alpha",
+                "AwayTeam": "Beta",
+                "B365H": 2.50,
+                "B365D": 4.50,
+                "B365A": 4.00,
+                "FlashscoreEventId": "fx-1",
+            }
+        ]
+    )
+    result = scan_top_value_bets(
+        fixtures,
+        _ToyDC(),  # type: ignore[arg-type]
+        min_ev=0.05,
+        now=now_vn,
+        filter_vn_window=True,
+        top_n=20,
+    )
+    assert result.n_value == 2
+    assert list(result.value_bets["selection"]) == ["Away", "Draw"]
+    assert result.value_bets.iloc[0]["ev"] == pytest.approx(0.20)
+    assert result.value_bets.iloc[1]["ev"] == pytest.approx(0.125)
+
+
+def test_merge_top_scan_results_ranks_across_leagues() -> None:
+    from src.scanner import TopScanResult, merge_top_scan_results
+
+    epl = pd.DataFrame(
+        [
+            {
+                "home": "Arsenal",
+                "away": "Chelsea",
+                "home_team": "Arsenal",
+                "away_team": "Chelsea",
+                "match_id": "epl-1",
+                "league": "EPL",
+                "market": "1X2",
+                "selection": "Home",
+                "ev": 0.10,
+                "ev_pct": 10.0,
+                "kickoff": "2026-09-22 15:00",
+            }
+        ]
+    )
+    uwcl = pd.DataFrame(
+        [
+            {
+                "home": "Barcelona",
+                "away": "Lyon",
+                "home_team": "Barcelona",
+                "away_team": "Lyon",
+                "match_id": "uwcl-1",
+                "league": "UWCL",
+                "market": "1X2",
+                "selection": "Home",
+                "ev": 0.18,
+                "ev_pct": 18.0,
+                "kickoff": "2026-09-22 19:00",
+            },
+            {
+                "home": "Barcelona",
+                "away": "Lyon",
+                "home_team": "Barcelona",
+                "away_team": "Lyon",
+                "match_id": "uwcl-1",
+                "league": "UWCL",
+                "market": "1X2",
+                "selection": "Draw",
+                "ev": 0.12,
+                "ev_pct": 12.0,
+                "kickoff": "2026-09-22 19:00",
+            },
+        ]
+    )
+    r1 = TopScanResult(
+        value_bets=epl,
+        fallback_bets=epl,
+        display_bets=epl,
+        below_threshold=False,
+        n_value=1,
+    )
+    r2 = TopScanResult(
+        value_bets=uwcl,
+        fallback_bets=uwcl,
+        display_bets=uwcl,
+        below_threshold=False,
+        n_value=2,
+    )
+    merged = merge_top_scan_results([r1, r2], top_n=20, min_ev=0.05)
+    assert merged.n_value == 3
+    assert merged.display_bets.iloc[0]["league"] == "UWCL"
+    assert merged.display_bets.iloc[0]["selection"] == "Home"
+    assert merged.display_bets.iloc[0]["ev"] == pytest.approx(0.18)
+    # Multi-market: both UWCL legs kept, ranked by EV before EPL
+    assert list(merged.display_bets["selection"]) == ["Home", "Draw", "Home"]
+    assert list(merged.display_bets["match_id"]) == ["uwcl-1", "uwcl-1", "epl-1"]
+    assert list(merged.display_bets["ev"]) == sorted(
+        merged.display_bets["ev"], reverse=True
+    )

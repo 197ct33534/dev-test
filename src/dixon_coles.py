@@ -36,9 +36,16 @@ from scipy.stats import poisson
 # Default time-decay rate (per day). ~0.0018 ≈ half-life of ~1 year.
 DEFAULT_XI = 0.0018
 DEFAULT_MAX_GOALS = 10
-# Priors for clubs never seen in training (user-specified league-average-ish).
+# Legacy "average" priors (overconfident for newcomers — prefer weak tier).
 DEFAULT_NEW_TEAM_ATTACK = 1.0
 DEFAULT_NEW_TEAM_DEFENCE = 1.0
+# Clubs with fewer historical matches use weak-tier priors (keep in sync with src.config).
+MIN_TEAM_MATCHES = 5
+# Weak-tier priors for new / thin-sample clubs (< MIN_TEAM_MATCHES matches).
+# Sign convention: higher δ = *better* defence (λ = exp(α − δ_opp + γ)).
+# Underdog newcomers need weak attack + *poor* defence → lower δ (not 1.6).
+WEAK_TIER_NEW_TEAM_ATTACK = 0.4
+WEAK_TIER_NEW_TEAM_DEFENCE = 0.4
 
 logger = logging.getLogger(__name__)
 
@@ -249,20 +256,64 @@ class DixonColesModel:
         Time-decay rate xi in w = exp(-xi * t). Set 0 to disable.
     max_goals:
         Truncation for the predicted score matrix (0 .. max_goals inclusive).
+    use_weak_tier_priors:
+        When True (UWCL / small-sample leagues), unknown clubs use weak-tier
+        α/δ. Thin clubs (< ``min_team_matches`` history) always use weak tier.
+    new_team_attack / new_team_defence:
+        Explicit prior overrides; when None, derived from ``use_weak_tier_priors``.
+    min_team_matches:
+        Clubs with fewer training appearances are treated as thin / new and
+        get weak-tier priors instead of noisy MLE strengths.
     """
 
     xi: float = DEFAULT_XI
     max_goals: int = DEFAULT_MAX_GOALS
+    use_weak_tier_priors: bool = False
+    new_team_attack: float | None = None
+    new_team_defence: float | None = None
+    min_team_matches: int = MIN_TEAM_MATCHES
 
     teams: list[str] = field(default_factory=list, init=False)
-    # Clubs present at fit time (stable; not mutated when priors are injected).
+    # Clubs with enough history at fit time (excludes thin / prior-only).
     fitted_teams_: set[str] = field(default_factory=set, init=False, repr=False)
+    team_match_counts_: dict[str, int] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    thin_teams_: set[str] = field(default_factory=set, init=False, repr=False)
     attack: dict[str, float] = field(default_factory=dict, init=False)
     defence: dict[str, float] = field(default_factory=dict, init=False)
     home_advantage: float = field(default=0.0, init=False)  # γ
     rho: float = field(default=0.0, init=False)  # ρ
     fitted_: bool = field(default=False, init=False)
     optimize_result_: OptimizeResult | None = field(default=None, init=False)
+
+    # ------------------------------------------------------------------
+    # Priors / thin-sample
+    # ------------------------------------------------------------------
+
+    def _prior_attack(self) -> float:
+        if self.new_team_attack is not None:
+            return float(self.new_team_attack)
+        if self.use_weak_tier_priors:
+            return float(WEAK_TIER_NEW_TEAM_ATTACK)
+        # Unknown = 0 matches < min → prefer weak tier to avoid +2000% EV.
+        return float(WEAK_TIER_NEW_TEAM_ATTACK)
+
+    def _prior_defence(self) -> float:
+        """Defence prior. Higher δ = better defence; weak newcomers get low δ."""
+        if self.new_team_defence is not None:
+            return float(self.new_team_defence)
+        if self.use_weak_tier_priors:
+            return float(WEAK_TIER_NEW_TEAM_DEFENCE)
+        return float(WEAK_TIER_NEW_TEAM_DEFENCE)
+
+    def team_match_count(self, team: str) -> int:
+        """Historical match count from the last ``fit`` (0 if unseen)."""
+        return int(self.team_match_counts_.get(str(team).strip(), 0))
+
+    def is_thin_team(self, team: str) -> bool:
+        """True when the club has fewer than ``min_team_matches`` history rows."""
+        return self.team_match_count(team) < int(self.min_team_matches)
 
     # ------------------------------------------------------------------
     # Expected goals
@@ -274,7 +325,7 @@ class DixonColesModel:
         lambda = exp(alpha_home - delta_away + gamma)
         mu     = exp(alpha_away - delta_home)
 
-        Unknown clubs use attack/defence priors (1.0 / 1.0) instead of raising.
+        Unknown / thin clubs use weak-tier attack/defence priors instead of raising.
         """
         self._require_fitted()
         a_home, d_home = self._strengths_for(home_team)
@@ -283,10 +334,40 @@ class DixonColesModel:
         mu = float(np.exp(a_away - d_home))
         return lam, mu
 
+    def expected_goals_with_league_weights(
+        self,
+        home_team: str,
+        away_team: str,
+        *,
+        home_weight: float = 1.0,
+        away_weight: float = 1.0,
+        w_ref: float = 1.0,
+    ) -> tuple[float, float]:
+        """Expected goals scaled by competition ``league_weight``.
+
+        Optional multi-comp path (European cups). Single-league Streamlit
+        fits leave weights at 1.0 → identical to :meth:`expected_goals`.
+
+        Math
+        ----
+        ``λ' = λ · (w_home / w_ref)``, ``μ' = μ · (w_away / w_ref)``
+        with ``w_ref = 1.0`` (EPL baseline). See ``src.global_db``.
+        """
+        from src.global_db import apply_league_weight_to_rates
+
+        lam, mu = self.expected_goals(home_team, away_team)
+        return apply_league_weight_to_rates(
+            lam, mu, home_weight, away_weight, w_ref=w_ref
+        )
+
     def unknown_teams(self, *teams: str) -> list[str]:
-        """Return club names absent from the original training set."""
+        """Return club names absent from the well-supported training set.
+
+        Includes thin-history clubs (< ``min_team_matches``) that were demoted
+        from ``fitted_teams_`` after fit.
+        """
         self._require_fitted()
-        known = self.fitted_teams_ or set(self.attack)
+        known = self.fitted_teams_ or set()
         out: list[str] = []
         for t in teams:
             name = str(t).strip()
@@ -295,27 +376,34 @@ class DixonColesModel:
         return out
 
     def has_new_team(self, home_team: str, away_team: str) -> bool:
-        """True when either side was absent from the training set."""
+        """True when either side was absent / thin in the training set."""
         return bool(self.unknown_teams(home_team, away_team))
 
     def _strengths_for(self, team: str) -> tuple[float, float]:
-        """Return ``(attack, defence)``, injecting league priors for newcomers."""
+        """Return ``(attack, defence)``, injecting weak-tier priors for newcomers."""
         name = str(team).strip()
-        known = self.fitted_teams_ or set(self.attack)
+        known = self.fitted_teams_ or set()
         if name in known and name in self.attack and name in self.defence:
             return float(self.attack[name]), float(self.defence[name])
         # Already injected priors for this process — reuse without re-logging.
         if name in self.attack and name in self.defence and name not in known:
             return float(self.attack[name]), float(self.defence[name])
+        atk = self._prior_attack()
+        deff = self._prior_defence()
+        n_hist = self.team_match_count(name)
         logger.warning(
-            "⚠️ Detecting new team: %s. Using default league priors.",
+            "⚠️ Detecting new/thin team: %s (n=%d). Using weak-tier priors "
+            "(α=%.2f, δ=%.2f).",
             name,
+            n_hist,
+            atk,
+            deff,
         )
         # Cache so subsequent calls in the same process stay consistent.
         # Do NOT add to fitted_teams_ — Kelly / unknown checks stay valid.
-        self.attack[name] = float(DEFAULT_NEW_TEAM_ATTACK)
-        self.defence[name] = float(DEFAULT_NEW_TEAM_DEFENCE)
-        return float(DEFAULT_NEW_TEAM_ATTACK), float(DEFAULT_NEW_TEAM_DEFENCE)
+        self.attack[name] = float(atk)
+        self.defence[name] = float(deff)
+        return float(atk), float(deff)
 
     # ------------------------------------------------------------------
     # Prediction
@@ -537,7 +625,31 @@ class DixonColesModel:
         attack_arr, defence_arr, gamma, rho = unpack(result.x)
         self.attack = {t: float(attack_arr[i]) for i, t in enumerate(self.teams)}
         self.defence = {t: float(defence_arr[i]) for i, t in enumerate(self.teams)}
-        self.fitted_teams_ = set(self.teams)
+        # Per-club appearance counts (home + away). Thin history → weak priors.
+        home_c = df["HomeTeam"].astype(str).value_counts()
+        away_c = df["AwayTeam"].astype(str).value_counts()
+        counts: dict[str, int] = {}
+        for t in self.teams:
+            counts[t] = int(home_c.get(t, 0)) + int(away_c.get(t, 0))
+        self.team_match_counts_ = counts
+        min_n = int(self.min_team_matches)
+        self.thin_teams_ = {t for t, n in counts.items() if n < min_n}
+        # Well-supported clubs only; thin clubs demoted to prior injection path.
+        self.fitted_teams_ = {t for t in self.teams if t not in self.thin_teams_}
+        atk_prior = self._prior_attack()
+        def_prior = self._prior_defence()
+        for t in self.thin_teams_:
+            self.attack[t] = float(atk_prior)
+            self.defence[t] = float(def_prior)
+            logger.warning(
+                "⚠️ Thin-sample team: %s (n=%d < %d). Using weak-tier priors "
+                "(α=%.2f, δ=%.2f).",
+                t,
+                counts[t],
+                min_n,
+                atk_prior,
+                def_prior,
+            )
         self.home_advantage = gamma
         self.rho = rho
         self.fitted_ = True
@@ -582,12 +694,30 @@ class DixonColesModel:
     # ------------------------------------------------------------------
 
     def _time_weights(self, df: pd.DataFrame) -> np.ndarray:
-        """Compute w_i = exp(-xi * t_i) with t_i = days before latest match."""
+        """Compute w_i = exp(-xi * t_i) with t_i = days before latest match.
+
+        Dates are normalised to timezone-naive midnights so string / tz-aware
+        ``Date`` columns cannot inflate ``t`` via UTC offsets or mixed dtypes.
+        """
         n = len(df)
         if self.xi <= 0 or "Date" not in df.columns:
             return np.ones(n, dtype=float)
 
-        dates = pd.to_datetime(df["Date"], errors="coerce")
+        raw = pd.to_datetime(df["Date"], errors="coerce", utc=False)
+        if raw.isna().all():
+            return np.ones(n, dtype=float)
+
+        # Force naive calendar days (strip tz without shifting the civil date).
+        def _naive_day(ts: object) -> pd.Timestamp:
+            if ts is None or (isinstance(ts, float) and ts != ts) or pd.isna(ts):
+                return pd.NaT
+            t = pd.Timestamp(ts)
+            if t.tzinfo is not None:
+                # Keep wall-clock civil day; do not convert via UTC.
+                t = t.replace(tzinfo=None)
+            return t.normalize()
+
+        dates = pd.to_datetime(raw.map(_naive_day), errors="coerce")
         if dates.isna().all():
             return np.ones(n, dtype=float)
 
