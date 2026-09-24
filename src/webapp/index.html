@@ -30,6 +30,7 @@
     .tab-active { background: var(--tg-theme-button-color, #2aabee); color: var(--tg-theme-button-text-color, #fff); }
     .card { background: var(--tg-theme-secondary-bg-color, #1c2128); }
     .modal-backdrop { background: rgba(0,0,0,.55); }
+    .nav-active { color: var(--tg-theme-button-color, #2aabee); border-bottom-color: var(--tg-theme-button-color, #2aabee); }
   </style>
 </head>
 <body class="min-h-screen pb-8">
@@ -41,6 +42,10 @@
       </div>
       <button id="btn-refresh" class="text-sm px-3 py-1.5 rounded-lg bg-tg-btn text-tg-btnText font-medium">Làm mới</button>
     </div>
+    <nav id="main-nav" class="mt-3 flex gap-4 text-sm border-b border-white/5">
+      <button type="button" data-view="bets" class="nav-tab nav-active pb-2 border-b-2 border-transparent font-medium">Kèo hời</button>
+      <button type="button" data-view="journal" class="nav-tab pb-2 border-b-2 border-transparent text-tg-hint font-medium">Nhật Ký Cược</button>
+    </nav>
     <div id="tabs" class="mt-3 flex gap-1.5 overflow-x-auto text-xs no-scrollbar">
       <button data-market="ALL" class="tab tab-active shrink-0 px-3 py-1.5 rounded-full">Tất cả</button>
       <button data-market="1X2" class="tab shrink-0 px-3 py-1.5 rounded-full bg-white/5 text-tg-hint">1X2</button>
@@ -51,8 +56,33 @@
   </header>
 
   <main class="px-4 pt-3 space-y-3">
-    <p id="status" class="text-sm text-tg-hint">Đang tải kèo hời…</p>
-    <div id="bets" class="space-y-3"></div>
+    <section id="view-bets">
+      <p id="status" class="text-sm text-tg-hint">Đang tải kèo hời…</p>
+      <div id="bets" class="space-y-3"></div>
+    </section>
+
+    <section id="view-journal" class="hidden space-y-3">
+      <div id="perf-card" class="card rounded-xl p-4 border border-white/5">
+        <p class="text-sm font-semibold mb-3">Hiệu suất paper</p>
+        <p id="perf-status" class="text-xs text-tg-hint">Đang tải…</p>
+        <div id="perf-metrics" class="hidden grid grid-cols-3 gap-3 text-center">
+          <div>
+            <p class="text-[11px] text-tg-hint uppercase tracking-wide">Win Rate</p>
+            <p id="perf-winrate" class="text-lg font-semibold mt-0.5">—</p>
+          </div>
+          <div>
+            <p class="text-[11px] text-tg-hint uppercase tracking-wide">PnL</p>
+            <p id="perf-pnl" class="text-lg font-semibold mt-0.5">—</p>
+          </div>
+          <div>
+            <p class="text-[11px] text-tg-hint uppercase tracking-wide">ROI</p>
+            <p id="perf-roi" class="text-lg font-semibold mt-0.5">—</p>
+          </div>
+        </div>
+        <p id="perf-meta" class="mt-3 text-xs text-tg-hint hidden"></p>
+      </div>
+      <p class="text-xs text-tg-hint">Số liệu từ cược đã settle trong journal (live_bets).</p>
+    </section>
   </main>
 
   <div id="modal" class="hidden fixed inset-0 z-50 flex items-end sm:items-center justify-center modal-backdrop p-3">

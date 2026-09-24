@@ -7,11 +7,12 @@ Schema notes
 ------------
 * Canonical table: ``live_bets`` (used by Streamlit journal UI).
 * Compatibility views (created on ensure):
-  - ``paper_trades`` → alias of ``live_bets``
-  - ``journal_history`` → settled rows only (WIN/LOSS/PUSH)
+  - ``paper_trades`` / ``user_bets`` → alias of ``live_bets``
+  - ``journal_history`` → settled rows only
 There is no separate SCHEDULED fixtures table; post-match automation
 operates on PENDING journal bets whose ``match_date``/kickoff has passed,
-matched against refreshed historical rows in the league SQLite DB.
+matched against refreshed historical rows in the league SQLite DB
+(or ``global_matches.db`` via :mod:`src.services.settlement_service`).
 """
 
 from __future__ import annotations
@@ -37,8 +38,20 @@ VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
 LIVE_BETS_TABLE = "live_bets"
 PAPER_TRADES_VIEW = "paper_trades"
+USER_BETS_VIEW = "user_bets"
 JOURNAL_HISTORY_VIEW = "journal_history"
-BetStatus = Literal["PENDING", "WIN", "LOSS", "PUSH"]
+BetStatus = Literal[
+    "PENDING",
+    "WIN",
+    "LOSS",
+    "PUSH",
+    "HALF_WIN",
+    "HALF_LOSS",
+    "VOID",
+]
+SETTLED_STATUSES = frozenset(
+    {"WIN", "LOSS", "PUSH", "HALF_WIN", "HALF_LOSS", "VOID"}
+)
 
 # Match considered finished this long after kickoff (FT + buffer).
 DEFAULT_SETTLE_GRACE = timedelta(hours=2)
@@ -139,6 +152,8 @@ def ensure_live_bets_table(db_path: Path | str = DEFAULT_DB_PATH) -> Path:
             )
         if "clv_pct" not in cols:
             conn.execute(f"ALTER TABLE {LIVE_BETS_TABLE} ADD COLUMN clv_pct REAL")
+        if "payout" not in cols:
+            conn.execute(f"ALTER TABLE {LIVE_BETS_TABLE} ADD COLUMN payout REAL")
         conn.execute(
             f"""
             CREATE INDEX IF NOT EXISTS idx_live_bets_status
@@ -160,9 +175,19 @@ def ensure_live_bets_table(db_path: Path | str = DEFAULT_DB_PATH) -> Path:
         )
         conn.execute(
             f"""
-            CREATE VIEW IF NOT EXISTS {JOURNAL_HISTORY_VIEW} AS
+            CREATE VIEW IF NOT EXISTS {USER_BETS_VIEW} AS
             SELECT * FROM {LIVE_BETS_TABLE}
-            WHERE status IN ('WIN', 'LOSS', 'PUSH')
+            """
+        )
+        # Recreate history view so HALF_* / VOID are included after upgrades.
+        conn.execute(f"DROP VIEW IF EXISTS {JOURNAL_HISTORY_VIEW}")
+        conn.execute(
+            f"""
+            CREATE VIEW {JOURNAL_HISTORY_VIEW} AS
+            SELECT * FROM {LIVE_BETS_TABLE}
+            WHERE status IN (
+                'WIN', 'LOSS', 'PUSH', 'HALF_WIN', 'HALF_LOSS', 'VOID'
+            )
             """
         )
         conn.commit()
@@ -717,22 +742,30 @@ def settle_live_bet(
     closing_odds: float | None = None,
     odds_close: float | None = None,
     pnl: float | None = None,
+    payout: float | None = None,
 ) -> float:
-    """Mark bet WIN/LOSS/PUSH and write PnL. Optionally set closing odds/CLV.
+    """Mark bet settled and write PnL + payout. Optionally set closing odds/CLV.
 
     Parameters
     ----------
     pnl:
         Optional cash PnL override (needed for half-win / half-lose Asian lines).
-        When ``None``, PnL is derived from full stake × (odds − 1) / −stake / 0.
+        When ``None``, PnL is derived from full/half stake rules.
+    payout:
+        Optional cash returned to the bettor (stake×odds on full win, etc.).
+        When ``None``, derived alongside PnL.
     closing_odds / odds_close:
         Optional closing price (aliases). Sets ``clv_pct`` when provided.
     """
-    if status not in {"WIN", "LOSS", "PUSH"}:
-        raise ValueError(f"status must be WIN/LOSS/PUSH, got {status!r}")
-    if status == "PENDING":
-        raise ValueError("Cannot settle as PENDING")
+    from src.services.settlement_service import payout_from_outcome
 
+    raw = str(status or "").strip().upper()
+    if raw == "VOID":
+        raw = "PUSH"
+    if raw not in {"WIN", "LOSS", "PUSH", "HALF_WIN", "HALF_LOSS"}:
+        raise ValueError(
+            f"status must be WIN/LOSS/PUSH/HALF_WIN/HALF_LOSS/VOID, got {status!r}"
+        )
     path = ensure_live_bets_table(db_path)
     with sqlite3.connect(path) as conn:
         row = conn.execute(
@@ -745,23 +778,21 @@ def settle_live_bet(
         if cur_status != "PENDING":
             raise RuntimeError(f"Bet #{bet_id} already settled as {cur_status}")
 
-        if pnl is not None:
-            realised = float(pnl)
-        elif status == "WIN":
-            realised = stake * (odds - 1.0)
-        elif status == "LOSS":
-            realised = -stake
+        if pnl is not None and payout is not None:
+            realised, paid = float(pnl), float(payout)
         else:
-            realised = 0.0
+            derived_pnl, derived_pay = payout_from_outcome(raw, odds, stake)
+            realised = float(pnl) if pnl is not None else derived_pnl
+            paid = float(payout) if payout is not None else derived_pay
 
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         conn.execute(
             f"""
             UPDATE {LIVE_BETS_TABLE}
-            SET status = ?, pnl = ?, settled_at = ?
+            SET status = ?, pnl = ?, payout = ?, settled_at = ?
             WHERE id = ?
             """,
-            (status, float(realised), now, int(bet_id)),
+            (raw, float(realised), float(paid), now, int(bet_id)),
         )
         conn.commit()
 
@@ -793,16 +824,23 @@ def journal_summary_from_frame(
     if df is None or df.empty:
         settled = pending = df if df is not None else pd.DataFrame()
     else:
-        settled = df.loc[df["status"].isin(["WIN", "LOSS", "PUSH"])]
+        settled = df.loc[df["status"].isin(list(SETTLED_STATUSES))]
         pending = df.loc[df["status"] == "PENDING"]
 
     realised_pnl = float(settled["pnl"].sum()) if not settled.empty else 0.0
     pending_stake = (
         float(pending["stake_amount"].sum()) if not pending.empty else 0.0
     )
-    wins = int((settled["status"] == "WIN").sum()) if not settled.empty else 0
-    losses = int((settled["status"] == "LOSS").sum()) if not settled.empty else 0
-    pushes = int((settled["status"] == "PUSH").sum()) if not settled.empty else 0
+    status_u = (
+        settled["status"].astype(str).str.upper()
+        if not settled.empty
+        else pd.Series(dtype=str)
+    )
+    wins = int(status_u.isin(["WIN", "HALF_WIN"]).sum()) if not settled.empty else 0
+    losses = int(status_u.isin(["LOSS", "HALF_LOSS"]).sum()) if not settled.empty else 0
+    pushes = (
+        int(status_u.isin(["PUSH", "VOID"]).sum()) if not settled.empty else 0
+    )
     current = float(initial_bankroll) + realised_pnl
 
     stake_settled = (
@@ -986,89 +1024,59 @@ def resolve_bet_outcome(
     """Settle one paper bet against full-time (and optional corner) scores.
 
     Supports markets ``1X2``, ``OU``, ``AH``, ``Corners`` (OU or AH on HC/AC).
-    Reuses backtester Asian settlement (incl. quarter-line half outcomes).
+    Reuses Asian quarter-line half outcomes via :mod:`src.services.settlement_service`.
+    Returns ``(status, pnl)``; status may be HALF_WIN / HALF_LOSS.
     """
-    from src.backtester import settle_1x2, settle_ah, settle_ou
+    from src.services.settlement_service import resolve_bet_settlement
 
-    mkt = str(market or "1X2").strip().upper()
-    sel = str(selection or "").strip()
-    label, line = parse_selection_line(sel)
-    o, s = float(odds), float(stake)
-
-    if mkt in {"1X2", "MATCH", "H2H"}:
-        status = settle_1x2(normalize_selection(sel), str(ftr))
-        if status == "WIN":
-            return "WIN", s * (o - 1.0)
-        if status == "LOSS":
-            return "LOSS", -s
-        return "PUSH", 0.0
-
-    if mkt in {"OU", "O/U", "OVER/UNDER"}:
-        if line is None:
-            raise ValueError(f"OU selection missing line: {sel!r}")
-        return settle_ou(label, int(fthg), int(ftag), float(line), o, s)
-
-    if mkt in {"AH", "ASIAN", "ASIAN HANDICAP"}:
-        if line is None:
-            raise ValueError(f"AH selection missing handicap: {sel!r}")
-        # Recommender stores away as ``AH Away {-home_hand:+g}``; convert
-        # back to home-convention before ``settle_ah`` (which mirrors Away).
-        if "away" in label.lower():
-            return settle_ah("AH Away", int(fthg), int(ftag), -float(line), o, s)
-        return settle_ah("AH Home", int(fthg), int(ftag), float(line), o, s)
-
-    if mkt in {"CORNERS", "CORNER"}:
-        if hc is None or ac is None or (isinstance(hc, float) and np.isnan(hc)):
-            raise ValueError("Corners settlement requires HC/AC")
-        hc_i, ac_i = int(hc), int(ac)
-        if label in {"Over", "Under"}:
-            if line is None:
-                raise ValueError(f"Corners OU missing line: {sel!r}")
-            return settle_ou(label, hc_i, ac_i, float(line), o, s)
-        if "AH" in label.upper() or label in {"Home", "Away"}:
-            if line is None:
-                raise ValueError(f"Corners AH missing line: {sel!r}")
-            if "away" in label.lower():
-                return settle_ah("AH Away", hc_i, ac_i, -float(line), o, s)
-            return settle_ah("AH Home", hc_i, ac_i, float(line), o, s)
-        raise ValueError(f"Unsupported Corners selection: {sel!r}")
-
-    # Fallback: treat unknown market as 1X2 if selection normalises.
-    status = settle_1x2(normalize_selection(sel), str(ftr))
-    if status == "WIN":
-        return "WIN", s * (o - 1.0)
-    if status == "LOSS":
-        return "LOSS", -s
-    return "PUSH", 0.0
-
+    status, pnl, _payout = resolve_bet_settlement(
+        market=market,
+        selection=selection,
+        odds=odds,
+        stake=stake,
+        fthg=fthg,
+        ftag=ftag,
+        ftr=ftr,
+        hc=hc,
+        ac=ac,
+    )
+    return status, pnl  # type: ignore[return-value]
 
 def compute_settled_brier(
     settled: pd.DataFrame | None = None,
     *,
     db_path: Path | str | None = None,
 ) -> float:
-    """Binary overnight Brier on settled WIN/LOSS rows with ``p_model``.
+    """Binary overnight Brier on settled rows with ``p_model``.
 
-    ``y = 1`` for WIN, ``0`` for LOSS; PUSH and missing ``p_model`` skipped.
+    ``y = 1`` for WIN/HALF_WIN, ``0`` for LOSS/HALF_LOSS; PUSH/VOID and
+    missing ``p_model`` skipped.
     """
     if settled is None:
         if db_path is None:
             return float("nan")
         df = load_live_bets(db_path)
-        settled = df.loc[df["status"].isin(["WIN", "LOSS", "PUSH"])] if not df.empty else df
+        settled = (
+            df.loc[df["status"].isin(list(SETTLED_STATUSES))] if not df.empty else df
+        )
     if settled is None or settled.empty:
         return float("nan")
     if "p_model" not in settled.columns:
         return float("nan")
 
-    rows = settled.loc[settled["status"].isin(["WIN", "LOSS"])].copy()
+    rows = settled.loc[
+        settled["status"].astype(str).str.upper().isin(
+            ["WIN", "LOSS", "HALF_WIN", "HALF_LOSS"]
+        )
+    ].copy()
     p = pd.to_numeric(rows["p_model"], errors="coerce")
     mask = p.notna() & np.isfinite(p.to_numpy(dtype=float))
     if not mask.any():
         return float("nan")
-    y = (rows.loc[mask, "status"] == "WIN").astype(float)
+    y = rows.loc[mask, "status"].astype(str).str.upper().isin(["WIN", "HALF_WIN"]).astype(
+        float
+    )
     return brier_score(y.to_numpy(), p.loc[mask].to_numpy(dtype=float))
-
 
 def evaluate_pending_against_results(
     results: pd.DataFrame,
@@ -1182,9 +1190,10 @@ def evaluate_pending_against_results(
 
         settled_n += 1
         pnl_sum += float(pnl)
-        if status == "WIN":
+        st = str(status).upper()
+        if st in {"WIN", "HALF_WIN"}:
             wins += 1
-        elif status == "LOSS":
+        elif st in {"LOSS", "HALF_LOSS"}:
             losses += 1
         else:
             pushes += 1

@@ -1,0 +1,95 @@
+# Quant Engine — 24/7 stack
+#
+# Schedulers (value signals + settlement) run inside the **web** FastAPI
+# lifespan (APScheduler). The **bot** process is Telegram polling only.
+# Do NOT set ENABLE_*_SCHEDULER=true on bot unless you disable them on web —
+# running both would double-fire jobs.
+#
+# Usage:
+#   cp .env.example .env   # fill DOMAIN, TELEGRAM_*, ENABLE_*
+#   ./deploy.sh
+#   # SSL: see DEPLOY.md (certbot profile)
+
+services:
+  web:
+    build: .
+    image: score-quant:latest
+    container_name: score-web
+    command: >
+      uvicorn src.api.main:app
+      --host 0.0.0.0
+      --port 8000
+    env_file:
+      - .env
+    environment:
+      # Schedulers live here (FastAPI lifespan) — prefer web-only
+      ENABLE_VALUE_SCHEDULER: ${ENABLE_VALUE_SCHEDULER:-true}
+      ENABLE_SETTLE_SCHEDULER: ${ENABLE_SETTLE_SCHEDULER:-true}
+      TELEGRAM_AUTH_DISABLED: ${TELEGRAM_AUTH_DISABLED:-false}
+      # Set WEBAPP_URL in .env to https://YOUR_DOMAIN/webapp/
+      WEBAPP_URL: ${WEBAPP_URL}
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    expose:
+      - "8000"
+    networks:
+      - score-net
+    restart: unless-stopped
+
+  bot:
+    build: .
+    image: score-quant:latest
+    container_name: score-bot
+    # Telegram Bot & WebApp launcher — polling only.
+    # Schedulers stay on web (see top comment). Forced off here for safety.
+    command: python -m src.bot.telegram_bot
+    env_file:
+      - .env
+    environment:
+      ENABLE_VALUE_SCHEDULER: "false"
+      ENABLE_SETTLE_SCHEDULER: "false"
+      WEBAPP_URL: ${WEBAPP_URL}
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    depends_on:
+      - web
+    networks:
+      - score-net
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    container_name: score-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    volumes:
+      # Official nginx image runs envsubst on *.template → conf.d/
+      - ./nginx/templates:/etc/nginx/templates:ro
+      - ./nginx/certbot/www:/var/www/certbot:ro
+      - ./nginx/certbot/conf:/etc/letsencrypt:ro
+    depends_on:
+      - web
+    networks:
+      - score-net
+    restart: unless-stopped
+
+  # Optional Certbot companion — enable with: docker compose --profile certs run --rm certbot ...
+  # See DEPLOY.md for issue / renew commands.
+  certbot:
+    image: certbot/certbot:latest
+    container_name: score-certbot
+    profiles: ["certs"]
+    volumes:
+      - ./nginx/certbot/www:/var/www/certbot
+      - ./nginx/certbot/conf:/etc/letsencrypt
+    networks:
+      - score-net
+
+networks:
+  score-net:
+    driver: bridge

@@ -136,3 +136,24 @@ class ValueBetsResponse(BaseModel):
 
 class HealthOut(BaseModel):
     status: str = "ok"
+
+
+class PerformanceAnalyticsOut(BaseModel):
+    """Post-match paper-trading performance summary."""
+
+    total_bets_placed: int = 0
+    total_bets_settled: int = 0
+    win_rate_percent: float = 0.0
+    net_pnl: float = 0.0
+    realized_roi_percent: float = 0.0
+    ev_vs_realized_gap: float | None = None
+    expected_ev_percent: float | None = None
+    brier_score: float | None = None
+    brier_note: str | None = Field(
+        default=None,
+        description="Explains missing Brier when insufficient p_model data",
+    )
+    days: int | None = None
+    league: str | None = None
+    notes: str | None = None
+

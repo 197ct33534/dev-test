@@ -7,11 +7,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from src.api.auth import require_telegram_webapp
 from src.api.routes import api_v1, router as root_router
+from src.api.routes_analytics import router as analytics_router
 from src.data_loader import PROJECT_ROOT
 
 
@@ -71,7 +73,13 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.include_router(root_router)
-    app.include_router(api_v1)
+    api_v1.include_router(analytics_router)
+    # Protect /api/v1/* with Telegram WebApp initData (bypass via TELEGRAM_AUTH_DISABLED).
+    # /health, /docs, /webapp stay public.
+    app.include_router(
+        api_v1,
+        dependencies=[Depends(require_telegram_webapp)],
+    )
 
     webapp = _webapp_dir()
     app.mount(

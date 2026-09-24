@@ -1,4 +1,4 @@
-/* Telegram WebApp — Lite value-bet cards */
+/* Telegram WebApp — Lite value-bet cards + journal performance */
 (function () {
   const tg = window.Telegram && window.Telegram.WebApp;
   if (tg) {
@@ -6,7 +6,13 @@
     try { tg.expand(); } catch (_) {}
   }
 
-  const state = { bets: [], market: "ALL", loading: false };
+  const state = {
+    bets: [],
+    market: "ALL",
+    view: "bets",
+    loading: false,
+    perf: null,
+  };
 
   const el = {
     user: document.getElementById("user-name"),
@@ -18,12 +24,38 @@
     modalTitle: document.getElementById("modal-title"),
     modalBody: document.getElementById("modal-body"),
     modalClose: document.getElementById("modal-close"),
+    mainNav: document.getElementById("main-nav"),
+    viewBets: document.getElementById("view-bets"),
+    viewJournal: document.getElementById("view-journal"),
+    perfStatus: document.getElementById("perf-status"),
+    perfMetrics: document.getElementById("perf-metrics"),
+    perfWinrate: document.getElementById("perf-winrate"),
+    perfPnl: document.getElementById("perf-pnl"),
+    perfRoi: document.getElementById("perf-roi"),
+    perfMeta: document.getElementById("perf-meta"),
   };
 
   const user = tg && tg.initDataUnsafe && tg.initDataUnsafe.user;
   if (user) {
     const name = [user.first_name, user.last_name].filter(Boolean).join(" ") || user.username || "Bạn";
     el.user.textContent = name;
+  }
+
+  /** Auth headers for API calls (Telegram Mini App initData). */
+  function authHeaders() {
+    const headers = {};
+    const initData = tg && tg.initData;
+    if (initData) {
+      headers["Authorization"] = `tma ${initData}`;
+      headers["X-Telegram-Init-Data"] = initData;
+    }
+    return headers;
+  }
+
+  function apiFetch(url, options) {
+    const opts = options || {};
+    const headers = Object.assign({}, authHeaders(), opts.headers || {});
+    return fetch(url, Object.assign({}, opts, { headers }));
   }
 
   function esc(s) {
@@ -44,6 +76,14 @@
     return Number(v).toFixed(2);
   }
 
+  function signedColor(n) {
+    if (n == null || Number.isNaN(Number(n))) return "text-tg-hint";
+    const x = Number(n);
+    if (x > 0) return "text-emerald-400";
+    if (x < 0) return "text-rose-400";
+    return "text-tg-text";
+  }
+
   function restLine(b) {
     if (b.fatigue_label) return b.fatigue_label;
     const hr = b.home_rest_days;
@@ -57,6 +97,19 @@
   function filteredBets() {
     if (state.market === "ALL") return state.bets;
     return state.bets.filter((b) => String(b.market || "") === state.market);
+  }
+
+  function setView(view) {
+    state.view = view === "journal" ? "journal" : "bets";
+    el.viewBets.classList.toggle("hidden", state.view !== "bets");
+    el.viewJournal.classList.toggle("hidden", state.view !== "journal");
+    el.tabs.classList.toggle("hidden", state.view !== "bets");
+    el.mainNav.querySelectorAll(".nav-tab").forEach((btn) => {
+      const active = btn.dataset.view === state.view;
+      btn.classList.toggle("nav-active", active);
+      btn.classList.toggle("text-tg-hint", !active);
+    });
+    if (state.view === "journal") loadPerformance();
   }
 
   function renderCards() {
@@ -105,12 +158,55 @@
       .join("");
   }
 
+  function renderPerformance(data) {
+    state.perf = data;
+    if (!data) {
+      el.perfStatus.classList.remove("hidden");
+      el.perfStatus.textContent = "Không có dữ liệu.";
+      el.perfMetrics.classList.add("hidden");
+      el.perfMeta.classList.add("hidden");
+      return;
+    }
+    el.perfStatus.classList.add("hidden");
+    el.perfMetrics.classList.remove("hidden");
+
+    const wr = data.win_rate_percent;
+    const pnl = data.net_pnl;
+    const roi = data.realized_roi_percent;
+
+    el.perfWinrate.textContent = wr == null ? "—" : `${Number(wr).toFixed(1)}%`;
+    el.perfWinrate.className = `text-lg font-semibold mt-0.5 ${signedColor(wr - 50)}`;
+
+    el.perfPnl.textContent =
+      pnl == null ? "—" : `${pnl >= 0 ? "+" : ""}${Number(pnl).toFixed(2)}$`;
+    el.perfPnl.className = `text-lg font-semibold mt-0.5 ${signedColor(pnl)}`;
+
+    el.perfRoi.textContent =
+      roi == null ? "—" : `${roi >= 0 ? "+" : ""}${Number(roi).toFixed(1)}%`;
+    el.perfRoi.className = `text-lg font-semibold mt-0.5 ${signedColor(roi)}`;
+
+    const bits = [
+      data.total_bets_settled != null && `${data.total_bets_settled} đã settle`,
+      data.total_bets_placed != null && `${data.total_bets_placed} đã đặt`,
+      data.brier_score != null && `Brier ${Number(data.brier_score).toFixed(3)}`,
+      data.brier_note,
+      data.ev_vs_realized_gap != null &&
+        `EV−ROI gap ${Number(data.ev_vs_realized_gap).toFixed(1)}pp`,
+    ].filter(Boolean);
+    if (bits.length) {
+      el.perfMeta.classList.remove("hidden");
+      el.perfMeta.textContent = bits.join(" · ");
+    } else {
+      el.perfMeta.classList.add("hidden");
+    }
+  }
+
   async function loadBets() {
     state.loading = true;
     el.status.textContent = "Đang tải kèo hời…";
     el.refresh.disabled = true;
     try {
-      const res = await fetch("/api/v1/value-bets?min_ev=5&limit=20&markets=1X2,AH,OU,Corners");
+      const res = await apiFetch("/api/v1/value-bets?min_ev=5&limit=20&markets=1X2,AH,OU,Corners");
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       state.bets = data.bets || [];
@@ -121,6 +217,21 @@
     } finally {
       state.loading = false;
       el.refresh.disabled = false;
+    }
+  }
+
+  async function loadPerformance() {
+    el.perfStatus.classList.remove("hidden");
+    el.perfStatus.textContent = "Đang tải hiệu suất…";
+    el.perfMetrics.classList.add("hidden");
+    try {
+      const res = await apiFetch("/api/v1/analytics/performance");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      renderPerformance(data);
+    } catch (err) {
+      el.perfStatus.textContent = `Lỗi: ${err.message || err}`;
+      el.perfMetrics.classList.add("hidden");
     }
   }
 
@@ -154,8 +265,8 @@
     el.modal.classList.remove("hidden");
     try {
       const [rh, ra] = await Promise.all([
-        fetch(`/api/v1/teams/${encodeURIComponent(home)}/profile`),
-        fetch(`/api/v1/teams/${encodeURIComponent(away)}/profile`),
+        apiFetch(`/api/v1/teams/${encodeURIComponent(home)}/profile`),
+        apiFetch(`/api/v1/teams/${encodeURIComponent(away)}/profile`),
       ]);
       const dh = rh.ok ? await rh.json() : null;
       const da = ra.ok ? await ra.json() : null;
@@ -167,6 +278,12 @@
       el.modalBody.innerHTML = `<p class="text-red-300">Lỗi: ${esc(err.message || err)}</p>`;
     }
   }
+
+  el.mainNav.addEventListener("click", (e) => {
+    const btn = e.target.closest(".nav-tab");
+    if (!btn) return;
+    setView(btn.dataset.view || "bets");
+  });
 
   el.tabs.addEventListener("click", (e) => {
     const btn = e.target.closest(".tab");
@@ -190,7 +307,17 @@
   el.modal.addEventListener("click", (e) => {
     if (e.target === el.modal) el.modal.classList.add("hidden");
   });
-  el.refresh.addEventListener("click", loadBets);
+  el.refresh.addEventListener("click", () => {
+    if (state.view === "journal") loadPerformance();
+    else loadBets();
+  });
+
+  // Deep-link: /webapp/?tab=journal or #journal
+  const params = new URLSearchParams(window.location.search);
+  const hash = (window.location.hash || "").replace(/^#/, "");
+  if (params.get("tab") === "journal" || hash === "journal") {
+    setView("journal");
+  }
 
   loadBets();
 })();

@@ -1,0 +1,44 @@
+.git
+.github
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+venv
+env
+__pycache__
+**/__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Secrets — mount via env_file / volumes at runtime
+.env
+.env.*
+!.env.example
+
+# Local / IDE
+.idea
+.vscode
+*.swp
+.DS_Store
+Thumbs.db
+
+# Tests & caches (not needed in image)
+tests
+.coverage
+htmlcov
+*.egg-info
+dist
+build
+
+# Large local artifacts already volume-mounted in compose
+# (keep models/ out of build context when present on host; compose mounts ./models)
+# Uncomment next line if you prefer always mounting models at runtime only:
+# models
+
+# Agent / editor noise
+.cursor
+.claude
+agent-transcripts

@@ -54,6 +54,7 @@ python test_recommender.py
 | `src/recommender.py` | EV, Fair Odds, Quarter Kelly, `ValueBetRecommender` |
 | `src/corner_model.py` | Poisson corner GLM |
 | `test_recommender.py` | End-to-end integration check |
+| `DEPLOY.md` | Docker / VPS 24/7 deploy (nginx + web + bot) |
 
 ## Rules (from `.cursorrules`)
 

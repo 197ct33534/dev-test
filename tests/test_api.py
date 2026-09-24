@@ -12,7 +12,9 @@ from src.api.main import create_app
 
 
 @pytest.fixture()
-def client() -> TestClient:
+def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    # Local / CI: skip Telegram Mini App HMAC on /api/v1/*
+    monkeypatch.setenv("TELEGRAM_AUTH_DISABLED", "true")
     return TestClient(create_app())
 
 
@@ -133,11 +135,40 @@ def test_value_bets_mocked(client: TestClient) -> None:
     assert body["bets"][0]["ai_reasons"] == ["EV dương"]
 
 
+def test_performance_analytics_route(client: TestClient) -> None:
+    fake = {
+        "total_bets_placed": 10,
+        "total_bets_settled": 8,
+        "win_rate_percent": 62.5,
+        "net_pnl": 42.0,
+        "realized_roi_percent": 5.25,
+        "ev_vs_realized_gap": 2.1,
+        "expected_ev_percent": 7.35,
+        "brier_score": 0.21,
+        "brier_note": None,
+        "days": 30,
+        "league": "EPL",
+        "notes": None,
+    }
+    with patch(
+        "src.api.routes_analytics.performance_analytics_sync",
+        return_value=fake,
+    ):
+        r = client.get("/api/v1/analytics/performance?days=30&league=EPL")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["win_rate_percent"] == 62.5
+    assert body["net_pnl"] == 42.0
+    assert body["realized_roi_percent"] == 5.25
+    assert body["ev_vs_realized_gap"] == 2.1
+
+
 def test_webapp_static_served(client: TestClient) -> None:
     r = client.get("/webapp/")
     assert r.status_code == 200
     assert "text/html" in r.headers.get("content-type", "")
     assert "Soi Kèo" in r.text or "telegram-web-app" in r.text
+    assert "Nhật Ký Cược" in r.text
 
 
 def test_parse_markets() -> None:

@@ -290,13 +290,27 @@ async def run_value_signal_job(
     return summary
 
 
+def settle_scheduler_enabled() -> bool:
+    """Settlement job runs with the value scheduler, or alone when enabled."""
+    # Default on when value scheduler is on; opt-in via ENABLE_SETTLE_SCHEDULER.
+    if scheduler_enabled():
+        return _env_bool("ENABLE_SETTLE_SCHEDULER", default=True)
+    return _env_bool("ENABLE_SETTLE_SCHEDULER", default=False)
+
+
 def start_scheduler() -> Any:
     """Create and start ``AsyncIOScheduler`` if enabled. Idempotent."""
     global _scheduler
     if _scheduler is not None:
         return _scheduler
-    if not scheduler_enabled():
-        logger.info("Value signal scheduler disabled (ENABLE_VALUE_SCHEDULER≠true)")
+
+    want_signals = scheduler_enabled()
+    want_settle = settle_scheduler_enabled()
+    if not want_signals and not want_settle:
+        logger.info(
+            "Schedulers disabled "
+            "(ENABLE_VALUE_SCHEDULER / ENABLE_SETTLE_SCHEDULER ≠ true)"
+        )
         return None
 
     try:
@@ -306,25 +320,59 @@ def start_scheduler() -> Any:
         return None
 
     interval = _env_int("SIGNAL_INTERVAL_MINUTES", DEFAULT_INTERVAL_MINUTES)
+    settle_interval = _env_int("SETTLE_INTERVAL_MINUTES", 45)
     sched = AsyncIOScheduler()
-    sched.add_job(
-        run_value_signal_job,
-        trigger="interval",
-        minutes=max(1, int(interval)),
-        id="value_signal_scan",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-    )
+
+    if want_signals:
+        sched.add_job(
+            run_value_signal_job,
+            trigger="interval",
+            minutes=max(1, int(interval)),
+            id="value_signal_scan",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        logger.info(
+            "Value signal scheduler started (every %s min, EV≥%s%% or |Δline|≥%s)",
+            interval,
+            signal_min_ev_pct(),
+            signal_min_line_delta(),
+        )
+
+    if want_settle:
+        sched.add_job(
+            run_settlement_job,
+            trigger="interval",
+            minutes=max(5, int(settle_interval)),
+            id="settle_completed_matches",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        logger.info("Settlement scheduler started (every %s min)", settle_interval)
+
     sched.start()
     _scheduler = sched
-    logger.info(
-        "Value signal scheduler started (every %s min, EV≥%s%% or |Δline|≥%s)",
-        interval,
-        signal_min_ev_pct(),
-        signal_min_line_delta(),
-    )
     return sched
+
+
+async def run_settlement_job() -> dict[str, Any]:
+    """Periodic settle of PENDING journal bets vs ``global_matches.db``."""
+    from src.services.settlement_service import settle_completed_matches_async
+
+    try:
+        summary = await settle_completed_matches_async()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("settlement job failed: %s", exc)
+        return {"ok": False, "error": str(exc)}
+    if summary.get("settled"):
+        logger.info(
+            "settlement job: settled=%s pnl=%.2f",
+            summary.get("settled"),
+            float(summary.get("pnl") or 0.0),
+        )
+    return {"ok": True, **summary}
 
 
 def stop_scheduler() -> None:
