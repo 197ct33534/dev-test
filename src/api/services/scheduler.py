@@ -28,6 +28,8 @@ DEFAULT_INTERVAL_MINUTES = 20
 DEFAULT_HORIZON_HOURS = 24
 DEFAULT_MIN_EV_PCT = 8.0
 DEFAULT_MIN_LINE_DELTA = 0.5
+# 0 = disabled. Production telegram_bot compose sets SIGNAL_MIN_DATA_SCORE=75.
+DEFAULT_MIN_DATA_SCORE = 0.0
 
 # Scan below signal EV so line-disparity-only picks still appear.
 _SCAN_MIN_EV_PCT = 1.0
@@ -75,6 +77,27 @@ def signal_min_line_delta() -> float:
     return _env_float("SIGNAL_MIN_LINE_DELTA", DEFAULT_MIN_LINE_DELTA)
 
 
+def signal_min_data_score() -> float:
+    """Minimum aggregate data score (0–100). ``0`` disables the gate."""
+    return _env_float("SIGNAL_MIN_DATA_SCORE", DEFAULT_MIN_DATA_SCORE)
+
+
+def bet_data_score(bet: Mapping[str, Any]) -> float | None:
+    """Read ``aggregate_data_score`` / ``data_score`` when present."""
+    for key in ("aggregate_data_score", "data_score"):
+        raw = bet.get(key)
+        if raw is None:
+            continue
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if val != val:  # NaN
+            continue
+        return val
+    return None
+
+
 def market_line_delta(bet: Mapping[str, Any]) -> float | None:
     """Abs board-line delta for the bet's market (OU / AH), else best available."""
     mkt = str(bet.get("market") or "").strip().upper()
@@ -108,8 +131,15 @@ def is_hot_signal(
     *,
     min_ev_pct: float = DEFAULT_MIN_EV_PCT,
     min_line_delta: float = DEFAULT_MIN_LINE_DELTA,
+    min_data_score: float = DEFAULT_MIN_DATA_SCORE,
 ) -> bool:
-    """True when EV ≥ floor **or** |line_delta| ≥ floor."""
+    """True when EV ≥ floor **or** |line_delta| ≥ floor (and data-score gate)."""
+    if float(min_data_score) > 0.0:
+        score = bet_data_score(bet)
+        # Missing score: allow (legacy scanner rows); present-but-low: reject.
+        if score is not None and float(score) < float(min_data_score):
+            return False
+
     ev_pct = bet.get("ev_pct")
     if ev_pct is None and bet.get("ev") is not None:
         try:
@@ -181,15 +211,21 @@ def filter_hot_signals(
     *,
     min_ev_pct: float = DEFAULT_MIN_EV_PCT,
     min_line_delta: float = DEFAULT_MIN_LINE_DELTA,
+    min_data_score: float = DEFAULT_MIN_DATA_SCORE,
     horizon_hours: float = DEFAULT_HORIZON_HOURS,
     now: datetime | None = None,
 ) -> list[Mapping[str, Any]]:
-    """Apply 24h window + EV/line hot filter (pure; no I/O)."""
+    """Apply 24h window + EV/line/data-score hot filter (pure; no I/O)."""
     out: list[Mapping[str, Any]] = []
     for bet in bets:
         if not kickoff_within_hours(bet, hours=horizon_hours, now=now):
             continue
-        if not is_hot_signal(bet, min_ev_pct=min_ev_pct, min_line_delta=min_line_delta):
+        if not is_hot_signal(
+            bet,
+            min_ev_pct=min_ev_pct,
+            min_line_delta=min_line_delta,
+            min_data_score=min_data_score,
+        ):
             continue
         out.append(bet)
     return out
@@ -218,6 +254,7 @@ async def run_value_signal_job(
     """One scheduler tick: scan → filter → dedupe → push."""
     min_ev = signal_min_ev_pct()
     min_delta = signal_min_line_delta()
+    min_score = signal_min_data_score()
     horizon = _env_float("SIGNAL_HORIZON_HOURS", float(DEFAULT_HORIZON_HOURS))
     store = db_path or DEFAULT_DB_PATH
 
@@ -231,6 +268,7 @@ async def run_value_signal_job(
         candidates,
         min_ev_pct=min_ev,
         min_line_delta=min_delta,
+        min_data_score=min_score,
         horizon_hours=horizon,
     )
     pushed = 0
@@ -334,10 +372,12 @@ def start_scheduler() -> Any:
             coalesce=True,
         )
         logger.info(
-            "Value signal scheduler started (every %s min, EV≥%s%% or |Δline|≥%s)",
+            "Value signal scheduler started "
+            "(every %s min, EV≥%s%% or |Δline|≥%s, data_score≥%s)",
             interval,
             signal_min_ev_pct(),
             signal_min_line_delta(),
+            signal_min_data_score(),
         )
 
     if want_settle:

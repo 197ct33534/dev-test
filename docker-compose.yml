@@ -1,17 +1,18 @@
-# Quant Engine — 24/7 stack
+# Quant Engine — Dockerization V2 (24/7 production)
 #
-# Schedulers (value signals + settlement) run inside the **web** FastAPI
-# lifespan (APScheduler). The **bot** process is Telegram polling only.
-# Do NOT set ENABLE_*_SCHEDULER=true on bot unless you disable them on web —
-# running both would double-fire jobs.
+# Schedulers are NOT on web_api (uvicorn --workers 2 would double-fire jobs).
+#   • Value alerts  → telegram_bot  (ENABLE_VALUE_SCHEDULER=true)
+#   • Settlement    → settlement_worker
+#   • Data monitor  → data_monitor_worker
 #
 # Usage:
-#   cp .env.example .env   # fill DOMAIN, TELEGRAM_*, ENABLE_*
+#   cp .env.example .env   # fill DOMAIN, TELEGRAM_*, SIGNAL_*
 #   ./deploy.sh
+#   # or: docker compose up -d
 #   # SSL: see DEPLOY.md (certbot profile)
 
 services:
-  web:
+  web_api:
     build: .
     image: score-quant:latest
     container_name: score-web
@@ -19,14 +20,14 @@ services:
       uvicorn src.api.main:app
       --host 0.0.0.0
       --port 8000
+      --workers 2
     env_file:
       - .env
     environment:
-      # Schedulers live here (FastAPI lifespan) — prefer web-only
-      ENABLE_VALUE_SCHEDULER: ${ENABLE_VALUE_SCHEDULER:-true}
-      ENABLE_SETTLE_SCHEDULER: ${ENABLE_SETTLE_SCHEDULER:-true}
+      # Multi-worker: never run APScheduler in FastAPI lifespan here
+      ENABLE_VALUE_SCHEDULER: "false"
+      ENABLE_SETTLE_SCHEDULER: "false"
       TELEGRAM_AUTH_DISABLED: ${TELEGRAM_AUTH_DISABLED:-false}
-      # Set WEBAPP_URL in .env to https://YOUR_DOMAIN/webapp/
       WEBAPP_URL: ${WEBAPP_URL}
     volumes:
       - ./data:/app/data
@@ -37,24 +38,60 @@ services:
       - score-net
     restart: unless-stopped
 
-  bot:
+  data_monitor_worker:
+    build: .
+    image: score-quant:latest
+    container_name: score-data-monitor
+    command: python -m src.workers.data_monitor
+    env_file:
+      - .env
+    environment:
+      DATA_MONITOR_INTERVAL_MINUTES: ${DATA_MONITOR_INTERVAL_MINUTES:-15}
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    networks:
+      - score-net
+    restart: unless-stopped
+
+  settlement_worker:
+    build: .
+    image: score-quant:latest
+    container_name: score-settlement
+    command: python -m src.workers.settlement_worker
+    env_file:
+      - .env
+    environment:
+      SETTLE_INTERVAL_MINUTES: ${SETTLE_INTERVAL_MINUTES:-30}
+      ENABLE_VALUE_SCHEDULER: "false"
+      ENABLE_SETTLE_SCHEDULER: "false"
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    networks:
+      - score-net
+    restart: unless-stopped
+
+  telegram_bot:
     build: .
     image: score-quant:latest
     container_name: score-bot
-    # Telegram Bot & WebApp launcher — polling only.
-    # Schedulers stay on web (see top comment). Forced off here for safety.
+    # WebApp launcher + value alerts (EV / data-score thresholds via env).
+    # Settlement stays on settlement_worker — forced off here.
     command: python -m src.bot.telegram_bot
     env_file:
       - .env
     environment:
-      ENABLE_VALUE_SCHEDULER: "false"
+      ENABLE_VALUE_SCHEDULER: ${ENABLE_VALUE_SCHEDULER:-true}
       ENABLE_SETTLE_SCHEDULER: "false"
+      SIGNAL_MIN_EV: ${SIGNAL_MIN_EV:-5}
+      SIGNAL_MIN_DATA_SCORE: ${SIGNAL_MIN_DATA_SCORE:-75}
       WEBAPP_URL: ${WEBAPP_URL}
     volumes:
       - ./data:/app/data
       - ./models:/app/models
     depends_on:
-      - web
+      - web_api
     networks:
       - score-net
     restart: unless-stopped
@@ -73,7 +110,7 @@ services:
       - ./nginx/certbot/www:/var/www/certbot:ro
       - ./nginx/certbot/conf:/etc/letsencrypt:ro
     depends_on:
-      - web
+      - web_api
     networks:
       - score-net
     restart: unless-stopped

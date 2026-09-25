@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Telegram bot that opens the Score WebApp.
+"""Telegram bot that opens the Score WebApp (+ optional value-signal scheduler).
 
 Requires
 --------
@@ -13,6 +13,19 @@ Telegram only launches WebApps over **HTTPS** (or ``http://127.0.0.1`` /
 If ``python run_api.py`` prints a non-8000 port (Laragon conflict), set
 ``WEBAPP_URL`` to that port.
 
+Value alerts
+------------
+When ``ENABLE_VALUE_SCHEDULER=true`` (Docker ``telegram_bot`` service), this
+process starts the APScheduler value-signal job from FastAPI's scheduler module
+(same code path). Thresholds via env:
+
+- ``SIGNAL_MIN_EV`` (compose default 5)
+- ``SIGNAL_MIN_DATA_SCORE`` (compose default 75; missing scores still pass)
+- ``SIGNAL_MIN_LINE_DELTA``, ``SIGNAL_INTERVAL_MINUTES``, …
+
+Keep ``ENABLE_SETTLE_SCHEDULER=false`` here — settlement runs in
+``src.workers.settlement_worker``.
+
 Run
 ---
     python -m src.bot.telegram_bot
@@ -20,8 +33,7 @@ Run
     python src/bot/telegram_bot.py
 
 ``/start`` persists ``chat_id`` into ``data/notified_signals.db``
-(``telegram_subscribers``) so the FastAPI value-signal scheduler can push
-alerts via Bot HTTP API without sharing this polling process.
+(``telegram_subscribers``) so value alerts can push via Bot HTTP API.
 """
 
 from __future__ import annotations
@@ -84,15 +96,39 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Bấm nút bên dưới để mở WebApp — xem Top kèo hời, EV%, "
         "và hồ sơ đội bóng.\n\n"
         "Bạn đã đăng ký nhận **tín hiệu value bet nóng** "
-        "(EV cao / lệch kèo) khi API scheduler bật.\n\n"
+        "(EV cao / lệch kèo) khi value scheduler bật.\n\n"
         f"WebApp: `{webapp_url}`"
     )
     if update.message:
         await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
 
+async def _post_init(application: Application) -> None:
+    """Start value-signal APScheduler on the bot event loop (production)."""
+    from src.api.services.scheduler import start_scheduler
+
+    sched = start_scheduler()
+    application.bot_data["value_scheduler"] = sched
+    if sched is not None:
+        logger.info("Value-signal scheduler attached to telegram_bot process")
+
+
+async def _post_shutdown(application: Application) -> None:
+    from src.api.services.scheduler import stop_scheduler
+
+    stop_scheduler()
+    application.bot_data.pop("value_scheduler", None)
+    logger.info("Value-signal scheduler stopped")
+
+
 def build_app(token: str) -> Application:
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     return app
 

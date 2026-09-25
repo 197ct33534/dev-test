@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from src.api.auth import require_telegram_webapp
 from src.api.routes import api_v1, router as root_router
 from src.api.routes_analytics import router as analytics_router
+from src.api.routes_v2 import api_v2
 from src.data_loader import PROJECT_ROOT
 
 
@@ -41,7 +42,11 @@ def _webapp_dir() -> Path:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Start optional value-signal BackgroundScheduler; stop on shutdown."""
+    """Optional APScheduler in lifespan (local / single-worker only).
+
+    Docker ``web_api`` sets ENABLE_*_SCHEDULER=false — value alerts run on
+    ``telegram_bot``, settlement on ``settlement_worker``.
+    """
     from src.api.services.scheduler import start_scheduler, stop_scheduler
 
     scheduler = start_scheduler()
@@ -74,10 +79,14 @@ def create_app() -> FastAPI:
     )
     app.include_router(root_router)
     api_v1.include_router(analytics_router)
-    # Protect /api/v1/* with Telegram WebApp initData (bypass via TELEGRAM_AUTH_DISABLED).
-    # /health, /docs, /webapp stay public.
+    # Protect /api/v1/* and /api/v2/* with Telegram WebApp initData
+    # (bypass via TELEGRAM_AUTH_DISABLED). /health, /docs, /webapp stay public.
     app.include_router(
         api_v1,
+        dependencies=[Depends(require_telegram_webapp)],
+    )
+    app.include_router(
+        api_v2,
         dependencies=[Depends(require_telegram_webapp)],
     )
 

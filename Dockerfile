@@ -1,4 +1,4 @@
-# Quant Engine — slim runtime image for FastAPI + Telegram bot
+# Quant Engine — slim runtime for FastAPI + workers + Telegram bot
 FROM python:3.11-slim
 
 # LightGBM needs OpenMP; keep apt footprint minimal
@@ -7,6 +7,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+ENV PYTHONPATH=/app \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -21,5 +24,5 @@ USER appuser
 
 EXPOSE 8000
 
-# Compose overrides CMD for web vs bot
+# Compose overrides CMD for web_api / workers / telegram_bot
 CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

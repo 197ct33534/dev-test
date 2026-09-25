@@ -68,6 +68,16 @@ def test_kickoff_within_hours() -> None:
     assert not kickoff_within_hours(past, hours=24, now=now)
 
 
+def test_is_hot_signal_data_score_gate() -> None:
+    hot = {"ev_pct": 10.0, "market": "1X2", "aggregate_data_score": 80.0}
+    cold = {"ev_pct": 10.0, "market": "1X2", "aggregate_data_score": 60.0}
+    legacy = {"ev_pct": 10.0, "market": "1X2"}  # missing score → still allowed
+    assert is_hot_signal(hot, min_ev_pct=5.0, min_data_score=75.0)
+    assert not is_hot_signal(cold, min_ev_pct=5.0, min_data_score=75.0)
+    assert is_hot_signal(legacy, min_ev_pct=5.0, min_data_score=75.0)
+    assert is_hot_signal(cold, min_ev_pct=5.0, min_data_score=0.0)
+
+
 def test_filter_hot_signals_combines_rules() -> None:
     now = datetime(2026, 9, 23, 10, 0, tzinfo=timezone.utc)
     bets = [
