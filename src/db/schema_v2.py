@@ -189,6 +189,40 @@ class CompetitionAlias(Base):
     )
 
 
+class StagingUnmappedCompetition(Base):
+    """Raw competition names that failed fuzzy auto-mapping (human review)."""
+
+    __tablename__ = "staging_unmapped_competitions"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_type",
+            "raw_name",
+            name="uq_staging_unmapped_competition_source",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=_uuid
+    )
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    raw_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    best_match_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    best_match_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="PENDING_REVIEW", index=True
+    )  # PENDING_REVIEW | RESOLVED | REJECTED
+    meta_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONType, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Core snapshots
 # ---------------------------------------------------------------------------

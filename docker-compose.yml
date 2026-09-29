@@ -39,7 +39,7 @@ services:
     restart: unless-stopped
 
   data_monitor_worker:
-    build: .
+    # Reuse image built by web_api — avoids BuildKit race on shared tag
     image: score-quant:latest
     container_name: score-data-monitor
     command: python -m src.workers.data_monitor
@@ -55,7 +55,6 @@ services:
     restart: unless-stopped
 
   settlement_worker:
-    build: .
     image: score-quant:latest
     container_name: score-settlement
     command: python -m src.workers.settlement_worker
@@ -73,7 +72,6 @@ services:
     restart: unless-stopped
 
   telegram_bot:
-    build: .
     image: score-quant:latest
     container_name: score-bot
     # WebApp launcher + value alerts (EV / data-score thresholds via env).
