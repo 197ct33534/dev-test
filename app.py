@@ -131,6 +131,14 @@ from src.strategy import (
     select_value_bets,
 )
 from src.timezone_utils import format_kickoff_vn
+from src.japan_schedule import (
+    JP_COMP_IDS,
+    attach_picks_to_records,
+    group_japan_matches,
+    japan_match_records,
+    load_japan_upcoming,
+    load_japan_upcoming_frames,
+)
 
 # ---------------------------------------------------------------------------
 # Page
@@ -1267,12 +1275,14 @@ def _apply_share_deep_link(
     league: str,
     alt_fixtures: pd.DataFrame | None = None,
     alt_league: str | None = None,
+    extra_fixtures: Sequence[tuple[str, pd.DataFrame]] | None = None,
 ) -> None:
     """Open Chi tiết when ``?match_id=`` / ``?match=`` is present and valid.
 
     Searches the active league first, then optional ``alt_fixtures`` (other
-    league). On an alt hit, switches the sidebar league and reruns so detail
-    loads the correct models/fixtures. Never silently drops a bad ``match_id``.
+    league), then ``extra_fixtures`` (e.g. Japan cups). On a cross-league hit,
+    switches the sidebar league and reruns so detail loads the correct
+    models/fixtures. Never silently drops a bad ``match_id``.
     """
     mid_q, slug_q = parse_match_query(dict(st.query_params))
     if not mid_q and not slug_q:
@@ -1297,6 +1307,16 @@ def _apply_share_deep_link(
         )
         if hit is not None:
             hit_league = alt_league
+    if hit is None and extra_fixtures:
+        for lg, efx in extra_fixtures:
+            if efx is None or getattr(efx, "empty", True):
+                continue
+            hit = find_fixture_for_share(
+                efx, match_id=mid_q, match_slug=slug_q
+            )
+            if hit is not None:
+                hit_league = str(lg)
+                break
 
     st.session_state["_share_deep_link_key"] = apply_key
     if hit is None:
@@ -2382,11 +2402,22 @@ try:
 except Exception:  # noqa: BLE001
     _alt_fixtures = None
 
+_jp_extra: list[tuple[str, pd.DataFrame]] = []
+try:
+    _jp_extra = [
+        (code, df)
+        for code, df in load_japan_upcoming_frames()
+        if code not in {league, _alt_league}
+    ]
+except Exception:  # noqa: BLE001
+    _jp_extra = []
+
 _apply_share_deep_link(
     fixtures,
     league=league,
     alt_fixtures=_alt_fixtures,
     alt_league=_alt_league,
+    extra_fixtures=_jp_extra or None,
 )
 
 # Deep-link / "mở chuyên sâu" while in Lite → switch to Pro so Chi tiết exists.
@@ -2501,6 +2532,7 @@ if st.session_state.pop("_tg_scan_send", False):
 # ---------------------------------------------------------------------------
 
 _NAV_TOP20 = "🔥 Top 20 Kèo Hời (Hôm Nay & Ngày Mai)"
+_NAV_JP = "🇯🇵 Lịch Nhật"
 _NAV_ABOUT = "Giới thiệu thuật toán"
 _NAV_DETAIL = "Chi tiết trận đấu & Mô hình"
 _NAV_BUDGET = "Quản lý ngân sách"
@@ -2511,6 +2543,7 @@ _NAV_CORNERS = "Phân tích Phạt Góc"
 _NAV_COMPARE = "So sánh đội"
 _NAV_OPTIONS = [
     _NAV_TOP20,
+    _NAV_JP,
     _NAV_ABOUT,
     _NAV_DETAIL,
     _NAV_BUDGET,
@@ -2520,7 +2553,7 @@ _NAV_OPTIONS = [
     _NAV_CORNERS,
     _NAV_COMPARE,
 ]
-_NAV_LITE_OPTIONS = [_NAV_LITE_TOP, _NAV_LITE_SEARCH]
+_NAV_LITE_OPTIONS = [_NAV_LITE_TOP, _NAV_LITE_SEARCH, _NAV_JP]
 
 if "_main_nav" not in st.session_state:
     st.session_state["_main_nav"] = _NAV_LITE_TOP if is_lite else _NAV_TOP20
@@ -2528,7 +2561,9 @@ if "_main_nav" not in st.session_state:
 # Map nav when toggling Lite ↔ Pro so pills never hold an invalid option.
 _cur_nav = st.session_state.get("_main_nav")
 if is_lite:
-    if _cur_nav not in _NAV_LITE_OPTIONS:
+    if _cur_nav == _NAV_JP:
+        pass  # shared Japan schedule tab
+    elif _cur_nav not in _NAV_LITE_OPTIONS:
         if _cur_nav == _NAV_TOP20:
             st.session_state["_main_nav"] = _NAV_LITE_TOP
         elif _cur_nav == _NAV_DETAIL and st.session_state.get("selected_match"):
@@ -2537,7 +2572,9 @@ if is_lite:
         else:
             st.session_state["_main_nav"] = _NAV_LITE_TOP
 else:
-    if _cur_nav in _NAV_LITE_OPTIONS:
+    if _cur_nav == _NAV_JP:
+        pass  # shared Japan schedule tab
+    elif _cur_nav in _NAV_LITE_OPTIONS:
         st.session_state["_main_nav"] = (
             _NAV_TOP20 if _cur_nav == _NAV_LITE_TOP else _NAV_DETAIL
         )
@@ -2553,7 +2590,8 @@ if st.session_state.pop("_goto_top20_tab", False):
 _miss_id = st.session_state.get("_share_deep_link_miss")
 if _miss_id:
     st.warning(
-        f"Không tìm thấy trận với `match_id={_miss_id}` trong fixtures EPL/UWCL. "
+        f"Không tìm thấy trận với `match_id={_miss_id}` trong fixtures "
+        "(EPL / UWCL / J.League Cup / Emperor's Cup). "
         "Bấm **Tải dữ liệu & huấn luyện lại** ở sidebar hoặc kiểm tra link."
     )
 _ok_link = st.session_state.pop("_share_deep_link_ok", None)
@@ -2772,6 +2810,144 @@ if is_lite and main_nav == _NAV_LITE_SEARCH:
                 default_league=str(hit["league"]),
                 key_prefix="lite_search_mini",
             )
+
+
+# ===========================================================================
+# Tab — Lịch Nhật (J.League Cup + Emperor's Cup)
+# ===========================================================================
+
+if main_nav == _NAV_JP:
+    st.header("🇯🇵 Lịch Nhật — J.League Cup & Emperor's Cup")
+    st.caption(
+        "Upcoming từ global_matches.db · Giờ VN · "
+        "Kèo gợi ý = mọi market EV≥ngưỡng (1X2/OU/AH) · "
+        "Chi tiết / Flashscore giữ nguyên"
+    )
+    _jp_base = _share_base_url() or "http://localhost:8501"
+    _jp_fx = load_japan_upcoming()
+    _jp_records = japan_match_records(_jp_fx, base_url=_jp_base)
+
+    _jp_c1, _jp_c2 = st.columns([1, 3])
+    with _jp_c1:
+        if st.button(
+            "🔄 Tính lại kèo",
+            key="jp_recalc_picks",
+            use_container_width=True,
+            help="Xóa cache session và chạy lại Dixon–Coles + EV cho từng trận.",
+        ):
+            st.session_state["jp_picks_cache"] = {}
+            st.rerun()
+    with _jp_c2:
+        st.caption(
+            f"EV ≥ {min_ev:.0%} · markets 1X2 / Tài-Xỉu / Chấp Á · "
+            "cache theo match_id trong session"
+        )
+
+    if "jp_picks_cache" not in st.session_state:
+        st.session_state["jp_picks_cache"] = {}
+
+    if not _jp_records:
+        st.warning(
+            "Chưa có fixture J.League Cup / Emperor's Cup trong DB. "
+            "Chọn giải ở sidebar rồi bấm **Làm mới dữ liệu**."
+        )
+    else:
+        # Fit (cached) Japan cup models — weak priors for thin cup history.
+        _jp_models: dict[str, Any] = {}
+        _jp_n_seasons = 3
+        _jp_n_train = min(int(n_train), 400)
+        for _jp_code in JP_COMP_IDS:
+            try:
+                _jp_models[_jp_code] = maybe_wrap_with_league_weights(
+                    _fit_dixon_coles(
+                        _jp_code,
+                        _jp_n_seasons,
+                        _jp_n_train,
+                        float(xi),
+                        force_refresh=False,
+                    ),
+                    _jp_code,
+                )
+            except Exception as _jp_exc:  # noqa: BLE001
+                st.caption(f"Model {_jp_code}: {_jp_exc}")
+
+        _jp_need = [
+            r["match_id"]
+            for r in _jp_records
+            if r.get("match_id")
+            and str(r["match_id"]) not in st.session_state["jp_picks_cache"]
+        ]
+        if _jp_need and _jp_models:
+            with st.spinner(
+                f"Đang tính kèo gợi ý cho {len(_jp_need)} trận…"
+            ):
+                _jp_records = attach_picks_to_records(
+                    _jp_records,
+                    _jp_fx,
+                    _jp_models,
+                    min_ev=float(min_ev),
+                    kelly_fraction=float(kelly_frac),
+                    cache=st.session_state["jp_picks_cache"],
+                    include_ou=True,
+                    include_ah=True,
+                )
+        else:
+            _jp_records = attach_picks_to_records(
+                _jp_records,
+                _jp_fx,
+                _jp_models,
+                min_ev=float(min_ev),
+                kelly_fraction=float(kelly_frac),
+                cache=st.session_state["jp_picks_cache"],
+                include_ou=True,
+                include_ah=True,
+            )
+
+        for _g_label, _g_rows in group_japan_matches(_jp_records):
+            st.subheader(_g_label)
+            _tbl = pd.DataFrame(
+                [
+                    {
+                        "Giải": r["comp_label"],
+                        "Trận": r["match"],
+                        "Giờ VN": r["kickoff_vn"],
+                        "Odds 1X2": r["odds"] or "—",
+                        "Kèo gợi ý": r.get("picks_text") or "—",
+                        "Chi tiết": r["detail_url"],
+                        "Flashscore": r["flashscore_url"],
+                    }
+                    for r in _g_rows
+                ]
+            )
+            st.dataframe(
+                _tbl,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Giải": st.column_config.TextColumn("Giải", width="small"),
+                    "Trận": st.column_config.TextColumn("Trận", width="medium"),
+                    "Giờ VN": st.column_config.TextColumn("Giờ VN", width="small"),
+                    "Odds 1X2": st.column_config.TextColumn(
+                        "Odds (H/D/A)", width="small"
+                    ),
+                    "Kèo gợi ý": st.column_config.TextColumn(
+                        "Kèo gợi ý",
+                        width="large",
+                        help="Mọi market EV≥ngưỡng; nếu không có → best pick + EV.",
+                    ),
+                    "Chi tiết": st.column_config.LinkColumn(
+                        "Chi tiết",
+                        display_text="Chi tiết",
+                        width="small",
+                    ),
+                    "Flashscore": st.column_config.LinkColumn(
+                        "Flashscore",
+                        display_text="Flashscore",
+                        width="small",
+                    ),
+                },
+            )
+            st.caption(f"{len(_g_rows)} trận")
 
 
 # ===========================================================================

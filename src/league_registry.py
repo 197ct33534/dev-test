@@ -192,6 +192,13 @@ def resolve_league_config(league: str) -> tuple[str, dict[str, object]]:
         "EMPEROR'S CUP": "EMPERORS_CUP",
         "JAPAN CUP": "EMPERORS_CUP",
         "CUP HOANG DE": "EMPERORS_CUP",
+        "J_LEAGUE_CUP": "J_LEAGUE_CUP",
+        "JLEAGUE_CUP": "J_LEAGUE_CUP",
+        "J.LEAGUE CUP": "J_LEAGUE_CUP",
+        "J LEAGUE CUP": "J_LEAGUE_CUP",
+        "LEVAIN": "J_LEAGUE_CUP",
+        "LEVAIN CUP": "J_LEAGUE_CUP",
+        "YBC LEVAIN CUP": "J_LEAGUE_CUP",
     }
     # Also map label strings from JSON.
     for code, entry in load_leagues_json().items():

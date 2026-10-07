@@ -74,7 +74,7 @@ DEFAULT_COMPETITIONS: tuple[tuple[str, str, float], ...] = (
     ("J2", "J2 League - Japan", 0.75),
     ("J3", "J3 League - Japan", 0.65),
     ("ACL", "AFC Champions League", 0.95),
-    ("J_LEAGUE_CUP", "J.League Cup - Japan", 0.7),
+    ("J_LEAGUE_CUP", "J.League Cup - Japan", 0.8),
     ("FRIENDLY", "Club Friendly", 0.3),
     ("FLASH_TEAM", "Flashscore team feed (unmapped)", 0.5),
 )
@@ -1802,7 +1802,7 @@ def team_weight_for_match(
     2. Weight of ``match_comp_id`` itself.
     3. ``default``.
     """
-    cup_like = {"UWCL", "EMPERORS_CUP"}
+    cup_like = {"UWCL", "EMPERORS_CUP", "J_LEAGUE_CUP"}
     rows = conn.execute(
         """
         SELECT comp_id, COUNT(*) AS n

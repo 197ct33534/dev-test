@@ -238,7 +238,7 @@ def league_team_aliases(league_key: str) -> dict[str, str]:
     if code == "LALIGA":
         out.update(LALIGA_TEAM_ALIASES)
         out.update(_FD_LALIGA_ALIASES)
-    elif code in {"EMPERORS_CUP", "J1", "J2", "JLEAGUE"}:
+    elif code in {"EMPERORS_CUP", "J_LEAGUE_CUP", "J1", "J2", "JLEAGUE"}:
         out.update(EMPERORS_CUP_TEAM_ALIASES)
     entry = get_league_entry(code) or {}
     extra = entry.get("team_aliases") or {}

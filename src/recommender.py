@@ -585,7 +585,12 @@ def _fixture_side_markets(
     Mapping[str, float] | None,
     Mapping[str, float] | None,
 ]:
-    """Extract O/U 2.5 and Asian Handicap dicts from a fixtures.csv row."""
+    """Extract O/U and Asian Handicap dicts from a fixtures row.
+
+    Prefers classic ``{family}_O25/U25`` (line 2.5). Falls back to Flashscore
+    ``OU_Line`` / ``OddsOver`` / ``OddsUnder`` when O25 aliases are missing
+    (common for Japan cups where the main total is 2.75 / 3.5 / …).
+    """
     prefix = odds_family  # B365 / Avg / Max
     ou = None
     over_col, under_col = f"{prefix}_O25", f"{prefix}_U25"
@@ -596,6 +601,20 @@ def _fixture_side_markets(
                 "over": float(row[over_col]),
                 "under": float(row[under_col]),
             }
+    if ou is None:
+        # Flashscore / ESPN style dynamic totals.
+        line_ok = "OU_Line" in row.index and pd.notna(row["OU_Line"])
+        over_ok = "OddsOver" in row.index and pd.notna(row["OddsOver"])
+        under_ok = "OddsUnder" in row.index and pd.notna(row["OddsUnder"])
+        if line_ok and over_ok and under_ok:
+            try:
+                ou = {
+                    "line": float(row["OU_Line"]),
+                    "over": float(row["OddsOver"]),
+                    "under": float(row["OddsUnder"]),
+                }
+            except (TypeError, ValueError):
+                ou = None
 
     ah = None
     home_col, away_col = f"{prefix}AHH", f"{prefix}AHA"

@@ -40,6 +40,7 @@ def test_leagues_json_loads_and_has_laliga() -> None:
     assert "EPL" in data
     assert "UWCL" in data
     assert "EMPERORS_CUP" in data
+    assert "J_LEAGUE_CUP" in data
     laliga = data["LALIGA"]
     assert laliga["flashscore_id"] == "dWdJXP6U"
     assert "2024-2025" in laliga["seasons"]
@@ -56,15 +57,27 @@ def test_leagues_json_loads_and_has_laliga() -> None:
     assert float(cup["league_weight"]) == pytest.approx(0.8)
     assert cup["team_aliases"]["Gamba Osaka"] == "JP_G_OSAKA"
     assert cup["team_aliases"]["Vissel Kobe"] == "JP_VISSEL_KOBE"
+    jlc = data["J_LEAGUE_CUP"]
+    assert jlc["flashscore_id"] == "hIbE7J4e"
+    assert jlc["flashscore_path"] == "/football/japan/j-league-cup"
+    assert jlc["time_zone"] == "Asia/Tokyo"
+    assert jlc["is_cup"] is True
+    assert jlc["history_source"] == "flashscore"
+    assert "2026-2027" in jlc["seasons"]
+    assert jlc["seasons"]["2026-2027"] == "4dWozNRr"
+    assert jlc["seasons"]["2025"] == "hEqImPLH"
+    assert float(jlc["league_weight"]) == pytest.approx(0.8)
+    assert jlc["team_aliases"]["Gamba Osaka"] == "JP_G_OSAKA"
 
 
 def test_get_available_leagues_includes_laliga() -> None:
     rows = get_available_leagues()
     codes = {r["code"] for r in rows}
-    assert {"EPL", "UWCL", "LALIGA", "EMPERORS_CUP"} <= codes
+    assert {"EPL", "UWCL", "LALIGA", "EMPERORS_CUP", "J_LEAGUE_CUP"} <= codes
     names = {r["name"] for r in rows}
     assert any("LaLiga" in n for n in names)
     assert any("Emperor" in n for n in names)
+    assert any("J.League Cup" in n for n in names)
     # Re-export from global_db stays in sync
     assert {r["code"] for r in global_get_available_leagues()} == codes
 
@@ -84,6 +97,16 @@ def test_resolve_league_config_emperors_cup() -> None:
     assert cfg["fd_div"] is None
     assert "emperors-cup" in str(cfg.get("flashscore_fixtures_url") or "").lower()
     assert float(cfg["league_weight"]) == pytest.approx(0.8)
+
+
+def test_resolve_league_config_j_league_cup() -> None:
+    code, cfg = resolve_league_config("J_LEAGUE_CUP")
+    assert code == "J_LEAGUE_CUP"
+    assert cfg["flashscore_id"] == "hIbE7J4e"
+    assert cfg["is_cup"] is True
+    assert "j-league-cup" in str(cfg.get("flashscore_fixtures_url") or "").lower()
+    assert resolve_league_config("LEVAIN")[0] == "J_LEAGUE_CUP"
+    assert resolve_league_team_name("Vissel Kobe", "J_LEAGUE_CUP") == "JP_VISSEL_KOBE"
 
 
 def test_japanese_aliases_to_jp_codes() -> None:
