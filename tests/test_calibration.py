@@ -36,7 +36,8 @@ def test_reliability_and_ece() -> None:
 
 
 def test_clv_and_commission() -> None:
-    assert closing_line_value(2.2, 2.0) == pytest.approx(0.1)
+    # Canonical CLV is log(taken / closing) (was ratio − 1 = 0.1).
+    assert closing_line_value(2.2, 2.0) == pytest.approx(np.log(1.1))
     assert apply_commission(10.0, 0.02) == pytest.approx(9.8)
     assert apply_commission(-5.0, 0.02) == -5.0
 

@@ -40,11 +40,14 @@ class TimeSplit:
 class WalkForwardValidator:
     """Generate expanding walk-forward calendar splits.
 
-    Example (``start_year=2019``, ``end_year=2023``, ``train_window_years=3``,
+    Example (``start_year=2019``, ``end_year=2022``, ``train_window_years=3``,
     ``test_window_months=6``)::
 
-        Train [2019-01-01, 2023-01-01) → Test [2023-01-01, 2023-07-01)  # 2023-H1
-        Train [2019-01-01, 2023-07-01) → Test [2023-07-01, 2024-01-01)  # 2023-H2
+        Train [2019-01-01, 2022-01-01) → Test [2022-01-01, 2022-07-01)  # 2022-H1
+        Train [2019-01-01, 2022-07-01) → Test [2022-07-01, 2023-01-01)  # 2022-H2
+
+    The first training window spans exactly ``train_window_years`` calendar
+    years (2019, 2020, 2021 above).
     """
 
     @staticmethod
@@ -56,9 +59,8 @@ class WalkForwardValidator:
     ) -> list[TimeSplit]:
         """Build expanding train / fixed-length test splits.
 
-        Initial training covers calendar years
-        ``start_year`` … ``start_year + train_window_years`` inclusive
-        (half-open end at Jan 1 of the following year). Each subsequent split
+        Initial training covers exactly ``train_window_years`` calendar years:
+        ``[start_year-01-01, (start_year + train_window_years)-01-01)``. Each subsequent split
         expands the train end to the previous test end. Test windows advance by
         ``test_window_months`` until the exclusive horizon ``end_year + 1``.
 
@@ -69,8 +71,8 @@ class WalkForwardValidator:
         end_year :
             Last calendar year that may appear in a test window.
         train_window_years :
-            Span from ``start_year`` to the last fully-trained year
-            (e.g. 3 → train through end of ``start_year + 3``).
+            Length of the first training window in calendar years
+            (e.g. 3 → train on ``start_year`` … ``start_year + 2``).
         test_window_months :
             Length of each out-of-sample block (default 6 ⇒ half-years).
 
@@ -88,10 +90,9 @@ class WalkForwardValidator:
 
         tz = timezone.utc
         train_start = datetime(start_year, 1, 1, tzinfo=tz)
-        # Inclusive train years: start .. start+window → exclusive end Jan 1 next
-        first_test_start = datetime(
-            start_year + train_window_years + 1, 1, 1, tzinfo=tz
-        )
+        # Exactly ``train_window_years`` years: [start, start + window) half-open.
+        # (Previously ``+ 1`` here trained on window + 1 years.)
+        first_test_start = datetime(start_year + train_window_years, 1, 1, tzinfo=tz)
         horizon_end = datetime(end_year + 1, 1, 1, tzinfo=tz)
 
         splits: list[TimeSplit] = []

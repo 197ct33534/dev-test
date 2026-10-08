@@ -7,7 +7,7 @@ as a cohesive ``QuantMetrics`` suite (pure NumPy / math).
 from __future__ import annotations
 
 import math
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 
@@ -88,21 +88,34 @@ class QuantMetrics:
         return float(ece)
 
     @staticmethod
-    def closing_line_value(taken_odds: float, closing_odds: float) -> float:
-        """CLV edge = log(taken_odds / closing_odds).
+    def closing_line_value(
+        taken_odds: float,
+        closing_odds: float,
+        *,
+        closing_market_odds: Mapping[str, float] | Sequence[float] | None = None,
+    ) -> float:
+        """Canonical CLV = ``log(taken_odds / closing_fair_odds)``.
+
+        This is the single project-wide CLV definition
+        (:func:`src.calibration.closing_line_value` delegates here).
+
+        ``closing_fair_odds`` is the de-vigged closing price when the full
+        closing market is supplied via ``closing_market_odds`` (all outcomes of
+        the market, e.g. H/D/A closing prices): proportional de-vig gives
+        ``fair = closing_odds × Σ(1/o)``. Without it the raw closing price is
+        used (vig not removed — CLV is then biased low by roughly the margin).
 
         Positive ⇒ took a better (higher) price than the closing reference.
         Non-positive or non-finite odds → ``nan``.
         """
-        taken = float(taken_odds)
-        closing = float(closing_odds)
-        if (
-            not math.isfinite(taken)
-            or not math.isfinite(closing)
-            or taken <= 0.0
-            or closing <= 0.0
-        ):
+        taken = _finite_float(taken_odds)
+        closing = _finite_float(closing_odds)
+        if taken is None or closing is None or taken <= 0.0 or closing <= 0.0:
             return float("nan")
+        if closing_market_odds is not None:
+            overround = market_overround(closing_market_odds)
+            if overround is not None:
+                closing = closing * overround
         return float(math.log(taken / closing))
 
     @staticmethod
@@ -132,6 +145,41 @@ class QuantMetrics:
                 if dd > max_dd:
                     max_dd = dd
         return float(max_dd)
+
+
+def _finite_float(x: object) -> float | None:
+    try:
+        v = float(x)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def market_overround(
+    market_odds: Mapping[str, float] | Sequence[float],
+) -> float | None:
+    """Book overround ``Σ 1/o`` over all outcomes of a market.
+
+    Returns ``None`` when fewer than two valid (finite, > 1.0) prices exist.
+    """
+    values = market_odds.values() if isinstance(market_odds, Mapping) else market_odds
+    inv: list[float] = []
+    for raw in values:
+        v = _finite_float(raw)
+        if v is None or v <= 1.0:
+            return None
+        inv.append(1.0 / v)
+    if len(inv) < 2:
+        return None
+    return float(sum(inv))
+
+
+def devig_odds(market_odds: Mapping[str, float]) -> dict[str, float] | None:
+    """Proportionally de-vigged fair decimal odds for every outcome."""
+    overround = market_overround(market_odds)
+    if overround is None:
+        return None
+    return {k: float(v) * overround for k, v in market_odds.items()}
 
 
 def _aligned_arrays(

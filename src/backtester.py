@@ -47,8 +47,9 @@ from src.recommender import (
     ODDS_COLUMN_MAPS,
     ValueBetRecommender,
     expected_value,
-    fractional_kelly,
+    fractional_kelly,  # noqa: F401  (re-export kept for backward compat)
 )
+from src.strategy import capped_kelly_fraction
 
 try:
     from src.ml_model import EPLMachineLearningModel
@@ -354,6 +355,55 @@ def _resolve_1x2_odds(
     return None
 
 
+# football-data.co.uk *closing* 1X2 columns (snapshot at kick-off). The
+# un-suffixed B365H / AvgH / PSH columns are the earlier (pre-close) snapshot.
+CLOSING_1X2_COLUMN_MAPS: dict[str, dict[str, str]] = {
+    "PSC": {"H": "PSCH", "D": "PSCD", "A": "PSCA"},
+    "AvgC": {"H": "AvgCH", "D": "AvgCD", "A": "AvgCA"},
+    "B365C": {"H": "B365CH", "D": "B365CD", "A": "B365CA"},
+    "MaxC": {"H": "MaxCH", "D": "MaxCD", "A": "MaxCA"},
+}
+_CLOSING_FAMILY_ALIASES: dict[str, str] = {
+    "PS": "PSC",
+    "PSC": "PSC",
+    "PINNACLE": "PSC",
+    "AVG": "AvgC",
+    "AVGC": "AvgC",
+    "B365": "B365C",
+    "B365C": "B365C",
+    "MAX": "MaxC",
+    "MAXC": "MaxC",
+}
+
+
+def _closing_1x2_market(
+    row: pd.Series,
+    *,
+    ref_family: str = "PSC",
+) -> dict[str, float] | None:
+    """Full real **closing** 1X2 market (H/D/A) from closing columns.
+
+    Preference: ``ref_family`` (aliases: ``PS``/``Avg``/``B365``/``Max`` map to
+    their closing variants), then Pinnacle → Avg → B365 → Max closing.
+    Returns ``None`` when the row has no complete closing market — CLV is
+    then undefined (NaN), never approximated from same-snapshot prices.
+    """
+    first = _CLOSING_FAMILY_ALIASES.get(str(ref_family).strip().upper(), "PSC")
+    order = [first] + [f for f in ("PSC", "AvgC", "B365C", "MaxC") if f != first]
+    for fam in order:
+        cols = CLOSING_1X2_COLUMN_MAPS[fam]
+        if not all(c in row.index for c in cols.values()):
+            continue
+        try:
+            odds = {k: float(row[cols[k]]) for k in ("H", "D", "A")}
+        except (TypeError, ValueError):
+            continue
+        if any(not np.isfinite(v) or v <= 1.0 for v in odds.values()):
+            continue
+        return odds
+    return None
+
+
 def _closing_ref_1x2(
     row: pd.Series,
     selection: str,
@@ -361,10 +411,12 @@ def _closing_ref_1x2(
     ref_family: str = "Avg",
     entered_family: str = "B365",
 ) -> float | None:
-    """Closing reference price for a 1X2 selection (for CLV).
+    """Same-snapshot market reference price for a 1X2 selection.
 
-    Prefers ``ref_family`` (Avg = market consensus close on football-data).
-    Falls back to other families excluding the entry book when needed.
+    **Not a closing line**: football-data ``AvgH`` and ``B365H`` are taken at
+    the same time, so comparing them measures price vs market average, not
+    CLV. Used only for the ``price_vs_market_avg`` diagnostic; real CLV uses
+    :func:`_closing_1x2_market`.
     """
     key = _SELECTION_TO_FTR.get(str(selection).strip(), str(selection).strip().upper())
     if key not in {"H", "D", "A"}:
@@ -385,17 +437,77 @@ def _closing_ref_1x2(
     return None
 
 
-def _season_label(row: pd.Series, day: pd.Timestamp) -> str:
+# Leagues whose seasons run within one calendar year (Feb–Dec).
+CALENDAR_YEAR_LEAGUES: frozenset[str] = frozenset(
+    {
+        "J1",
+        "J2",
+        "J3",
+        "J_LEAGUE",
+        "J1_LEAGUE",
+        "JLEAGUE",
+        "EMPERORS_CUP",
+        "J_LEAGUE_CUP",
+    }
+)
+_LEAGUE_ROW_KEYS = ("League", "league", "comp_id", "league_id", "competition")
+
+
+def _row_league(row: pd.Series) -> str | None:
+    for key in _LEAGUE_ROW_KEYS:
+        if key in row.index:
+            val = row[key]
+            if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                txt = str(val).strip()
+                if txt:
+                    return txt
+    return None
+
+
+def _league_season_labels(league: str) -> set[str]:
+    try:
+        from src.league_registry import get_league_entry
+
+        entry = get_league_entry(league) or {}
+    except Exception:  # noqa: BLE001 — registry is optional context
+        return set()
+    return {str(k).strip() for k in (entry.get("seasons") or {})}
+
+
+def _season_label(
+    row: pd.Series,
+    day: pd.Timestamp,
+    league: str | None = None,
+) -> str:
+    """Season label for ``day``.
+
+    Aug–May leagues → ``"YYYY/YYYY+1"``; calendar-year competitions
+    (J-League, Emperor's Cup, J.League Cup) → ``"YYYY"``. The league comes
+    from ``league`` or a ``League``/``comp_id``/... row column; the season
+    map in ``config/leagues.json`` decides when it lists the date's season.
+    """
     if "Season" in row.index and pd.notna(row["Season"]):
         return str(row["Season"])
     if "SeasonStart" in row.index and pd.notna(row["SeasonStart"]):
         start = int(row["SeasonStart"])
         return f"{start}/{start + 1}"
-    year = int(pd.Timestamp(day).year)
-    # EPL season straddles calendar years; Aug+ → year/year+1
-    if pd.Timestamp(day).month >= 7:
-        return f"{year}/{year + 1}"
-    return f"{year - 1}/{year}"
+    ts = pd.Timestamp(day)
+    year = int(ts.year)
+    split_start = year if ts.month >= 7 else year - 1
+    split_label = f"{split_start}/{split_start + 1}"
+
+    lg = league or _row_league(row)
+    if lg:
+        code = str(lg).strip().upper().replace(".", "_").replace(" ", "_")
+        labels = _league_season_labels(code)
+        if labels:
+            if f"{split_start}-{split_start + 1}" in labels:
+                return split_label
+            if str(year) in labels:
+                return str(year)
+        if code in CALENDAR_YEAR_LEAGUES:
+            return str(year)
+    return split_label
 
 
 def _resolve_ou_odds(row: pd.Series, line: float = 2.5) -> dict[str, float] | None:
@@ -496,13 +608,18 @@ class BacktestConfig:
     min_odds: float = DEFAULT_MIN_ODDS
     max_odds: float = DEFAULT_MAX_ODDS
     max_stake_pct: float = DEFAULT_MAX_STAKE_PCT
-    # Closing-line discipline: bets priced at ``odds_family`` (default B365
-    # closing). CLV compares that price to ``closing_ref_family`` (Avg).
-    closing_ref_family: str = "Avg"
+    # Closing-line discipline: bets priced at ``odds_family`` (B365 pre-close
+    # snapshot). CLV compares that price to the de-vigged **real closing**
+    # market (``PSCH``/``AvgCH``/``B365CH``...); ``closing_ref_family`` picks the
+    # preferred closing book (PS -> Pinnacle closing). No closing columns -> NaN.
+    closing_ref_family: str = "PS"
     # Exchange-style commission on winning PnL only (0.02 = 2%).
     commission_pct: float = DEFAULT_COMMISSION_PCT
     # Shrink ensemble w_ML when train sample is thin (UWCL-friendly).
     adapt_w_ml: bool = True
+    # League code for season labels (calendar-year leagues -> "YYYY").
+    # None -> ``matches.attrs["league"]`` or a per-row League/comp_id column.
+    league: str | None = None
 
     def normalized_markets(self) -> tuple[str, ...]:
         """Canonical market codes from ``allowed_markets``."""
@@ -548,6 +665,10 @@ class BacktestResult:
 ProgressFn = Callable[[int, int, str], None]
 
 
+class _SkipLabel(Exception):
+    """Internal: calibration label undefined (push) -> skip the row."""
+
+
 def run_backtest(
     matches: pd.DataFrame,
     *,
@@ -565,8 +686,12 @@ def run_backtest(
     df["Date"] = df["Date"].map(_as_date)
     df["HomeTeam"] = df["HomeTeam"].astype(str).str.strip()
     df["AwayTeam"] = df["AwayTeam"].astype(str).str.strip()
-    df["FTHG"] = pd.to_numeric(df["FTHG"], errors="coerce").astype(int)
-    df["FTAG"] = pd.to_numeric(df["FTAG"], errors="coerce").astype(int)
+    df["FTHG"] = pd.to_numeric(df["FTHG"], errors="coerce")
+    df["FTAG"] = pd.to_numeric(df["FTAG"], errors="coerce")
+    # Non-numeric scores ("", "-", "P-P") coerce to NaN -> drop, never crash.
+    df = df.dropna(subset=["FTHG", "FTAG"]).copy()
+    df["FTHG"] = df["FTHG"].astype(int)
+    df["FTAG"] = df["FTAG"].astype(int)
     if "FTR" not in df.columns:
         df["FTR"] = np.where(
             df["FTHG"] > df["FTAG"],
@@ -575,7 +700,15 @@ def run_backtest(
         )
     else:
         df["FTR"] = df["FTR"].astype(str).str.upper().str.strip()
+        derived = np.where(
+            df["FTHG"] > df["FTAG"],
+            "H",
+            np.where(df["FTHG"] < df["FTAG"], "A", "D"),
+        )
+        bad = ~df["FTR"].isin(["H", "D", "A"])
+        df.loc[bad, "FTR"] = derived[bad.to_numpy()]
 
+    league_hint = cfg.league or (getattr(matches, "attrs", {}) or {}).get("league")
     df = df.sort_values(["Date", "HomeTeam", "AwayTeam"]).reset_index(drop=True)
     match_days = sorted(df["Date"].unique())
 
@@ -597,12 +730,21 @@ def run_backtest(
     total_days = len(match_days)
     effective_w_ml = float(cfg.ensemble_w_ml)
 
-    # Online calibration memory: past scored 1X2 margins
-    cal_p: list[float] = []
-    cal_y: list[int] = []
-    calibrator = ProbabilityCalibrator(
-        method=cfg.calibration, min_samples=cfg.min_cal_samples
-    )
+    # Online calibration memory per market (past scored fixtures only).
+    # Each market has its own calibrator: a map fit on 1X2 margins is not
+    # valid for O/U or AH probabilities.
+    cal_mem: dict[str, tuple[list[float], list[int]]] = {
+        "1X2": ([], []),
+        "OU": ([], []),
+        "AH": ([], []),
+    }
+    calibrators: dict[str, ProbabilityCalibrator] = {
+        mkt: ProbabilityCalibrator(
+            method=cfg.calibration, min_samples=cfg.min_cal_samples
+        )
+        for mkt in cal_mem
+    }
+    cal_p, cal_y = cal_mem["1X2"]
 
     for day_i, day in enumerate(match_days):
         train = df.loc[df["Date"] < day]
@@ -640,9 +782,11 @@ def run_backtest(
         elif progress and day_i % 5 == 0:
             progress(day_i + 1, total_days, f"Score @ {day.date()}")
 
-        # Refresh calibrator from all past scored fixtures (causal).
+        # Refresh calibrators from all past scored fixtures (causal: today's
+        # outcomes are appended below and only used from tomorrow on).
         if cfg.calibration != "none":
-            calibrator.fit(cal_p, cal_y)
+            for mkt, (mp, my) in cal_mem.items():
+                calibrators[mkt].fit(mp, my)
 
         assert dc_model is not None
         known = set(dc_model.teams)
@@ -680,14 +824,20 @@ def run_backtest(
                     continue
                 if cfg.use_ml and ml_model is not None and effective_w_ml > 0:
                     try:
-                        p_ml = ml_model.predict_proba(home, away, match_date=day)
+                        comp_code = _row_league(row) or league_hint
+                        p_ml = ml_model.predict_proba(
+                            home,
+                            away,
+                            match_date=day,
+                            competition=str(comp_code) if comp_code else None,
+                        )
                         probs_1x2 = _blend_1x2(p_dc, p_ml, effective_w_ml)
                     except Exception:
                         probs_1x2 = p_dc
                 else:
                     probs_1x2 = p_dc
 
-                season = _season_label(row, day)
+                season = _season_label(row, day, league_hint)
                 # Multiclass snapshot (no binary y — used for MC-Brier / MC-LogLoss)
                 pred_rows.append(
                     {
@@ -728,8 +878,8 @@ def run_backtest(
                         }
                     )
 
-                if calibrator.fitted_:
-                    probs_1x2 = calibrator.transform_dict(probs_1x2)
+                if calibrators["1X2"].fitted_:
+                    probs_1x2 = calibrators["1X2"].transform_dict(probs_1x2)
 
             try:
                 candidates = rec.evaluate_match(
@@ -745,15 +895,26 @@ def run_backtest(
             except Exception:
                 continue
 
-            season = _season_label(row, day)
+            season = _season_label(row, day, league_hint)
             # Score OU / AH model probs for calibration (all fixtures with odds)
             if ou_odds is not None:
                 try:
                     line = float(ou_odds["line"])
                     ou_p = dc_model.predict_over_under(home, away, line=line)
                     total_g = fthg + ftag
-                    # .5 lines: over wins iff total > line
-                    y_over = 1.0 if total_g > line else 0.0
+                    over_s = _combine_settlements(_settle_over(total_g, line))
+                    # Pushes (integer lines, total == line) are neither an Over
+                    # nor an Under win -> excluded from calibration labels.
+                    if over_s in {"win", "half_win"}:
+                        y_over = 1.0
+                    elif over_s in {"lose", "half_lose"}:
+                        y_over = 0.0
+                    else:
+                        raise _SkipLabel
+                    cal_mem["OU"][0].extend(
+                        [float(ou_p["over"]), float(ou_p["under"])]
+                    )
+                    cal_mem["OU"][1].extend([int(y_over), int(1.0 - y_over)])
                     pred_rows.append(
                         {
                             "match_date": day,
@@ -778,6 +939,8 @@ def run_backtest(
                             "w_ml": 0.0,
                         }
                     )
+                except _SkipLabel:
+                    pass
                 except Exception:
                     pass
             if ah_odds is not None:
@@ -796,6 +959,10 @@ def run_backtest(
                         else (0.0 if home_s in {"lose", "half_lose"} else float("nan"))
                     )
                     if y_home == y_home:
+                        cal_mem["AH"][0].extend(
+                            [float(ah_p["home"]), float(ah_p["away"])]
+                        )
+                        cal_mem["AH"][1].extend([int(y_home), int(1.0 - y_home)])
                         pred_rows.append(
                             {
                                 "match_date": day,
@@ -831,17 +998,38 @@ def run_backtest(
                     continue
 
                 p_use = float(bet.p_model)
-                # Re-calibrate OU/AH single-event probs when calibrator is warm.
-                if bet.market != "1X2" and calibrator.fitted_:
-                    p_use = calibrator.transform(p_use)
+                # OU / AH: apply that market's own calibrator (1X2 probs were
+                # already calibrated before evaluate_match).
+                mkt_cal = calibrators.get(bet.market)
+                calibrated = (
+                    bet.market != "1X2" and mkt_cal is not None and mkt_cal.fitted_
+                )
+                if calibrated:
+                    p_use = mkt_cal.transform(p_use)
 
-                ev = expected_value(p_use, book_odds)
+                # OU / AH p_model is the push-adjusted cover probability, so
+                # p·odds − 1 is EV per unit *at risk*; scale by the stake at
+                # risk (1 − push − ½·half outcomes) to get EV per unit staked.
+                stake_at_risk = float((bet.detail or {}).get("stake_at_risk", 1.0))
+                if bet.market != "1X2" and not calibrated:
+                    ev = float(bet.ev)
+                else:
+                    ev = expected_value(p_use, book_odds) * stake_at_risk
                 min_ev_m = float(ev_by_mkt.get(bet.market, cfg.min_ev))
                 if ev < min_ev_m:
                     continue
 
-                kelly = fractional_kelly(p_use, book_odds, cfg.kelly_fraction)
-                stake_pct = capped_stake_pct(kelly, cfg.max_stake_pct)
+                # Same stake policy as live (src.strategy): Kelly multiplier
+                # clamped to MAX_KELLY_FRACTION, stake clipped to max_stake_pct.
+                if bet.market != "1X2" and not calibrated:
+                    stake_pct = float(bet.kelly_fraction)
+                else:
+                    stake_pct = capped_kelly_fraction(
+                        p_use,
+                        book_odds,
+                        kelly_fraction=cfg.kelly_fraction,
+                        max_stake_pct=cfg.max_stake_pct,
+                    )
                 stake_amount = day_bankroll * stake_pct
                 if stake_amount <= 0:
                     continue
@@ -864,18 +1052,30 @@ def run_backtest(
 
                 pnl = apply_commission(pnl, cfg.commission_pct)
 
-                # CLV vs closing reference (Avg consensus on football-data)
+                # CLV vs the de-vigged REAL closing market (PSCH/AvgCH/...).
+                # No closing columns -> NaN (excluded from CLV stats).
                 odds_close = None
                 clv = float("nan")
+                price_vs_avg = float("nan")
                 if bet.market == "1X2":
-                    odds_close = _closing_ref_1x2(
+                    sel_key = _SELECTION_TO_FTR.get(str(bet.selection).strip())
+                    close_mkt = _closing_1x2_market(
+                        row, ref_family=cfg.closing_ref_family
+                    )
+                    if close_mkt is not None and sel_key in close_mkt:
+                        odds_close = float(close_mkt[sel_key])
+                        clv = closing_line_value(
+                            book_odds, odds_close, closing_market_odds=close_mkt
+                        )
+                    # Diagnostic only: entry price vs same-snapshot market avg.
+                    avg_ref = _closing_ref_1x2(
                         row,
                         bet.selection,
-                        ref_family=cfg.closing_ref_family,
+                        ref_family="Avg",
                         entered_family=cfg.odds_family,
                     )
-                    if odds_close is not None:
-                        clv = closing_line_value(book_odds, odds_close)
+                    if avg_ref is not None:
+                        price_vs_avg = closing_line_value(book_odds, avg_ref)
 
                 bet_rows.append(
                     {
@@ -888,6 +1088,7 @@ def run_backtest(
                         "odds": book_odds,
                         "odds_closing": odds_close,
                         "clv": clv,
+                        "price_vs_market_avg": price_vs_avg,
                         "ev": ev,
                         "stake_pct": stake_pct,
                         "stake_amount": stake_amount,
@@ -940,6 +1141,14 @@ def run_backtest(
         summary["avg_clv"] = float("nan")
         summary["avg_clv_pct"] = float("nan")
         summary["n_clv"] = 0
+    if not bets_df.empty and "price_vs_market_avg" in bets_df.columns:
+        pva = bets_df["price_vs_market_avg"].astype(float)
+        pva = pva[np.isfinite(pva)]
+        summary["avg_price_vs_market_avg"] = (
+            float(pva.mean()) if len(pva) else float("nan")
+        )
+    else:
+        summary["avg_price_vs_market_avg"] = float("nan")
     summary["commission_pct"] = float(cfg.commission_pct)
 
     if cfg.persist and not bets_df.empty:
@@ -1262,6 +1471,7 @@ def run_ablation(
             closing_ref_family=base.closing_ref_family,
             commission_pct=base.commission_pct,
             adapt_w_ml=base.adapt_w_ml,
+            league=base.league,
         )
         try:
             result = run_backtest(matches, config=cfg, progress=None)

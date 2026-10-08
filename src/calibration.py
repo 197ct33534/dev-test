@@ -6,7 +6,7 @@ Provides Brier score, log-loss, and reliability (calibration) tables for
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -43,7 +43,13 @@ def multiclass_brier(
     probs: pd.DataFrame | dict[str, Sequence[float]],
     classes: Sequence[str] = ("H", "D", "A"),
 ) -> float:
-    """Multi-class Brier: mean over classes of (p_k - 1_{y=k})^2."""
+    """Standard multi-class Brier score (Brier 1950).
+
+    ``BS = (1/N) Σ_i Σ_k (p_ik − 1{y_i = k})²`` — summed over classes,
+    averaged over samples. Range ``[0, 2]``; uniform 1X2 (1/3 each) scores
+    ``2/3``. Note: earlier versions divided additionally by the number of
+    classes (range ``[0, 2/3]``), so values are now 3× larger for 1X2.
+    """
     y = np.asarray(list(y_labels), dtype=object)
     if isinstance(probs, dict):
         p_df = pd.DataFrame({c: np.asarray(probs[c], dtype=float) for c in classes})
@@ -51,11 +57,16 @@ def multiclass_brier(
         p_df = probs[list(classes)].astype(float)
     if len(y) != len(p_df):
         raise ValueError("y_labels and probs length mismatch")
-    total = 0.0
+    if len(y) == 0:
+        return float("nan")
+    per_sample = np.zeros(len(y), dtype=float)
     for c in classes:
         y_bin = (y == c).astype(float)
-        total += float(np.mean((p_df[c].to_numpy() - y_bin) ** 2))
-    return total / float(len(classes))
+        per_sample += (p_df[c].to_numpy(dtype=float) - y_bin) ** 2
+    mask = np.isfinite(per_sample)
+    if not mask.any():
+        return float("nan")
+    return float(np.mean(per_sample[mask]))
 
 
 def multiclass_log_loss(
@@ -155,16 +166,33 @@ def expected_calibration_error(
     return float(ece)
 
 
-def closing_line_value(odds_entered: float, odds_closing: float) -> float:
-    """CLV = (odds_entered / odds_closing) − 1.
+def closing_line_value(
+    odds_entered: float,
+    odds_closing: float,
+    *,
+    closing_market_odds: Mapping[str, float] | Sequence[float] | None = None,
+) -> float:
+    """CLV = ``log(odds_entered / closing_fair_odds)``.
 
-    Positive ⇒ got a better (higher) price than the closing reference.
+    Delegates to the canonical
+    :meth:`src.validation.metrics.QuantMetrics.closing_line_value`; pass the
+    full closing market via ``closing_market_odds`` to de-vig the closing
+    price. (Before the CLV unification this returned the ratio
+    ``odds_entered / odds_closing − 1``; for small edges the two agree to
+    first order.) Decimal odds ≤ 1.0 or non-finite → ``nan``.
     """
-    o_in = float(odds_entered)
-    o_cl = float(odds_closing)
-    if o_in <= 1.0 or o_cl <= 1.0 or not np.isfinite(o_in) or not np.isfinite(o_cl):
+    from src.validation.metrics import QuantMetrics
+
+    try:
+        o_in = float(odds_entered)
+        o_cl = float(odds_closing)
+    except (TypeError, ValueError):
         return float("nan")
-    return (o_in / o_cl) - 1.0
+    if not np.isfinite(o_in) or not np.isfinite(o_cl) or o_in <= 1.0 or o_cl <= 1.0:
+        return float("nan")
+    return QuantMetrics.closing_line_value(
+        o_in, o_cl, closing_market_odds=closing_market_odds
+    )
 
 
 def apply_commission(pnl: float, commission_pct: float) -> float:

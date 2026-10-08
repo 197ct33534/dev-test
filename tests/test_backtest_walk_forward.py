@@ -58,10 +58,12 @@ async def test_run_backtest_dry_run_smoke() -> None:
         dry_run=True,
         concurrency=4,
         seed=123,
+        synthetic=True,  # synthetic data only when explicitly requested
     )
     report = await run_backtest(cfg)
     assert report.n_matches == 50
-    assert report.mode == "dry-run"
+    assert report.mode == "synthetic"
+    assert report.source == "synthetic"
     assert sum(report.tier_counts.values()) == report.n_matches
     assert report.final_bankroll > 0
     text = render_quant_report(report)

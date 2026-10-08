@@ -13,6 +13,23 @@ Replay loop
 3. ``run_quant_pipeline`` → price only when PIT ok and aggregate_data_score ≥ 50
 4. ``RiskEngine.calculate_stake`` / PaperTrader → paper bet when stake > 0
 5. After kickoff, ``SettlementEngineV2`` (or in-memory settle) → PnL + CLV
+
+Model evaluation
+----------------
+Matches without model probabilities (DB / fixtures) get Dixon–Coles 1X2
+probabilities from :class:`WalkForwardValidator` folds: for each fold one
+model per league is fit on finished matches with ``kickoff < test_start`` only
+and predicts that fold's test matches (no look-ahead). LightGBM is not
+refit here (``lightgbm_probs=None``).
+
+Data honesty
+------------
+* Matches without real 1X2 odds are skipped (``n_skipped_no_odds``).
+* ``closing_odds`` come from a real closing snapshot (football-data
+  ``PSCH``/``AvgCH``/``B365CH`` or a later lake odds row) or are ``None`` —
+  CLV is then excluded, never computed against the entry price itself.
+* An empty / unreachable DB raises; synthetic data runs only with
+  ``--synthetic`` and is reported as ``mode="synthetic"``.
 """
 
 from __future__ import annotations
@@ -53,7 +70,7 @@ from src.execution.paper_trader import build_1x2_candidates
 from src.execution.settlement_v2 import SettlementEngineV2, settle_market
 from src.pipeline.run_pipeline import run_quant_pipeline
 from src.risk import ExposureManager, RiskEngine, RiskEngineConfig
-from src.validation.metrics import QuantMetrics
+from src.validation.metrics import QuantMetrics, devig_odds
 from src.validation.walk_forward import WalkForwardValidator
 
 logger = logging.getLogger(__name__)
@@ -61,6 +78,24 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONCURRENCY = 8
 DRY_RUN_MATCH_COUNT = 50
 PIT_LEAD = timedelta(minutes=30)
+# Lake odds observed up to this long after kickoff still count as "closing".
+CLOSING_GRACE = timedelta(minutes=5)
+
+# football-data.co.uk 1X2 column families.
+_PRE_CLOSE_FAMILIES: dict[str, tuple[str, str, str]] = {
+    "B365": ("B365H", "B365D", "B365A"),
+    "PS": ("PSH", "PSD", "PSA"),
+    "Avg": ("AvgH", "AvgD", "AvgA"),
+}
+_CLOSING_FAMILIES: dict[str, tuple[str, str, str]] = {
+    "PSC": ("PSCH", "PSCD", "PSCA"),
+    "AvgC": ("AvgCH", "AvgCD", "AvgCA"),
+    "B365C": ("B365CH", "B365CD", "B365CA"),
+}
+
+
+class BacktestDataError(RuntimeError):
+    """Raised when a live backtest has no usable real data (no silent fallback)."""
 
 _TEAMS = (
     "Arsenal",
@@ -99,23 +134,19 @@ class BacktestMatch:
     status: str = "FINISHED"
     ft_home_goals: int | None = None
     ft_away_goals: int | None = None
-    bookmaker_odds: dict[str, float] = field(
-        default_factory=lambda: {"H": 2.10, "D": 3.40, "A": 3.60}
-    )
-    closing_odds: dict[str, float] = field(
-        default_factory=lambda: {"H": 2.00, "D": 3.40, "A": 3.70}
-    )
-    dixon_coles_probs: dict[str, float] = field(
-        default_factory=lambda: {"H": 0.45, "D": 0.28, "A": 0.27}
-    )
-    lightgbm_probs: dict[str, float] = field(
-        default_factory=lambda: {"H": 0.44, "D": 0.29, "A": 0.27}
-    )
+    # Real entry 1X2 odds (empty ⇒ match is skipped, never priced on fakes).
+    bookmaker_odds: dict[str, float] = field(default_factory=dict)
+    # Real closing 1X2 market or None ⇒ excluded from CLV stats.
+    closing_odds: dict[str, float] | None = None
+    # Empty ⇒ filled by the walk-forward Dixon–Coles fit (or skipped).
+    dixon_coles_probs: dict[str, float] = field(default_factory=dict)
+    lightgbm_probs: dict[str, float] | None = None
     raw_records: list[dict[str, Any]] = field(default_factory=list)
-    expected_sources: list[str] = field(
+    expected_sources: list[str] | None = field(
         default_factory=lambda: ["odds_api", "stats", "news"]
     )
     quality_band: str = "A"  # A | B | X (synthetic hint)
+    competition: str | None = None
 
 
 @dataclass
@@ -128,6 +159,17 @@ class BacktestConfig:
     fixtures_path: Path | None = None
     database_url: str | None = None
     seed: int = 42
+    # Synthetic fixtures only when explicitly requested (mode="synthetic").
+    synthetic: bool = False
+    # Walk-forward model fitting (DB / fixture matches without model probs).
+    train_window_years: int = 3
+    test_window_months: int = 3
+    min_train_matches: int = 60
+    dc_xi: float = 0.0018
+    # Entry price preference for football-data rows (pre-close snapshot).
+    entry_odds_family: str = "B365"
+    # When a row only has closing odds, bet at the close (CLV then excluded).
+    allow_closing_as_entry: bool = True
 
 
 @dataclass
@@ -306,15 +348,18 @@ def load_matches_from_fixtures(path: Path) -> list[BacktestMatch]:
                 status=str(row.get("status") or "FINISHED"),
                 ft_home_goals=row.get("ft_home_goals"),
                 ft_away_goals=row.get("ft_away_goals"),
-                bookmaker_odds=dict(row.get("bookmaker_odds") or {"H": 2.1, "D": 3.4, "A": 3.6}),
-                closing_odds=dict(row.get("closing_odds") or row.get("bookmaker_odds") or {}),
+                # No fake fallbacks: missing odds ⇒ skipped; missing closing ⇒
+                # no CLV (never copied from the entry price).
+                bookmaker_odds=_valid_1x2(row.get("bookmaker_odds")) or {},
+                closing_odds=_valid_1x2(row.get("closing_odds")),
                 dixon_coles_probs=dict(row.get("dixon_coles_probs") or {}),
-                lightgbm_probs=dict(row.get("lightgbm_probs") or {}),
+                lightgbm_probs=dict(row.get("lightgbm_probs") or {}) or None,
                 raw_records=list(raw),
                 expected_sources=list(
                     row.get("expected_sources") or ["odds_api", "stats", "news"]
                 ),
                 quality_band=str(row.get("quality_band") or "A"),
+                competition=row.get("competition"),
             )
         )
     out.sort(key=lambda m: m.kickoff_utc)
@@ -326,67 +371,278 @@ async def load_matches_from_db(
     *,
     start: datetime,
     end: datetime,
+    stats: dict[str, int] | None = None,
+    entry_odds_family: str = "B365",
+    allow_closing_as_entry: bool = True,
 ) -> list[BacktestMatch]:
-    """Load finished canonical matches in range (empty list if none)."""
+    """Load canonical matches in ``[start, end)`` with **real** odds only.
+
+    * ``league`` / ``competition`` come from the match's competition.
+    * Entry odds: latest lake odds snapshot observed ≤ ``kickoff − PIT_LEAD``,
+      else the football-data pre-close columns (``B365H``/``PSH``/``AvgH``),
+      else (``allow_closing_as_entry``) the closing columns with
+      ``closing_odds=None`` (CLV undefined). No odds ⇒ ``bookmaker_odds={}``
+      (the backtester skips it but still uses it for model training).
+    * Closing odds: football-data closing columns (``PSCH``…), else a lake
+      odds snapshot observed after the entry snapshot and ≤ kickoff + grace
+      (Pinnacle preferred); otherwise ``None``.
+    * ``raw_records``: real lake rows observed ≤ as-of, plus one derived
+      record for football-data pre-close odds (known before kickoff).
+    * Model probabilities are left empty — the walk-forward fit fills them.
+
+    ``stats`` (optional) receives ``n_loaded``, ``n_no_odds``,
+    ``n_entry_at_close`` and ``n_with_closing`` counters.
+    """
+    from sqlalchemy.orm import selectinload
+
+    counters = stats if stats is not None else {}
+    for key in ("n_loaded", "n_no_odds", "n_entry_at_close", "n_with_closing"):
+        counters.setdefault(key, 0)
+
     stmt = (
         select(CanonicalMatch)
+        .options(
+            selectinload(CanonicalMatch.home_team),
+            selectinload(CanonicalMatch.away_team),
+            selectinload(CanonicalMatch.competition),
+        )
         .where(
             CanonicalMatch.kickoff_utc >= start,
             CanonicalMatch.kickoff_utc < end,
         )
         .order_by(CanonicalMatch.kickoff_utc.asc())
     )
-    rows = (await session.execute(stmt)).scalars().all()
+    rows = (await session.execute(stmt)).scalars().unique().all()
     if not rows:
         return []
+
+    lake = await _lake_rows_by_match(session, [m.canonical_match_id for m in rows])
 
     out: list[BacktestMatch] = []
     for m in rows:
         kickoff = _ensure_aware(m.kickoff_utc)
         as_of = kickoff - PIT_LEAD
-        # Best-effort odds from raw lake; synthetic fallback if missing.
-        odds = await _odds_from_lake(session, m.canonical_match_id)
-        book = odds or {"H": 2.10, "D": 3.40, "A": 3.60}
-        close = dict(book)
+        lake_rows = lake.get(m.canonical_match_id, [])
+        entry, closing, at_close, records = _odds_and_records_from_lake(
+            lake_rows,
+            kickoff=kickoff,
+            as_of=as_of,
+            entry_family=entry_odds_family,
+            allow_closing_as_entry=allow_closing_as_entry,
+        )
+        counters["n_loaded"] += 1
+        if not entry:
+            counters["n_no_odds"] += 1
+        if at_close:
+            counters["n_entry_at_close"] += 1
+        if closing:
+            counters["n_with_closing"] += 1
+
+        league = _competition_label(m) or "UNKNOWN"
         out.append(
             BacktestMatch(
                 canonical_match_id=m.canonical_match_id,
                 kickoff_utc=kickoff,
-                home_team=str(getattr(getattr(m, "home_team", None), "name", None) or "Home"),
-                away_team=str(getattr(getattr(m, "away_team", None), "name", None) or "Away"),
+                home_team=_team_label(m, "home"),
+                away_team=_team_label(m, "away"),
+                league=league,
+                competition=league,
                 status=str(m.status or "SCHEDULED"),
                 ft_home_goals=m.ft_home_goals,
                 ft_away_goals=m.ft_away_goals,
-                bookmaker_odds=book,
-                closing_odds=close,
-                dixon_coles_probs={"H": 0.40, "D": 0.30, "A": 0.30},
-                lightgbm_probs={"H": 0.40, "D": 0.30, "A": 0.30},
-                raw_records=_synthetic_raw_records(
-                    as_of, band="A", rng=random.Random(int(kickoff.timestamp()) % 10_000)
-                ),
+                bookmaker_odds=entry or {},
+                closing_odds=closing,
+                dixon_coles_probs={},
+                lightgbm_probs=None,
+                raw_records=records,
+                # Mirror live scans: coverage from sources actually present.
+                expected_sources=None,
             )
         )
     return out
 
 
+async def _lake_rows_by_match(
+    session: AsyncSession,
+    match_ids: Sequence[UUID],
+    *,
+    chunk: int = 500,
+) -> dict[UUID, list[RawDataLake]]:
+    """All lake rows for ``match_ids`` (chunked IN queries), oldest first."""
+    out: dict[UUID, list[RawDataLake]] = {}
+    ids = list(match_ids)
+    for i in range(0, len(ids), chunk):
+        part = ids[i : i + chunk]
+        stmt = (
+            select(RawDataLake)
+            .where(RawDataLake.canonical_match_id.in_(part))
+            .order_by(RawDataLake.observed_at.asc())
+        )
+        for row in (await session.execute(stmt)).scalars().all():
+            if row.canonical_match_id is not None:
+                out.setdefault(row.canonical_match_id, []).append(row)
+    return out
+
+
+def _odds_and_records_from_lake(
+    rows: Sequence[Any],
+    *,
+    kickoff: datetime,
+    as_of: datetime,
+    entry_family: str = "B365",
+    allow_closing_as_entry: bool = True,
+) -> tuple[
+    dict[str, float] | None,
+    dict[str, float] | None,
+    bool,
+    list[dict[str, Any]],
+]:
+    """Return ``(entry_odds, closing_odds, entry_is_closing, raw_records)``."""
+    entry: dict[str, float] | None = None
+    entry_obs: datetime | None = None
+    fd_pre: dict[str, float] | None = None
+    fd_close: dict[str, float] | None = None
+    late: list[tuple[datetime, bool, dict[str, float]]] = []
+    records: list[dict[str, Any]] = []
+
+    for row in rows:
+        payload = row.payload if isinstance(getattr(row, "payload", None), Mapping) else {}
+        obs = _ensure_aware(row.observed_at) if row.observed_at is not None else None
+        source = str(getattr(row, "source", "") or "")
+
+        # football-data history rows (observed_at = kickoff, carry results):
+        # take the pre-close / closing columns, never the row itself.
+        pre = _family_odds(payload, _PRE_CLOSE_FAMILIES, prefer=entry_family)
+        close = _family_odds(payload, _CLOSING_FAMILIES, prefer="PSC")
+        if pre and fd_pre is None:
+            fd_pre = pre
+            records.append(
+                {
+                    "id": f"{row.raw_id}:pre_close_odds",
+                    "observed_at": as_of,
+                    "source_type": source or "football-data",
+                    "derived": "pre_close_odds",
+                    "payload": {"odds": dict(pre)},
+                }
+            )
+        if close and fd_close is None:
+            fd_close = close
+
+        snap = _odds_map_from_payload(payload)
+        if obs is None:
+            continue
+        if obs <= as_of:
+            records.append(
+                {
+                    "id": str(row.raw_id),
+                    "observed_at": obs,
+                    "source_type": source,
+                    "payload": dict(payload),
+                }
+            )
+            if snap and (entry_obs is None or obs >= entry_obs):
+                entry, entry_obs = snap, obs
+        elif snap and obs <= kickoff + CLOSING_GRACE:
+            late.append((obs, "pinnacle" in source.lower(), snap))
+
+    if entry is None and fd_pre:
+        entry = fd_pre
+
+    closing: dict[str, float] | None = fd_close
+    if closing is None and late:
+        # Pinnacle first, then the latest snapshot before kickoff (+grace).
+        late.sort(key=lambda t: (t[1], t[0]))
+        closing = late[-1][2]
+
+    at_close = False
+    if entry is None and closing is not None and allow_closing_as_entry:
+        entry, closing, at_close = closing, None, True
+    return entry, closing, at_close, records
+
+
+def _family_odds(
+    payload: Mapping[str, Any],
+    families: Mapping[str, tuple[str, str, str]],
+    *,
+    prefer: str,
+) -> dict[str, float] | None:
+    order = [prefer] + [f for f in families if f != prefer]
+    for fam in order:
+        cols = families.get(fam)
+        if not cols or not all(c in payload for c in cols):
+            continue
+        odds = _valid_1x2(dict(zip(("H", "D", "A"), (payload[c] for c in cols))))
+        if odds:
+            return odds
+    return None
+
+
+def _odds_map_from_payload(payload: Mapping[str, Any]) -> dict[str, float] | None:
+    for key in ("odds", "bookmaker_odds", "closing_odds"):
+        raw = payload.get(key)
+        if isinstance(raw, Mapping):
+            nested = raw.get("1X2") if isinstance(raw.get("1X2"), Mapping) else raw
+            odds = _valid_1x2(nested)
+            if odds:
+                return odds
+    return None
+
+
+def _valid_1x2(raw: Any) -> dict[str, float] | None:
+    """``{"H","D","A"}`` decimal odds (> 1.0, finite) or ``None``."""
+    if not isinstance(raw, Mapping):
+        return None
+    aliases = {
+        "H": ("H", "home", "Home", "1"),
+        "D": ("D", "draw", "Draw", "X"),
+        "A": ("A", "away", "Away", "2"),
+    }
+    out: dict[str, float] = {}
+    for key, names in aliases.items():
+        val = None
+        for name in names:
+            if name in raw and raw[name] is not None:
+                try:
+                    val = float(raw[name])
+                except (TypeError, ValueError):
+                    val = None
+                break
+        if val is None or not math.isfinite(val) or val <= 1.0:
+            return None
+        out[key] = val
+    return out
+
+
+def _competition_label(match: Any) -> str | None:
+    comp = getattr(match, "competition", None)
+    if comp is None:
+        return None
+    code = getattr(comp, "code", None)
+    if code:
+        return str(code)
+    name = getattr(comp, "name", None)
+    return str(name) if name else None
+
+
+def _team_label(match: Any, side: str) -> str:
+    team = getattr(match, f"{side}_team", None)
+    name = getattr(team, "name", None) if team is not None else None
+    if name:
+        return str(name)
+    tid = getattr(match, f"{side}_team_id", None)
+    return f"team:{tid}" if tid is not None else side.capitalize()
+
+
 async def _odds_from_lake(
     session: AsyncSession, match_id: UUID
 ) -> dict[str, float] | None:
-    stmt = (
-        select(RawDataLake)
-        .where(RawDataLake.canonical_match_id == match_id)
-        .order_by(RawDataLake.observed_at.desc())
-        .limit(5)
-    )
-    rows = (await session.execute(stmt)).scalars().all()
-    for row in rows:
-        payload = row.payload or {}
-        odds = payload.get("odds") if isinstance(payload, Mapping) else None
-        if isinstance(odds, Mapping) and {"H", "D", "A"} <= set(odds):
-            try:
-                return {k: float(odds[k]) for k in ("H", "D", "A")}
-            except (TypeError, ValueError):
-                continue
+    """Backward-compatible helper: latest real 1X2 odds map for a match."""
+    rows = (await _lake_rows_by_match(session, [match_id])).get(match_id, [])
+    for row in reversed(rows):
+        payload = row.payload if isinstance(row.payload, Mapping) else {}
+        odds = _odds_map_from_payload(payload)
+        if odds:
+            return odds
     return None
 
 
@@ -398,8 +654,16 @@ async def _odds_from_lake(
 class WalkForwardBacktester:
     """Chronological paper-trading replay with gated pricing + settlement."""
 
-    def __init__(self, config: BacktestConfig) -> None:
+    def __init__(
+        self,
+        config: BacktestConfig,
+        *,
+        model_factory: Any | None = None,
+    ) -> None:
         self.config = config
+        # ``model_factory()`` → object with ``fit(df)`` / ``predict_match_probs``
+        # (default: Dixon–Coles). Injectable for tests.
+        self._model_factory = model_factory
         self.risk = RiskEngine(
             RiskEngineConfig(min_data_score=50.0, min_ev_threshold=0.05)
         )
@@ -413,48 +677,69 @@ class WalkForwardBacktester:
         self.tier_counts: Counter[str] = Counter()
         self.n_priced = 0
         self.n_skipped_gate = 0
+        self.n_skipped_no_odds = 0
+        self.n_skipped_no_model = 0
+        self.n_folds = 0
+        self.fold_log: list[dict[str, Any]] = []
+        self.mode = "dry-run" if config.dry_run else "live"
+        if config.synthetic:
+            self.mode = "synthetic"
+        self.source = ""
         self._last_day: date | None = None
         self._sem = asyncio.Semaphore(max(1, int(config.concurrency)))
 
-    async def run(self, matches: Sequence[BacktestMatch]) -> QuantReport:
-        """Replay ``matches`` chronologically; return QuantReport."""
+    async def run(
+        self,
+        matches: Sequence[BacktestMatch],
+        *,
+        history: Sequence[BacktestMatch] | None = None,
+        mode: str | None = None,
+        source: str | None = None,
+    ) -> QuantReport:
+        """Replay ``matches`` chronologically; return QuantReport.
+
+        ``history`` holds earlier finished matches used only as model training
+        data (never bet). Matches lacking model probabilities are predicted by
+        per-fold Dixon–Coles fits trained strictly before each test window.
+        """
+        if mode:
+            self.mode = str(mode)
+        if source is not None:
+            self.source = str(source)
         ordered = sorted(matches, key=lambda m: m.kickoff_utc)
         if not ordered:
-            return build_quant_report(
-                settled_bets=[],
-                equity_curve=self.equity,
-                y_true=[],
-                y_prob=[],
-                tier_counts=self.tier_counts,
-                initial_bankroll=self.config.initial_bankroll,
-                final_bankroll=self.bankroll,
-                n_matches=0,
-                mode="dry-run" if self.config.dry_run else "live",
-            )
+            return self._report(n_matches=0)
 
-        # Optional fold annotation via WalkForwardValidator (no leakage helper).
-        years = {m.kickoff_utc.year for m in ordered}
-        if years:
-            try:
-                splits = WalkForwardValidator.generate_time_splits(
-                    min(years) - 3, max(years), train_window_years=3, test_window_months=6
-                )
-                logger.info("Walk-forward folds available: %d", len(splits))
-            except ValueError:
-                splits = []
-            _ = splits
+        self._fit_walk_forward(ordered, list(history or []))
+
+        priceable: list[BacktestMatch] = []
+        for m in ordered:
+            if not _valid_1x2(m.bookmaker_odds):
+                self.n_skipped_no_odds += 1
+                continue
+            if not m.dixon_coles_probs:
+                self.n_skipped_no_model += 1
+                continue
+            priceable.append(m)
+        if self.n_skipped_no_odds:
+            logger.info("Skipped %d matches without real odds", self.n_skipped_no_odds)
+        if self.n_skipped_no_model:
+            logger.info(
+                "Skipped %d matches without a walk-forward model prediction",
+                self.n_skipped_no_model,
+            )
 
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         await init_schema_v2_async(engine)
         factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
         async with factory() as session:
-            await self._seed_matches(session, ordered)
+            await self._seed_matches(session, priceable)
             await session.commit()
 
             # Day-batch: parallel pipeline (no shared session), then sequential
             # persist / stake / settle (bankroll + AsyncSession are serial).
-            for day, day_matches in _group_by_day(ordered):
+            for day, day_matches in _group_by_day(priceable):
                 if self._last_day is not None and day != self._last_day:
                     self.exposure.reset_daily()
                 self._last_day = day
@@ -473,8 +758,9 @@ class WalkForwardBacktester:
             await session.commit()
 
         await engine.dispose()
+        return self._report(n_matches=len(ordered))
 
-        mode = "dry-run" if self.config.dry_run else "live"
+    def _report(self, *, n_matches: int) -> QuantReport:
         return build_quant_report(
             settled_bets=self.settled,
             equity_curve=self.equity,
@@ -483,21 +769,138 @@ class WalkForwardBacktester:
             tier_counts=self.tier_counts,
             initial_bankroll=self.config.initial_bankroll,
             final_bankroll=self.bankroll,
-            n_matches=len(ordered),
+            n_matches=n_matches,
             n_priced=self.n_priced,
             n_skipped_gate=self.n_skipped_gate,
-            mode=mode,
+            mode=self.mode,
+            n_skipped_no_odds=self.n_skipped_no_odds,
+            n_skipped_no_model=self.n_skipped_no_model,
+            n_folds=self.n_folds,
+            source=self.source,
         )
+
+    # ------------------------------------------------------------------
+    # Walk-forward model fitting
+    # ------------------------------------------------------------------
+
+    def _new_model(self) -> Any:
+        if self._model_factory is not None:
+            return self._model_factory()
+        from src.dixon_coles import DixonColesModel
+
+        return DixonColesModel(xi=float(self.config.dc_xi))
+
+    def _fit_walk_forward(
+        self,
+        matches: Sequence[BacktestMatch],
+        history: Sequence[BacktestMatch],
+    ) -> None:
+        """Fill ``dixon_coles_probs`` for matches lacking them, fold by fold.
+
+        For each :class:`TimeSplit` and league, the model is fit only on
+        finished matches with ``train_start <= kickoff < test_start`` and
+        predicts that league's matches in ``[test_start, test_end)``.
+        """
+        need = [m for m in matches if not m.dixon_coles_probs]
+        if not need:
+            return
+
+        pool: dict[UUID, BacktestMatch] = {}
+        for m in list(history) + list(matches):
+            if m.ft_home_goals is None or m.ft_away_goals is None:
+                continue
+            pool.setdefault(m.canonical_match_id, m)
+        train_pool = sorted(pool.values(), key=lambda m: _ensure_aware(m.kickoff_utc))
+
+        years = [_ensure_aware(m.kickoff_utc).year for m in need]
+        window = max(1, int(self.config.train_window_years))
+        try:
+            splits = WalkForwardValidator.generate_time_splits(
+                min(years) - window,
+                max(years),
+                train_window_years=window,
+                test_window_months=max(1, int(self.config.test_window_months)),
+            )
+        except ValueError:
+            splits = []
+        logger.info("Walk-forward folds: %d", len(splits))
+
+        min_train = max(1, int(self.config.min_train_matches))
+        for split in splits:
+            test = [
+                m
+                for m in need
+                if split.test_start <= _ensure_aware(m.kickoff_utc) < split.test_end
+            ]
+            if not test:
+                continue
+            by_league: dict[str, list[BacktestMatch]] = {}
+            for m in test:
+                by_league.setdefault(m.league, []).append(m)
+
+            for league, league_test in by_league.items():
+                train = [
+                    p
+                    for p in train_pool
+                    if p.league == league
+                    and split.train_start <= _ensure_aware(p.kickoff_utc) < split.test_start
+                ]
+                if len(train) < min_train:
+                    continue
+                try:
+                    model = self._new_model().fit(_training_frame(train))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Model fit failed league=%s fold=%s: %s",
+                        league,
+                        split.test_start.date(),
+                        exc,
+                    )
+                    continue
+                self.n_folds += 1
+                self.fold_log.append(
+                    {
+                        "league": league,
+                        "train_start": split.train_start,
+                        "train_end": split.train_end,
+                        "test_start": split.test_start,
+                        "test_end": split.test_end,
+                        "n_train": len(train),
+                        "max_train_kickoff": max(
+                            _ensure_aware(p.kickoff_utc) for p in train
+                        ),
+                        "n_test": len(league_test),
+                    }
+                )
+                for m in league_test:
+                    try:
+                        probs = model.predict_match_probs(m.home_team, m.away_team)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    clean = {
+                        k: float(probs[k]) for k in ("H", "D", "A") if k in probs
+                    }
+                    total = sum(clean.values())
+                    if len(clean) == 3 and total > 0 and math.isfinite(total):
+                        m.dixon_coles_probs = {k: v / total for k, v in clean.items()}
 
     async def _seed_matches(
         self, session: AsyncSession, matches: Sequence[BacktestMatch]
     ) -> None:
         team_ids: dict[str, UUID] = {}
-        comp = CanonicalCompetition(name="EPL", code="EPL", mapping_status="MAPPED")
-        session.add(comp)
-        await session.flush()
+        comp_ids: dict[str, UUID] = {}
 
         for m in matches:
+            league = str(m.league or "UNKNOWN")
+            if league not in comp_ids:
+                comp = CanonicalCompetition(
+                    name=str(m.competition or league),
+                    code=league[:32],
+                    mapping_status="MAPPED",
+                )
+                session.add(comp)
+                await session.flush()
+                comp_ids[league] = comp.id
             for name in (m.home_team, m.away_team):
                 if name not in team_ids:
                     t = CanonicalTeam(name=name, mapping_status="MAPPED")
@@ -507,7 +910,7 @@ class WalkForwardBacktester:
 
             row = CanonicalMatch(
                 canonical_match_id=m.canonical_match_id,
-                competition_id=comp.id,
+                competition_id=comp_ids[league],
                 home_team_id=team_ids[m.home_team],
                 away_team_id=team_ids[m.away_team],
                 kickoff_utc=m.kickoff_utc,
@@ -539,9 +942,9 @@ class WalkForwardBacktester:
         async def _one(m: BacktestMatch) -> dict[str, Any]:
             async with self._sem:
                 as_of = _ensure_aware(m.kickoff_utc) - PIT_LEAD
-                match_data: dict[str, Any] = {
-                    "expected_sources": list(m.expected_sources),
-                }
+                match_data: dict[str, Any] = {}
+                if m.expected_sources:
+                    match_data["expected_sources"] = list(m.expected_sources)
                 if m.quality_band == "B":
                     match_data["expected_sources"] = [
                         "odds_api",
@@ -671,9 +1074,11 @@ class WalkForwardBacktester:
             bet_id = record.get("bet_id") or uuid4()
             stake_amt = float(record.get("final_stake_amount") or frac * self.bankroll)
             sel_key = _selection_to_hda(str(cand["selection"]))
+            # CLV reference = de-vigged real closing price (None ⇒ no CLV).
             closing = None
-            if sel_key and match.closing_odds:
-                closing = float(match.closing_odds.get(sel_key) or 0) or None
+            fair_close = _fair_closing(match.closing_odds)
+            if sel_key and fair_close:
+                closing = float(fair_close.get(sel_key) or 0) or None
 
             paper = _PaperBet(
                 bet_id=bet_id if isinstance(bet_id, UUID) else UUID(str(bet_id)),
@@ -842,7 +1247,12 @@ class WalkForwardBacktester:
 
 
 async def run_backtest(config: BacktestConfig) -> QuantReport:
-    """Load matches (DB → fixtures → synthetic) and run walk-forward replay."""
+    """Load matches (fixtures → DB, or synthetic on request) and replay.
+
+    Raises :class:`BacktestDataError` when the DB is unreachable or has no
+    matches in range — synthetic data is used **only** with
+    ``config.synthetic=True`` and is then reported as ``mode="synthetic"``.
+    """
     start = datetime(
         config.start_date.year,
         config.start_date.month,
@@ -857,40 +1267,70 @@ async def run_backtest(config: BacktestConfig) -> QuantReport:
     ) + timedelta(days=1)
 
     matches: list[BacktestMatch] = []
-    source = "synthetic"
+    history: list[BacktestMatch] = []
+    source: str
+    load_stats: dict[str, int] = {}
 
-    if config.fixtures_path and config.fixtures_path.exists():
-        matches = load_matches_from_fixtures(config.fixtures_path)
+    if config.fixtures_path is not None:
+        if not config.fixtures_path.exists():
+            raise BacktestDataError(f"Fixtures file not found: {config.fixtures_path}")
+        loaded = load_matches_from_fixtures(config.fixtures_path)
+        history = [m for m in loaded if _ensure_aware(m.kickoff_utc) < start]
+        matches = loaded
         source = "fixtures"
-    else:
-        # Try live DB when not dry-run (or as primary when URL set).
-        if not config.dry_run or config.database_url:
-            try:
-                from src.db.session import create_async_engine_from_url, async_session_factory
-
-                url = config.database_url
-                eng = create_async_engine_from_url(url)
-                factory = async_session_factory(eng)
-                async with factory() as session:
-                    matches = await load_matches_from_db(session, start=start, end=end)
-                await eng.dispose()
-                if matches:
-                    source = "database"
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("DB match load failed (%s); falling back", exc)
-                matches = []
-
-    if not matches:
-        n = DRY_RUN_MATCH_COUNT if config.dry_run else DRY_RUN_MATCH_COUNT
+    elif config.synthetic:
         matches = generate_synthetic_matches(
-            n=n,
+            n=DRY_RUN_MATCH_COUNT,
             end=end - timedelta(seconds=1),
             seed=config.seed,
         )
         source = "synthetic"
-        logger.info("Using %d synthetic matches (%s)", len(matches), source)
+        logger.info("Using %d synthetic matches (explicitly requested)", len(matches))
+    else:
+        hist_start = datetime(
+            start.year - max(1, int(config.train_window_years)), 1, 1, tzinfo=timezone.utc
+        )
+        try:
+            from src.db.session import async_session_factory, create_async_engine_from_url
 
-    # Filter to date window.
+            eng = create_async_engine_from_url(config.database_url)
+            factory = async_session_factory(eng)
+            async with factory() as session:
+                matches = await load_matches_from_db(
+                    session,
+                    start=start,
+                    end=end,
+                    stats=load_stats,
+                    entry_odds_family=config.entry_odds_family,
+                    allow_closing_as_entry=config.allow_closing_as_entry,
+                )
+                history = await load_matches_from_db(
+                    session,
+                    start=hist_start,
+                    end=start,
+                    entry_odds_family=config.entry_odds_family,
+                    allow_closing_as_entry=config.allow_closing_as_entry,
+                )
+            await eng.dispose()
+        except Exception as exc:  # noqa: BLE001
+            raise BacktestDataError(
+                f"DB match load failed ({exc}); refusing to fall back to synthetic "
+                "data. Fix the DB / --database-url, or pass --synthetic."
+            ) from exc
+        if not matches:
+            raise BacktestDataError(
+                f"No canonical matches in DB for [{start.date()}, {end.date()}); "
+                "refusing to fall back to synthetic data. Import history first "
+                "or pass --synthetic."
+            )
+        source = "database"
+        logger.info(
+            "DB load: %s (history=%d)",
+            ", ".join(f"{k}={v}" for k, v in sorted(load_stats.items())),
+            len(history),
+        )
+
+    # Filter to date window (earlier fixture rows stay as training history).
     matches = [
         m
         for m in matches
@@ -898,19 +1338,33 @@ async def run_backtest(config: BacktestConfig) -> QuantReport:
     ]
     matches.sort(key=lambda m: m.kickoff_utc)
 
+    dry_run_cut: list[BacktestMatch] = []
     if config.dry_run and len(matches) > DRY_RUN_MATCH_COUNT:
+        dry_run_cut = matches[:-DRY_RUN_MATCH_COUNT]
         matches = matches[-DRY_RUN_MATCH_COUNT:]
 
+    if source == "synthetic":
+        mode = "synthetic"
+    elif config.dry_run:
+        mode = "dry-run"
+    else:
+        mode = "live"
+
     logger.info(
-        "Backtest: %d matches · source=%s · bankroll=%.2f · dry_run=%s",
+        "Backtest: %d matches · source=%s · mode=%s · bankroll=%.2f",
         len(matches),
         source,
+        mode,
         config.initial_bankroll,
-        config.dry_run,
     )
 
     bt = WalkForwardBacktester(config)
-    report = await bt.run(matches)
+    report = await bt.run(
+        matches,
+        history=history + dry_run_cut,
+        mode=mode,
+        source=source,
+    )
     return report
 
 
@@ -924,8 +1378,15 @@ def parse_args(argv: Sequence[str] | None = None) -> BacktestConfig:
     p.add_argument(
         "--dry-run",
         action="store_true",
-        help="Replay last ~50 matches only (synthetic if DB empty)",
+        help="Replay the last ~50 matches only",
     )
+    p.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="Use generated synthetic fixtures (report mode=synthetic)",
+    )
+    p.add_argument("--train-window-years", type=int, default=3)
+    p.add_argument("--test-window-months", type=int, default=3)
     p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     p.add_argument("--fixtures", type=str, default=None, help="JSON fixtures path")
     p.add_argument("--database-url", type=str, default=None)
@@ -953,12 +1414,19 @@ def parse_args(argv: Sequence[str] | None = None) -> BacktestConfig:
         fixtures_path=Path(ns.fixtures) if ns.fixtures else None,
         database_url=ns.database_url,
         seed=int(ns.seed),
+        synthetic=bool(ns.synthetic),
+        train_window_years=max(1, int(ns.train_window_years)),
+        test_window_months=max(1, int(ns.test_window_months)),
     )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     config = parse_args(argv)
-    report = asyncio.run(run_backtest(config))
+    try:
+        report = asyncio.run(run_backtest(config))
+    except BacktestDataError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     text = render_quant_report(report)
     try:
         print(text)
@@ -990,6 +1458,31 @@ def _parse_dt(s: str | datetime) -> datetime:
     raw = str(s).strip().replace("Z", "+00:00")
     dt = datetime.fromisoformat(raw)
     return _ensure_aware(dt)
+
+
+def _fair_closing(closing: Mapping[str, float] | None) -> dict[str, float] | None:
+    """De-vigged closing 1X2 prices (``None`` when no complete real close)."""
+    valid = _valid_1x2(closing)
+    if not valid:
+        return None
+    return devig_odds(valid)
+
+
+def _training_frame(matches: Sequence[BacktestMatch]) -> Any:
+    """Finished matches → DataFrame for ``DixonColesModel.fit``."""
+    import pandas as pd
+
+    return pd.DataFrame(
+        {
+            "Date": [
+                _ensure_aware(m.kickoff_utc).replace(tzinfo=None) for m in matches
+            ],
+            "HomeTeam": [m.home_team for m in matches],
+            "AwayTeam": [m.away_team for m in matches],
+            "FTHG": [int(m.ft_home_goals) for m in matches],  # type: ignore[arg-type]
+            "FTAG": [int(m.ft_away_goals) for m in matches],  # type: ignore[arg-type]
+        }
+    )
 
 
 def _group_by_day(
@@ -1033,6 +1526,7 @@ def _outcome_hit(selection: str, ft_h: int, ft_a: int) -> int | None:
 # Re-exports for package __init__
 __all__ = [
     "BacktestConfig",
+    "BacktestDataError",
     "BacktestMatch",
     "QuantReport",
     "WalkForwardBacktester",

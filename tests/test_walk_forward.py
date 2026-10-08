@@ -21,19 +21,33 @@ def test_generate_time_splits_example_2019_2023() -> None:
         train_window_years=3,
         test_window_months=6,
     )
-    assert len(splits) == 2
+    # train_window_years=3 ⇒ first train is exactly 2019, 2020, 2021
+    # (previous off-by-one trained on 4 years and first tested 2023-H1).
+    assert len(splits) == 4
 
-    s0, s1 = splits
+    s0, s1 = splits[0], splits[1]
     assert s0.train_start == datetime(2019, 1, 1, tzinfo=UTC)
-    assert s0.train_end == datetime(2023, 1, 1, tzinfo=UTC)
-    assert s0.test_start == datetime(2023, 1, 1, tzinfo=UTC)
-    assert s0.test_end == datetime(2023, 7, 1, tzinfo=UTC)
+    assert s0.train_end == datetime(2022, 1, 1, tzinfo=UTC)
+    assert s0.test_start == datetime(2022, 1, 1, tzinfo=UTC)
+    assert s0.test_end == datetime(2022, 7, 1, tzinfo=UTC)
 
     # Expanding: train grows through previous test end
     assert s1.train_start == datetime(2019, 1, 1, tzinfo=UTC)
-    assert s1.train_end == datetime(2023, 7, 1, tzinfo=UTC)
-    assert s1.test_start == datetime(2023, 7, 1, tzinfo=UTC)
-    assert s1.test_end == datetime(2024, 1, 1, tzinfo=UTC)
+    assert s1.train_end == datetime(2022, 7, 1, tzinfo=UTC)
+    assert s1.test_start == datetime(2022, 7, 1, tzinfo=UTC)
+    assert s1.test_end == datetime(2023, 1, 1, tzinfo=UTC)
+
+    assert splits[-1].test_start == datetime(2023, 7, 1, tzinfo=UTC)
+    assert splits[-1].test_end == datetime(2024, 1, 1, tzinfo=UTC)
+
+
+def test_train_window_years_is_exact() -> None:
+    for years in (1, 2, 3, 5):
+        splits = WalkForwardValidator.generate_time_splits(
+            2010, 2020, train_window_years=years, test_window_months=12
+        )
+        first = splits[0]
+        assert first.train_end.year - first.train_start.year == years
 
 
 def test_every_split_test_strictly_after_train() -> None:
@@ -59,11 +73,11 @@ def test_every_split_test_strictly_after_train() -> None:
 def test_no_splits_when_horizon_too_short() -> None:
     splits = WalkForwardValidator.generate_time_splits(
         start_year=2020,
-        end_year=2022,
+        end_year=2021,
         train_window_years=3,
         test_window_months=6,
     )
-    # First test would start 2024-01-01, past horizon end 2023-01-01
+    # First test would start 2023-01-01, past horizon end 2022-01-01
     assert splits == []
 
 

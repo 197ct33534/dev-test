@@ -59,6 +59,12 @@ class QuantReport:
     n_priced: int = 0
     n_skipped_gate: int = 0
     mode: str = "live"
+    # Matches excluded before pricing (no real 1X2 odds / no model prediction).
+    n_skipped_no_odds: int = 0
+    n_skipped_no_model: int = 0
+    # Walk-forward folds in which a model was actually fit.
+    n_folds: int = 0
+    source: str = ""
 
 
 def build_quant_report(
@@ -74,6 +80,10 @@ def build_quant_report(
     n_priced: int = 0,
     n_skipped_gate: int = 0,
     mode: str = "live",
+    n_skipped_no_odds: int = 0,
+    n_skipped_no_model: int = 0,
+    n_folds: int = 0,
+    source: str = "",
 ) -> QuantReport:
     """Compute dashboard metrics from settled paper bets + equity path."""
     bets = list(settled_bets)
@@ -165,6 +175,10 @@ def build_quant_report(
         n_priced=n_priced,
         n_skipped_gate=n_skipped_gate,
         mode=mode,
+        n_skipped_no_odds=int(n_skipped_no_odds),
+        n_skipped_no_model=int(n_skipped_no_model),
+        n_folds=int(n_folds),
+        source=str(source or ""),
     )
 
 
@@ -261,6 +275,11 @@ def _render_rich(report: QuantReport, title: str) -> str:
     meta.add_row("Matches", str(report.n_matches))
     meta.add_row("Priced", str(report.n_priced))
     meta.add_row("Skipped (gate)", str(report.n_skipped_gate))
+    meta.add_row("Skipped (no odds)", str(report.n_skipped_no_odds))
+    meta.add_row("Skipped (no model)", str(report.n_skipped_no_model))
+    meta.add_row("Model folds", str(report.n_folds))
+    if report.source:
+        meta.add_row("Source", report.source)
     console.print(meta)
 
     return buf.getvalue()
@@ -307,6 +326,10 @@ def _render_plain(report: QuantReport, title: str) -> str:
         f"  Matches               {report.n_matches}",
         f"  Priced                {report.n_priced}",
         f"  Skipped (gate)        {report.n_skipped_gate}",
+        f"  Skipped (no odds)     {report.n_skipped_no_odds}",
+        f"  Skipped (no model)    {report.n_skipped_no_model}",
+        f"  Model folds           {report.n_folds}",
+        f"  Source                {report.source or 'n/a'}",
         "=" * 64,
     ]
     return "\n".join(lines)
