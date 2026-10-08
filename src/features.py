@@ -91,9 +91,17 @@ def _as_ts(value: Any) -> pd.Timestamp:
 
 
 def _mean_last(values: Sequence[float], n: int) -> float:
+    """Mean of the last ``n`` entries, ignoring NaN (missing stat) entries.
+
+    Returns NaN when history is empty or every entry in the window is NaN.
+    """
     if not values:
         return float("nan")
-    return float(np.mean(values[-n:]))
+    window = np.asarray(values[-n:], dtype=float)
+    window = window[~np.isnan(window)]
+    if window.size == 0:
+        return float("nan")
+    return float(np.mean(window))
 
 
 def add_match_xg_proxy(matches: pd.DataFrame) -> pd.DataFrame:
@@ -221,48 +229,90 @@ def engineer_rolling_features(
         away_shots = float(row["AS"]) if pd.notna(row["AS"]) else float("nan")
         home_c = float(row["HC"]) if pd.notna(row["HC"]) else float("nan")
         away_c = float(row["AC"]) if pd.notna(row["AC"]) else float("nan")
+        def _ok(v: float) -> bool:
+            return v == v  # not NaN
+
+        # xG fallback only when at least one shot stat exists — otherwise the
+        # proxy would silently become 0.0 for stat-less rows.
         home_xg = (
             float(row["home_xg_proxy"])
             if pd.notna(row["home_xg_proxy"])
-            else xg_proxy(home_shots, home_sot)
+            else (
+                xg_proxy(home_shots, home_sot)
+                if _ok(home_shots) or _ok(home_sot)
+                else float("nan")
+            )
         )
         away_xg = (
             float(row["away_xg_proxy"])
             if pd.notna(row["away_xg_proxy"])
-            else xg_proxy(away_shots, away_sot)
+            else (
+                xg_proxy(away_shots, away_sot)
+                if _ok(away_shots) or _ok(away_sot)
+                else float("nan")
+            )
         )
 
-        def _ok(v: float) -> bool:
-            return v == v  # not NaN
-
+        # Missing individual stats stay NaN (not 0.0) so rolling means skip
+        # them instead of being dragged towards zero.
         if _ok(home_sot) or _ok(home_c) or _ok(home_xg):
             history[home].append(
                 {
-                    "sot": home_sot if _ok(home_sot) else 0.0,
-                    "shots": home_shots if _ok(home_shots) else 0.0,
-                    "corners": home_c if _ok(home_c) else 0.0,
-                    "xg": home_xg if _ok(home_xg) else 0.0,
+                    "sot": home_sot,
+                    "shots": home_shots,
+                    "corners": home_c,
+                    "xg": home_xg,
                 }
             )
         if _ok(away_sot) or _ok(away_c) or _ok(away_xg):
             history[away].append(
                 {
-                    "sot": away_sot if _ok(away_sot) else 0.0,
-                    "shots": away_shots if _ok(away_shots) else 0.0,
-                    "corners": away_c if _ok(away_c) else 0.0,
-                    "xg": away_xg if _ok(away_xg) else 0.0,
+                    "sot": away_sot,
+                    "shots": away_shots,
+                    "corners": away_c,
+                    "xg": away_xg,
                 }
             )
 
     return impute_rolling_with_league_mean(pd.DataFrame(rows))
 
 
-def impute_rolling_with_league_mean(df: pd.DataFrame) -> pd.DataFrame:
-    """Fill NaN rolling / xG feature columns with column-wise league means.
+def _point_in_time_means(
+    values: pd.DataFrame,
+    dates: pd.Series,
+) -> pd.DataFrame:
+    """Per-row column means over rows with ``date`` **strictly before** that row.
 
-    Uses ``df.fillna(df.mean(numeric_only=True))`` on rolling_* / *_xg_* /
-    corner_total_avg* columns so LightGBM / corner regressors never see NaN
-    for debut clubs.
+    Same-day rows never contribute to each other (no intra-day look-ahead).
+    Rows with no earlier non-NaN value get NaN.
+    """
+    num = values.apply(pd.to_numeric, errors="coerce").astype(float)
+    day = pd.to_datetime(dates, errors="coerce")
+    sums = num.groupby(day.values).sum(min_count=1).fillna(0.0).sort_index()
+    counts = num.notna().groupby(day.values).sum().sort_index()
+    prior_sum = sums.cumsum().shift(1).fillna(0.0)
+    prior_cnt = counts.cumsum().shift(1).fillna(0.0)
+    prior_mean = prior_sum / prior_cnt.replace(0.0, np.nan)
+    out = prior_mean.reindex(day.values)
+    out.index = values.index
+    return out
+
+
+def impute_rolling_with_league_mean(
+    df: pd.DataFrame,
+    *,
+    point_in_time: bool = True,
+    date_col: str = "Date",
+) -> pd.DataFrame:
+    """Fill NaN rolling / xG feature columns with league means (leakage-safe).
+
+    With ``point_in_time=True`` (default) and a ``date_col`` present, each
+    row is imputed with the column mean over rows whose date is **strictly
+    before** it (expanding mean, shifted by one day) — no future rows leak
+    into earlier training rows. Without a date column (or with
+    ``point_in_time=False``) the legacy whole-frame mean is used. Remaining
+    NaN (no earlier data at all) → ``0.0`` so LightGBM / corner regressors
+    never see NaN for debut clubs.
     """
     if df.empty:
         return df.copy()
@@ -294,9 +344,15 @@ def impute_rolling_with_league_mean(df: pd.DataFrame) -> pd.DataFrame:
         ]
     if not feature_cols:
         return out
-    means = out[feature_cols].mean(numeric_only=True)
-    out[feature_cols] = out[feature_cols].fillna(means)
-    # Any remaining NaN (all-NaN columns) → 0
+    if point_in_time and date_col in out.columns:
+        prior = _point_in_time_means(out[feature_cols], out[date_col])
+        out[feature_cols] = (
+            out[feature_cols].apply(pd.to_numeric, errors="coerce").fillna(prior)
+        )
+    else:
+        means = out[feature_cols].mean(numeric_only=True)
+        out[feature_cols] = out[feature_cols].fillna(means)
+    # Any remaining NaN (no prior data / all-NaN columns) → 0
     out[feature_cols] = out[feature_cols].fillna(0.0)
     return out
 
@@ -453,9 +509,13 @@ def get_rest_days(
 ) -> float:
     """Instant rest_days from SQLite only — **zero** web requests.
 
-    Uses ``teams.last_match_date`` when set; otherwise falls back to
-    ``MAX(matches.match_date)`` for that ``team_id``. Applies the same
-    hard-cap as :func:`calculate_multi_comp_features` (``>30`` → ``14``).
+    Point-in-time: only finished matches with ``match_date`` strictly
+    before the upcoming day are considered (``MAX(match_date) WHERE
+    match_date < upcoming``). ``teams.last_match_date`` (feed meta) is used
+    only when it is also strictly before ``upcoming_date``; when both are
+    available the later of the two wins. A stale / future meta value never
+    yields a negative rest. Applies the same hard-cap as
+    :func:`calculate_multi_comp_features` (``>30`` → ``14``).
     Returns ``NaN`` when no prior match date is known.
     """
     from src.global_db import (
@@ -466,7 +526,7 @@ def get_rest_days(
     )
 
     try:
-        upcoming = pd.Timestamp(upcoming_date).normalize()
+        upcoming = _as_ts(upcoming_date)
     except (TypeError, ValueError):
         return float("nan")
 
@@ -486,30 +546,45 @@ def get_rest_days(
             if tid is None:
                 return float("nan")
             meta = get_team_feed_meta(conn, tid)
-            last_raw = (meta or {}).get("last_match_date") if meta else None
-            if not last_raw:
-                row = conn.execute(
-                    """
-                    SELECT MAX(match_date) AS last_d
-                    FROM matches
-                    WHERE (home_team_id = ? OR away_team_id = ?)
-                      AND home_score IS NOT NULL
-                      AND away_score IS NOT NULL
-                    """,
-                    (tid, tid),
-                ).fetchone()
-                last_raw = row["last_d"] if row else None
+            meta_raw = (meta or {}).get("last_match_date") if meta else None
+            # PIT: strictly before the upcoming *day* (string compare works for
+            # ISO ``YYYY-MM-DD`` and ``YYYY-MM-DD HH:MM`` alike).
+            row = conn.execute(
+                """
+                SELECT MAX(match_date) AS last_d
+                FROM matches
+                WHERE (home_team_id = ? OR away_team_id = ?)
+                  AND home_score IS NOT NULL
+                  AND away_score IS NOT NULL
+                  AND match_date < ?
+                """,
+                (tid, tid, upcoming.strftime("%Y-%m-%d")),
+            ).fetchone()
+            query_raw = row["last_d"] if row else None
         finally:
             conn.close()
     except Exception:  # noqa: BLE001
         return float("nan")
 
-    if not last_raw:
+    candidates: list[pd.Timestamp] = []
+    for raw in (meta_raw, query_raw):
+        if not raw:
+            continue
+        try:
+            ts = pd.Timestamp(raw)
+        except (TypeError, ValueError):
+            continue
+        if pd.isna(ts):
+            continue
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert(None)
+        ts = ts.normalize()
+        # Feed meta may be stale *ahead* of the fixture (later matches) → skip.
+        if ts < upcoming:
+            candidates.append(ts)
+    if not candidates:
         return float("nan")
-    try:
-        last = pd.Timestamp(last_raw).normalize()
-    except (TypeError, ValueError):
-        return float("nan")
+    last = max(candidates)
 
     rest_days = float((upcoming - last).days)
     if rest_days < 0:

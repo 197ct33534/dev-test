@@ -11,8 +11,10 @@ from __future__ import annotations
 DEFAULT_W_ML: float = 0.20
 
 # Fractional Kelly multiplier (full Kelly × this). Was 0.25 (Quarter Kelly).
+# Policy: 10% Kelly. UI / report labels must render this value (e.g. via
+# :func:`kelly_fraction_label`) rather than hard-coding a percentage.
 DEFAULT_KELLY_FRACTION: float = 0.10
-MAX_KELLY_FRACTION: float = 0.10  # alias / hard policy ceiling for UI & strategy
+MAX_KELLY_FRACTION: float = 0.10  # hard policy ceiling enforced by src.strategy
 
 # Hard cap on stake as a fraction of bankroll (1.0% per bet).
 MAX_STAKE_PCT: float = 0.01
@@ -25,8 +27,14 @@ MAX_BETS_PER_DAY: int = 5
 CLOSE_ODDS_WINDOW_MIN_MINUTES: int = 15
 CLOSE_ODDS_WINDOW_MAX_MINUTES: int = 30
 
-# Value-bet floor (unchanged).
+# Value-bet floor: recommend only when EV = P·Odds − 1 ≥ this (5%).
+# AH / O/U use the exact settlement EV (push / half-lose refunds included).
 DEFAULT_MIN_EV: float = 0.05
+# Explicit policy alias for the EV floor (same value; prefer in new code).
+MIN_EV_THRESHOLD: float = DEFAULT_MIN_EV
+
+# New / thin-history clubs: tighter stake ceiling (half the normal cap).
+NEW_TEAM_MAX_STAKE_PCT: float = MAX_STAKE_PCT / 2.0
 # Hard sanity cap — drop absurd EV (overconfident longshots / bad probs).
 MAX_EV: float = 0.50
 # 1X2 longshot guard: odds above this with model p above threshold → skip.
@@ -40,3 +48,14 @@ MIN_TEAM_MATCHES_FOR_STRENGTH: int = MIN_TEAM_MATCHES
 # LightGBM probability calibration (sklearn CalibratedClassifierCV).
 ML_CALIBRATION_METHOD: str = "sigmoid"  # or "isotonic"
 ML_CALIBRATION_MIN_ROWS: int = 40
+
+
+def kelly_fraction_label(fraction: float | None = None) -> str:
+    """Human label for the active fractional-Kelly policy, e.g. ``"Kelly 10%"``.
+
+    The effective fraction is clipped to :data:`MAX_KELLY_FRACTION`, matching
+    what :func:`src.strategy.calculate_kelly_stake` enforces.
+    """
+    frac = DEFAULT_KELLY_FRACTION if fraction is None else float(fraction)
+    frac = max(0.0, min(frac, MAX_KELLY_FRACTION))
+    return f"Kelly {frac:.0%}"

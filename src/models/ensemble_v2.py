@@ -31,9 +31,22 @@ _DEFAULT_TEMPERATURE = 1.0
 
 
 def _as_prob_dict(raw: Optional[Mapping[str, Any]]) -> dict[str, float]:
-    """Normalize a probability mapping onto ``H/D/A``; missing → uniform."""
-    if not raw:
+    """Normalize a probability mapping onto ``H/D/A``; missing → uniform.
+
+    Kept for callers that need a total function. The ensemble itself uses
+    :func:`_parse_prob_dict` so missing components are *dropped* rather than
+    blended in as a fake uniform forecast.
+    """
+    parsed = _parse_prob_dict(raw)
+    if parsed is None:
         return {k: 1.0 / 3.0 for k in OUTCOME_KEYS}
+    return parsed
+
+
+def _parse_prob_dict(raw: Optional[Mapping[str, Any]]) -> Optional[dict[str, float]]:
+    """Normalize a probability mapping onto ``H/D/A``; missing / empty → ``None``."""
+    if not raw:
+        return None
     out: dict[str, float] = {}
     for key in OUTCOME_KEYS:
         # Accept common aliases.
@@ -50,10 +63,10 @@ def _as_prob_dict(raw: Optional[Mapping[str, Any]]) -> dict[str, float]:
                 except (TypeError, ValueError):
                     val = None
                 break
-        out[key] = val if val is not None else 0.0
+        out[key] = val if val is not None and math.isfinite(val) and val > 0.0 else 0.0
     total = sum(out.values())
     if total <= _EPS:
-        return {k: 1.0 / 3.0 for k in OUTCOME_KEYS}
+        return None
     return {k: out[k] / total for k in OUTCOME_KEYS}
 
 
@@ -64,18 +77,43 @@ def _renormalize(probs: Mapping[str, float]) -> dict[str, float]:
     return {k: float(probs.get(k, 0.0)) / total for k in OUTCOME_KEYS}
 
 
-def _blend(
-    components: Mapping[str, Mapping[str, float]],
+def _effective_weights(
+    components: Mapping[str, Optional[Mapping[str, float]]],
     weights: Mapping[str, float],
 ) -> dict[str, float]:
-    """Weighted average of probability dicts; renormalize."""
+    """Drop missing components and renormalize the remaining weights to 1.
+
+    Every configured weight key is kept in the output (missing → 0.0). If no
+    present component carries positive weight, all weights are 0.0.
+    """
+    present = {
+        name: max(0.0, float(w))
+        for name, w in weights.items()
+        if components.get(name) is not None
+    }
+    total = sum(present.values())
+    if total <= _EPS:
+        return {name: 0.0 for name in weights}
+    return {name: present.get(name, 0.0) / total for name in weights}
+
+
+def _blend(
+    components: Mapping[str, Optional[Mapping[str, float]]],
+    weights: Mapping[str, float],
+) -> dict[str, float]:
+    """Weighted average of the *present* probability dicts; renormalize.
+
+    Components that are missing (``None`` / absent) are dropped and the
+    remaining weights renormalized, instead of being treated as uniform.
+    """
+    weights = _effective_weights(components, weights)
     w_sum = sum(max(0.0, float(w)) for w in weights.values())
     if w_sum <= _EPS:
         return {k: 1.0 / 3.0 for k in OUTCOME_KEYS}
     blended: dict[str, float] = {k: 0.0 for k in OUTCOME_KEYS}
     for name, w in weights.items():
         ww = max(0.0, float(w)) / w_sum
-        if ww <= _EPS or name not in components:
+        if ww <= _EPS or components.get(name) is None:
             continue
         for key in OUTCOME_KEYS:
             blended[key] += ww * float(components[name].get(key, 0.0))
@@ -221,7 +259,12 @@ class EnsembleEngineV2:
         ----------
         dixon_coles, lightgbm, market:
             Probability dicts with keys ``H``/``D``/``A`` (aliases accepted).
-            ``market`` should already be vig-removed fair probs.
+            ``market`` should already be vig-removed fair probs. A missing /
+            empty component is dropped and the remaining tier weights are
+            renormalized (``mix_weights`` reports the effective weights). If
+            no weighted component is available the result is uniform and
+            flagged ``no_bet``. Without ``market`` the calibrator skips the
+            pull toward market.
         pit_integrity_passed:
             False forces ``MODEL_TIER_X``.
         aggregate_data_score:
@@ -231,9 +274,9 @@ class EnsembleEngineV2:
         quality_flags:
             Optional extra flags passed through to ``meta``.
         """
-        dc = _as_prob_dict(dixon_coles)
-        lgbm = _as_prob_dict(lightgbm)
-        mkt = _as_prob_dict(market)
+        dc = _parse_prob_dict(dixon_coles)
+        lgbm = _parse_prob_dict(lightgbm)
+        mkt = _parse_prob_dict(market)
 
         tier = self.resolve_tier(
             pit_integrity_passed=pit_integrity_passed,
@@ -250,9 +293,21 @@ class EnsembleEngineV2:
             weights = {"dc": 0.0, "lgbm": 0.0, "market": 1.0}
 
         components = {"dc": dc, "lgbm": lgbm, "market": mkt}
-        raw = _blend(components, weights)
+        configured_weights = dict(weights)
+        weights = _effective_weights(components, configured_weights)
+        missing = sorted(name for name, comp in components.items() if comp is None)
+        no_components = sum(weights.values()) <= _EPS
+        if no_components:
+            # Nothing usable with positive weight → uniform, never bet on it.
+            no_bet = True
+        raw = _blend(components, configured_weights)
 
-        temperature, calibrated = self._calibrate_toward_market(raw, mkt)
+        if mkt is not None and not no_components:
+            temperature, calibrated = self._calibrate_toward_market(raw, mkt)
+        else:
+            temperature, calibrated = self.default_temperature, _apply_temperature(
+                raw, self.default_temperature
+            )
         fair = _renormalize(calibrated)
         lines = _fair_lines_from_probs(fair)
         ev_pct = 0.0 if no_bet else _max_ev_percent(fair, bookmaker_odds)
@@ -281,6 +336,8 @@ class EnsembleEngineV2:
             meta={
                 "quality_flags": dict(quality_flags or {}),
                 "components": {"dc": dc, "lgbm": lgbm, "market": mkt},
+                "configured_weights": configured_weights,
+                "missing_components": missing,
                 "hard_gate": HARD_GATE_CODE if no_bet else None,
             },
         )

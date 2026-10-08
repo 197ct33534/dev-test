@@ -68,6 +68,7 @@ class RiskEngine:
         *,
         market: str | None = None,
         selection: str | None = None,
+        settlement: Mapping[str, float] | None = None,
     ) -> dict[str, Any]:
         """Return sized stake (bankroll fraction) and diagnostic fields.
 
@@ -86,6 +87,11 @@ class RiskEngine:
             with ``market`` / ``selection`` / ``market_type`` attributes).
         market, selection:
             Optional labels for the *candidate* bet (used for correlation).
+        settlement:
+            Optional AH / O/U settlement masses ``{win, half_win, push,
+            half_lose, lose}``. When given, EV and full Kelly use the exact
+            settlement payoff (push / half-lose refunds) instead of the binary
+            ``p * odds - 1`` formulas.
         """
         cfg = self.config
         p = float(probability)
@@ -94,7 +100,12 @@ class RiskEngine:
         mc = float(model_confidence)
         existing = list(existing_match_bets or [])
 
-        ev = p * o - 1.0 if o > 0.0 else float("-inf")
+        if settlement is not None and o > 0.0:
+            from src.dixon_coles import settlement_expected_value
+
+            ev = settlement_expected_value(settlement, o)
+        else:
+            ev = p * o - 1.0 if o > 0.0 else float("-inf")
 
         base: dict[str, Any] = {
             "probability": p,
@@ -120,7 +131,12 @@ class RiskEngine:
             return base
 
         # Full Kelly b = odds - 1; f* = (p*b - q) / b = (p*odds - 1)/(odds - 1)
-        f_full = (p * o - 1.0) / (o - 1.0)
+        if settlement is not None:
+            from src.strategy import settlement_full_kelly_fraction
+
+            f_full = settlement_full_kelly_fraction(settlement, o)
+        else:
+            f_full = (p * o - 1.0) / (o - 1.0)
         f_kelly = max(0.0, f_full) * float(cfg.fraction_multiplier)
         base["f_kelly"] = f_kelly
 

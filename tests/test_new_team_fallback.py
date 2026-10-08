@@ -1,4 +1,4 @@
-"""New / unseen clubs must never KeyError; Kelly capped at 1% bankroll."""
+"""New / unseen clubs must never KeyError; Kelly capped at NEW_TEAM_KELLY_CAP."""
 
 from __future__ import annotations
 
@@ -11,8 +11,6 @@ import pytest
 from src.data_loader import normalize_team_name
 from src.dixon_coles import (
     MIN_TEAM_MATCHES,
-    WEAK_TIER_NEW_TEAM_ATTACK,
-    WEAK_TIER_NEW_TEAM_DEFENCE,
     DixonColesModel,
 )
 from src.models import NEW_TEAM_KELLY_CAP, apply_new_team_kelly_cap, detect_new_teams
@@ -91,8 +89,10 @@ def test_dixon_coles_new_team_priors(caplog: pytest.LogCaptureFixture) -> None:
         lam, mu = model.expected_goals("Inter", "Chelsea")
     assert lam > 0 and mu > 0
     assert "Detecting new/thin team: Inter" in caplog.text
-    assert model.attack["Inter"] == pytest.approx(WEAK_TIER_NEW_TEAM_ATTACK)
-    assert model.defence["Inter"] == pytest.approx(WEAK_TIER_NEW_TEAM_DEFENCE)
+    # Priors are relative to the fitted league (below-average on both).
+    atk_prior, def_prior = model.new_team_priors()
+    assert model.attack["Inter"] == pytest.approx(atk_prior)
+    assert model.defence["Inter"] == pytest.approx(def_prior)
     # Still flagged after prior injection (fitted_teams_ is stable).
     assert model.has_new_team("Inter", "Chelsea")
     probs = model.predict_match_probs("Inter", "Chelsea")
@@ -110,10 +110,13 @@ def test_thin_team_gets_weak_tier_priors() -> None:
     assert model.is_thin_team("Servette")
     assert "Servette" in model.thin_teams_
     assert "Servette" not in model.fitted_teams_
-    assert model.attack["Servette"] == pytest.approx(WEAK_TIER_NEW_TEAM_ATTACK)
-    assert model.defence["Servette"] == pytest.approx(WEAK_TIER_NEW_TEAM_DEFENCE)
-    # Higher δ = better defence; weak newcomers must get low δ (poor defence).
-    assert WEAK_TIER_NEW_TEAM_DEFENCE < 1.0
+    atk_prior, def_prior = model.new_team_priors()
+    assert model.attack["Servette"] == pytest.approx(atk_prior)
+    assert model.defence["Servette"] == pytest.approx(def_prior)
+    # Higher δ = better defence; weak newcomers must get δ below league mean.
+    mean_a, mean_d = model.league_mean_strengths()
+    assert atk_prior < mean_a
+    assert def_prior < mean_d
     assert model.has_new_team("Servette", "Arsenal")
 
 

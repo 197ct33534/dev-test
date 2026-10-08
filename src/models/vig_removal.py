@@ -189,6 +189,14 @@ class VigRemovalEngine:
         dict
             Fair probs (sum ≈ 1), fair odds, and metadata. Keys depend on
             ``market_type``.
+
+        Notes
+        -----
+        On whole / quarter lines the two-way prices embed push and half-stake
+        refunds, so the de-vigged probabilities are *push-adjusted* cover
+        probabilities ``W'/(W'+L')`` — directly comparable to the model's
+        ``p_model`` from :func:`src.dixon_coles.settlement_cover_probability`,
+        not to raw ``P(win)``.
         """
         mt = str(market_type).strip().lower()
         method_key: MethodName

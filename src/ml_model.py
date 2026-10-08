@@ -17,6 +17,7 @@ import logging
 import numpy as np
 import pandas as pd
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import TimeSeriesSplit
 
 try:
     import lightgbm as lgb
@@ -322,21 +323,30 @@ def features_for_fixture(
     *,
     windows: Sequence[int] = ROLL_WINDOWS,
     upcoming_comp_id: str | None = None,
+    is_cup: bool | None = None,
 ) -> dict[str, float]:
-    """Compute the feature vector for an upcoming (or held-out) fixture."""
+    """Compute the feature vector for an upcoming (or held-out) fixture.
+
+    ``upcoming_comp_id`` (or an explicit ``is_cup`` override) drives the
+    ``*_is_rotation_risk`` feature exactly like training does from the row's
+    ``comp_id`` / ``league_id`` / ``league`` column.
+    """
     match_ts = _as_timestamp(match_date)
     home = str(home_team).strip()
     away = str(away_team).strip()
-    try:
-        from src.league_registry import is_cup_competition
+    if is_cup is not None:
+        upcoming_cup = bool(is_cup)
+    else:
+        try:
+            from src.league_registry import is_cup_competition
 
-        upcoming_cup = is_cup_competition(upcoming_comp_id)
-    except Exception:  # noqa: BLE001
-        upcoming_cup = str(upcoming_comp_id or "").strip().upper() in {
-            "EMPERORS_CUP",
-            "J_LEAGUE_CUP",
-            "UWCL",
-        }
+            upcoming_cup = is_cup_competition(upcoming_comp_id)
+        except Exception:  # noqa: BLE001
+            upcoming_cup = str(upcoming_comp_id or "").strip().upper() in {
+                "EMPERORS_CUP",
+                "J_LEAGUE_CUP",
+                "UWCL",
+            }
     feats: dict[str, float] = {}
     feats.update(
         _side_features(
@@ -525,20 +535,31 @@ class EPLMachineLearningModel:
 
         self.calibrated_ = False
         self.base_model_ = base
-        # CalibratedClassifierCV needs enough rows for stratified CV folds.
+        # CalibratedClassifierCV needs enough rows per fold. Folds are
+        # *temporal* (TimeSeriesSplit on date-sorted rows): every calibrator
+        # is fitted on matches strictly later than its base estimator's
+        # training window — no future-to-past leakage as with shuffled /
+        # stratified K-fold.
         n_cv = 3 if n_rows >= 90 else (2 if n_rows >= ML_CALIBRATION_MIN_ROWS else 0)
         if self.calibrate and n_cv >= 2:
             try:
+                splitter = TimeSeriesSplit(n_splits=n_cv)
+                for tr_idx, _te in splitter.split(x):
+                    if set(np.unique(y[tr_idx]).tolist()) != {0, 1, 2}:
+                        raise ValueError(
+                            "temporal calibration fold lacks one of H/D/A"
+                        )
                 clf: Any = CalibratedClassifierCV(
                     estimator=base,
                     method=method,
-                    cv=n_cv,
+                    cv=splitter,
                 )
                 clf.fit(x, y)
                 self.model_ = clf
                 self.calibrated_ = True
                 logger.info(
-                    "LightGBM wrapped with CalibratedClassifierCV(method=%s, cv=%d)",
+                    "LightGBM wrapped with CalibratedClassifierCV(method=%s, "
+                    "cv=TimeSeriesSplit(%d))",
                     method,
                     n_cv,
                 )
@@ -569,6 +590,9 @@ class EPLMachineLearningModel:
         home_team: str,
         away_team: str,
         match_date: pd.Timestamp | datetime | str | None = None,
+        *,
+        competition: str | None = None,
+        is_cup: bool | None = None,
     ) -> dict[str, float]:
         """Return 1X2 probabilities ``{\"H\", \"D\", \"A\"}``.
 
@@ -580,38 +604,26 @@ class EPLMachineLearningModel:
         home_team, away_team:
             Club names as in the training data.
         match_date:
-            Kick-off used for rest-day features. Defaults to one day after
-            the latest training match (or today if unknown).
+            Actual fixture kick-off — **pass it**: rest-day / 14-day density
+            features depend on it. Fallback when ``None``: rolling stats are
+            computed as of one day after the last training match, but
+            ``*_rest_days`` / ``*_matches_last_14d`` are set to NaN and
+            imputed with training means (a synthetic "last + 1 day" date
+            would fabricate 1-day rest). Logged at INFO.
+        competition:
+            Competition id of the fixture (e.g. ``"EMPERORS_CUP"``) so the
+            ``*_is_rotation_risk`` feature matches training. Omit for league
+            fixtures (→ not a cup).
+        is_cup:
+            Explicit override for the cup flag (wins over ``competition``).
         """
         self._require_fitted()
-        home = str(home_team).strip()
-        away = str(away_team).strip()
-        # New / unseen clubs: empty history + league-mean feature impute (no crash).
-        if home not in self.history_:
-            logger.warning(
-                "⚠️ Detecting new team: %s. Using default league priors.",
-                home,
-            )
-            self.history_[home] = []
-        if away not in self.history_:
-            logger.warning(
-                "⚠️ Detecting new team: %s. Using default league priors.",
-                away,
-            )
-            self.history_[away] = []
-
-        if match_date is None:
-            if self.last_match_date_ is not None:
-                match_date = self.last_match_date_ + timedelta(days=1)
-            else:
-                match_date = pd.Timestamp(datetime.utcnow()).normalize()
-
-        feats = features_for_fixture(
-            self.history_,
-            home,
-            away,
+        feats = self._fixture_features(
+            home_team,
+            away_team,
             match_date,
-            windows=self.windows,
+            competition=competition,
+            is_cup=is_cup,
         )
         row = pd.DataFrame([{c: feats.get(c, float("nan")) for c in self.feature_names_}])
         if self.feature_means_:
@@ -631,35 +643,103 @@ class EPLMachineLearningModel:
             raise RuntimeError("ML predict_proba returned non-positive mass")
         return {k: v / total for k, v in out.items()}
 
+    def _fixture_features(
+        self,
+        home_team: str,
+        away_team: str,
+        match_date: pd.Timestamp | datetime | str | None,
+        *,
+        competition: str | None = None,
+        is_cup: bool | None = None,
+    ) -> dict[str, float]:
+        """Feature dict for one fixture (shared by predict / feature_vector)."""
+        home = str(home_team).strip()
+        away = str(away_team).strip()
+        # New / unseen clubs: empty history + league-mean feature impute (no crash).
+        if home not in self.history_:
+            logger.warning(
+                "⚠️ Detecting new team: %s. Using default league priors.",
+                home,
+            )
+            self.history_[home] = []
+        if away not in self.history_:
+            logger.warning(
+                "⚠️ Detecting new team: %s. Using default league priors.",
+                away,
+            )
+            self.history_[away] = []
+
+        try:
+            date_known = match_date is not None and not bool(pd.isna(match_date))
+        except (TypeError, ValueError):
+            date_known = match_date is not None
+        if not date_known:
+            match_date = None
+            logger.info(
+                "ML predict without match_date for %s vs %s: rest-day / "
+                "14-day density features imputed with training means.",
+                home,
+                away,
+            )
+            if self.last_match_date_ is not None:
+                match_date = self.last_match_date_ + timedelta(days=1)
+            else:
+                match_date = pd.Timestamp(datetime.utcnow()).normalize()
+
+        feats = features_for_fixture(
+            self.history_,
+            home,
+            away,
+            match_date,
+            windows=self.windows,
+            upcoming_comp_id=competition,
+            is_cup=is_cup,
+        )
+        if not date_known:
+            for side in ("home", "away"):
+                feats[f"{side}_rest_days"] = float("nan")
+                feats[f"{side}_matches_last_14d"] = float("nan")
+        return feats
+
     def predict_match_probs(
         self,
         home_team: str,
         away_team: str,
         match_date: pd.Timestamp | datetime | str | None = None,
+        *,
+        competition: str | None = None,
+        is_cup: bool | None = None,
     ) -> dict[str, float]:
         """Alias of :meth:`predict_proba` (Dixon–Coles naming parity)."""
-        return self.predict_proba(home_team, away_team, match_date=match_date)
+        return self.predict_proba(
+            home_team,
+            away_team,
+            match_date=match_date,
+            competition=competition,
+            is_cup=is_cup,
+        )
 
     def feature_vector(
         self,
         home_team: str,
         away_team: str,
         match_date: pd.Timestamp | datetime | str | None = None,
+        *,
+        competition: str | None = None,
+        is_cup: bool | None = None,
     ) -> pd.Series:
-        """Return the engineered feature Series for inspection / Ensemble."""
+        """Return the engineered feature Series for inspection / Ensemble.
+
+        Same date / competition semantics as :meth:`predict_proba` (rest /
+        density are NaN when ``match_date`` is omitted).
+        """
         self._require_fitted()
-        if match_date is None:
-            match_date = (
-                self.last_match_date_ + timedelta(days=1)
-                if self.last_match_date_ is not None
-                else pd.Timestamp(datetime.utcnow()).normalize()
-            )
-        feats = features_for_fixture(
-            self.history_,
+        feats = self._fixture_features(
             home_team,
             away_team,
             match_date,
-            windows=self.windows,
+            competition=competition,
+            is_cup=is_cup,
         )
         return pd.Series(
             {c: feats.get(c, float("nan")) for c in self.feature_names_},

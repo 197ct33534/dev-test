@@ -25,7 +25,8 @@ matches (t = days before the latest kick-off in the training set).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from functools import lru_cache
+from typing import Any, Mapping
 import logging
 
 import numpy as np
@@ -36,16 +37,26 @@ from scipy.stats import poisson
 # Default time-decay rate (per day). ~0.0018 ≈ half-life of ~1 year.
 DEFAULT_XI = 0.0018
 DEFAULT_MAX_GOALS = 10
-# Legacy "average" priors (overconfident for newcomers — prefer weak tier).
-DEFAULT_NEW_TEAM_ATTACK = 1.0
-DEFAULT_NEW_TEAM_DEFENCE = 1.0
 # Clubs with fewer historical matches use weak-tier priors (keep in sync with src.config).
 MIN_TEAM_MATCHES = 5
-# Weak-tier priors for new / thin-sample clubs (< MIN_TEAM_MATCHES matches).
-# Sign convention: higher δ = *better* defence (λ = exp(α − δ_opp + γ)).
-# Underdog newcomers need weak attack + *poor* defence → lower δ (not 1.6).
-WEAK_TIER_NEW_TEAM_ATTACK = 0.4
-WEAK_TIER_NEW_TEAM_DEFENCE = 0.4
+# Weak-tier priors for new / thin-sample clubs (< MIN_TEAM_MATCHES matches) are
+# *relative to the fitted league*:
+#
+#     α_new = mean(α_fitted) − WEAK_TIER_ATTACK_OFFSET
+#     δ_new = mean(δ_fitted) − WEAK_TIER_DEFENCE_OFFSET
+#
+# Sign convention: higher δ = *better* defence (λ = exp(α − δ_opp + γ)), so a
+# lower δ means a leakier defence. A newcomer is therefore weaker than the
+# league-average club on both attack and defence. (The old absolute 0.4 / 0.4
+# priors sat *above* the fitted means — mean α ≈ 0, mean δ ≈ −0.1 — and rated
+# newcomers as elite.)
+WEAK_TIER_ATTACK_OFFSET: float = 0.30
+WEAK_TIER_DEFENCE_OFFSET: float = 0.30
+# Deprecated absolute priors kept for import compatibility. ``None`` means
+# "derive the prior from the fitted parameters" when passed as
+# ``new_team_attack`` / ``new_team_defence``.
+WEAK_TIER_NEW_TEAM_ATTACK: float | None = None
+WEAK_TIER_NEW_TEAM_DEFENCE: float | None = None
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +93,50 @@ def score_probability(
 ) -> float:
     """P(X=x, Y=y) = tau * Poisson(x; lambda) * Poisson(y; mu)."""
     return float(tau(x, y, lam, mu, rho) * poisson.pmf(x, lam) * poisson.pmf(y, mu))
+
+
+@lru_cache(maxsize=512)
+def _score_matrix_cached(lam: float, mu: float, rho: float, g: int) -> np.ndarray:
+    goals = np.arange(g + 1)
+    mat = np.outer(poisson.pmf(goals, lam), poisson.pmf(goals, mu))
+    # Dixon–Coles τ only touches the four low-score cells.
+    mat[0, 0] *= 1.0 - lam * mu * rho
+    if g >= 1:
+        mat[0, 1] *= 1.0 + lam * rho
+        mat[1, 0] *= 1.0 + mu * rho
+        mat[1, 1] *= 1.0 - rho
+    total = float(mat.sum())
+    if not total > 0.0:
+        raise RuntimeError("Score matrix has non-positive mass; check parameters.")
+    mat = mat / total
+    mat.setflags(write=False)
+    return mat
+
+
+def score_matrix(
+    lam: float,
+    mu: float,
+    rho: float,
+    max_goals: int = DEFAULT_MAX_GOALS,
+) -> np.ndarray:
+    """Vectorised, renormalised Dixon–Coles score matrix ``P(X=x, Y=y)``.
+
+    Equivalent to evaluating :func:`score_probability` on the full
+    ``(max_goals+1)²`` grid and renormalising, but uses two vectorised Poisson
+    pmf calls and a small LRU cache (repeated markets on one fixture reuse the
+    same λ/μ). Returns a fresh writable copy.
+    """
+    return _score_matrix_cached(float(lam), float(mu), float(rho), int(max_goals)).copy()
+
+
+def match_probs_from_matrix(mat: np.ndarray) -> dict[str, float]:
+    """1X2 probabilities ``{H, D, A}`` from a score matrix (rows = home goals)."""
+    m = np.asarray(mat, dtype=float)
+    return {
+        "H": float(np.tril(m, k=-1).sum()),
+        "D": float(np.trace(m)),
+        "A": float(np.triu(m, k=1).sum()),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -196,14 +251,150 @@ def _empty_settlement() -> dict[str, float]:
     return {"win": 0.0, "half_win": 0.0, "push": 0.0, "half_lose": 0.0, "lose": 0.0}
 
 
-def _effective_cover_prob(settlement: dict[str, float]) -> float:
-    """Effective win probability for EV = P × odds − 1.
+SETTLEMENT_KEYS: tuple[str, ...] = ("win", "half_win", "push", "half_lose", "lose")
 
-    Counts a full win as 1 and a half-win as 0.5 (half the stake struck at
-    the offered odds). Push / half-lose / lose do not add cover mass; the
-    recommender applies the exact settlement EV when sizing bets.
+
+def _settlement_masses(settlement: Mapping[str, float]) -> tuple[float, float, float, float, float]:
+    """``(win, half_win, push, half_lose, lose)`` clipped ≥ 0 and renormalised."""
+    vals = [max(0.0, float(settlement.get(k, 0.0) or 0.0)) for k in SETTLEMENT_KEYS]
+    total = sum(vals)
+    if total > 0.0 and abs(total - 1.0) > 1e-9:
+        vals = [v / total for v in vals]
+    return vals[0], vals[1], vals[2], vals[3], vals[4]
+
+
+def _effective_cover_prob(settlement: Mapping[str, float]) -> float:
+    """Raw cover mass ``win + 0.5·half_win`` (legacy, *not* an EV probability).
+
+    ``P × odds − 1`` with this mass ignores push / half-lose refunds and
+    understates EV on whole / quarter lines. Use
+    :func:`settlement_cover_probability` / :func:`settlement_expected_value`.
     """
     return float(settlement.get("win", 0.0) + 0.5 * settlement.get("half_win", 0.0))
+
+
+def settlement_cover_probability(settlement: Mapping[str, float]) -> float:
+    """Push-adjusted cover probability ``p* = W' / (W' + L')``.
+
+    With ``W' = win + ½·half_win`` and ``L' = lose + ½·half_lose`` (stake
+    actually won / lost; pushes and refunded halves removed). Properties:
+
+    * ``Fair odds = 1 / p*`` is the price at which the exact settlement EV
+      is zero (``1 + L'/W'``).
+    * For whole lines (win / push / lose) the Kelly fraction of ``p*`` at odds
+      ``o`` is the exact 3-outcome Kelly ``(b·p_w − p_l)/b`` with push removed.
+    * ``p*`` equals the plain win probability on half lines (no push), so
+      1X2 / .5 lines are unchanged. Over + Under (home + away) sum to 1.
+    """
+    win, half_win, _push, half_lose, lose = _settlement_masses(settlement)
+    w_eff = win + 0.5 * half_win
+    l_eff = lose + 0.5 * half_lose
+    denom = w_eff + l_eff
+    if denom <= 1e-15:
+        return 0.0
+    return float(w_eff / denom)
+
+
+def settlement_stake_at_risk(settlement: Mapping[str, float]) -> float:
+    """Expected fraction of stake that is actually settled (not refunded)."""
+    win, half_win, _push, half_lose, lose = _settlement_masses(settlement)
+    return float(win + lose + 0.5 * (half_win + half_lose))
+
+
+def settlement_expected_value(settlement: Mapping[str, float], odds: float) -> float:
+    """Exact EV per unit stake for Asian / totals settlement.
+
+    ``EV = win·(o−1) + half_win·(o−1)/2 + push·0 − half_lose·½ − lose·1``.
+    Equals ``P × odds − 1`` when only win / lose mass is present (1X2).
+    """
+    o = float(odds)
+    if o <= 0.0:
+        raise ValueError(f"odds must be positive, got {odds}")
+    win, half_win, _push, half_lose, lose = _settlement_masses(settlement)
+    b = o - 1.0
+    return float(win * b + half_win * b / 2.0 - half_lose * 0.5 - lose)
+
+
+def settlement_fair_odds(settlement: Mapping[str, float]) -> float | None:
+    """Decimal odds with zero exact EV: ``1 + (lose + ½·half_lose)/(win + ½·half_win)``."""
+    p_star = settlement_cover_probability(settlement)
+    if p_star <= 1e-12:
+        return None
+    return float(1.0 / p_star)
+
+
+def _rank_settlement(mat: np.ndarray, rank: np.ndarray) -> dict[str, float]:
+    """Aggregate score-matrix mass by combined settlement rank (2 … −2)."""
+    idx = np.rint(np.asarray(rank, dtype=float)).astype(int).ravel() + 2
+    masses = np.bincount(idx, weights=np.asarray(mat, dtype=float).ravel(), minlength=5)
+    return {label: float(masses[r + 2]) for label, r in _SETTLEMENT_RANK.items()}
+
+
+def _quarter_avg_rank(atomic, line: float) -> np.ndarray:
+    lo, hi = split_handicap_line(float(line))
+    if lo == hi:
+        return atomic(lo)
+    return (atomic(lo) + atomic(hi)) / 2.0
+
+
+def over_under_from_matrix(mat: np.ndarray, line: float) -> dict[str, float]:
+    """O/U settlement masses + push-adjusted cover probs from a score matrix.
+
+    See :meth:`DixonColesModel.predict_over_under` for the returned keys.
+    """
+    m = np.asarray(mat, dtype=float)
+    g = m.shape[0] - 1
+    totals = np.add.outer(np.arange(g + 1, dtype=float), np.arange(m.shape[1], dtype=float))
+
+    def _atomic(L: float) -> np.ndarray:
+        return np.where(totals > L, 2.0, np.where(totals < L, -2.0, 0.0))
+
+    over_rank = _quarter_avg_rank(_atomic, line)
+    over_s = _rank_settlement(m, over_rank)
+    under_s = _rank_settlement(m, -over_rank)
+    return {
+        "line": float(line),
+        "over": settlement_cover_probability(over_s),
+        "under": settlement_cover_probability(under_s),
+        "over_effective": _effective_cover_prob(over_s),
+        "under_effective": _effective_cover_prob(under_s),
+        **{f"over_{k}": float(v) for k, v in over_s.items()},
+        **{f"under_{k}": float(v) for k, v in under_s.items()},
+    }
+
+
+def asian_handicap_from_matrix(mat: np.ndarray, handicap: float) -> dict[str, float]:
+    """AH settlement masses + push-adjusted cover probs from a score matrix.
+
+    See :meth:`DixonColesModel.predict_asian_handicap` for the returned keys.
+    """
+    m = np.asarray(mat, dtype=float)
+    xs = np.arange(m.shape[0], dtype=float)
+    ys = np.arange(m.shape[1], dtype=float)
+    margin0 = xs[:, None] - ys[None, :]
+
+    def _atomic(h: float) -> np.ndarray:
+        margin = margin0 + h
+        return np.where(margin > 0.0, 2.0, np.where(margin < 0.0, -2.0, 0.0))
+
+    home_rank = _quarter_avg_rank(_atomic, handicap)
+    home_s = _rank_settlement(m, home_rank)
+    # Away side is the mirror settlement of the home side.
+    away_s = _rank_settlement(m, -home_rank)
+    return {
+        "handicap": float(handicap),
+        "home": settlement_cover_probability(home_s),
+        "away": settlement_cover_probability(away_s),
+        "home_effective": _effective_cover_prob(home_s),
+        "away_effective": _effective_cover_prob(away_s),
+        **{f"home_{k}": float(v) for k, v in home_s.items()},
+        **{f"away_{k}": float(v) for k, v in away_s.items()},
+    }
+
+
+def settlement_from_prediction(preds: Mapping[str, float], side: str) -> dict[str, float]:
+    """Extract ``{win, half_win, push, half_lose, lose}`` for ``side`` (``over``/``home``/…)."""
+    return {k: float(preds.get(f"{side}_{k}", 0.0) or 0.0) for k in SETTLEMENT_KEYS}
 
 
 def _tau_vectorized(
@@ -257,13 +448,18 @@ class DixonColesModel:
     max_goals:
         Truncation for the predicted score matrix (0 .. max_goals inclusive).
     use_weak_tier_priors:
-        When True (UWCL / small-sample leagues), unknown clubs use weak-tier
-        α/δ. Thin clubs (< ``min_team_matches`` history) always use weak tier.
+        Kept for call-site compatibility. Unknown and thin clubs *always* use
+        the relative weak-tier prior (see ``new_team_*_offset``).
     new_team_attack / new_team_defence:
-        Explicit prior overrides; when None, derived from ``use_weak_tier_priors``.
+        Explicit absolute prior overrides. ``None`` (default) derives the prior
+        from the fitted parameters: ``mean(α) − new_team_attack_offset`` and
+        ``mean(δ) − new_team_defence_offset`` (means over well-supported
+        clubs), i.e. weaker than league average on both attack and defence.
     min_team_matches:
         Clubs with fewer training appearances are treated as thin / new and
         get weak-tier priors instead of noisy MLE strengths.
+    new_team_attack_offset / new_team_defence_offset:
+        How far below the fitted league mean newcomers are placed.
     """
 
     xi: float = DEFAULT_XI
@@ -272,6 +468,8 @@ class DixonColesModel:
     new_team_attack: float | None = None
     new_team_defence: float | None = None
     min_team_matches: int = MIN_TEAM_MATCHES
+    new_team_attack_offset: float = WEAK_TIER_ATTACK_OFFSET
+    new_team_defence_offset: float = WEAK_TIER_DEFENCE_OFFSET
 
     teams: list[str] = field(default_factory=list, init=False)
     # Clubs with enough history at fit time (excludes thin / prior-only).
@@ -291,21 +489,44 @@ class DixonColesModel:
     # Priors / thin-sample
     # ------------------------------------------------------------------
 
+    def league_mean_strengths(self) -> tuple[float, float]:
+        """Mean ``(α, δ)`` over well-supported fitted clubs (excludes priors)."""
+        known = [
+            t
+            for t in (self.fitted_teams_ or ())
+            if t in self.attack and t in self.defence
+        ]
+        if not known:
+            thin = self.thin_teams_ or set()
+            known = [
+                t
+                for t in (self.teams or ())
+                if t in self.attack and t in self.defence and t not in thin
+            ]
+        if not known:
+            return 0.0, 0.0
+        return (
+            float(np.mean([self.attack[t] for t in known])),
+            float(np.mean([self.defence[t] for t in known])),
+        )
+
+    def new_team_priors(self) -> tuple[float, float]:
+        """``(α_prior, δ_prior)`` injected for new / thin clubs."""
+        return self._prior_attack(), self._prior_defence()
+
     def _prior_attack(self) -> float:
+        """Attack prior: ``mean(α) − offset`` unless explicitly overridden."""
         if self.new_team_attack is not None:
             return float(self.new_team_attack)
-        if self.use_weak_tier_priors:
-            return float(WEAK_TIER_NEW_TEAM_ATTACK)
-        # Unknown = 0 matches < min → prefer weak tier to avoid +2000% EV.
-        return float(WEAK_TIER_NEW_TEAM_ATTACK)
+        mean_a, _ = self.league_mean_strengths()
+        return float(mean_a - float(self.new_team_attack_offset))
 
     def _prior_defence(self) -> float:
-        """Defence prior. Higher δ = better defence; weak newcomers get low δ."""
+        """Defence prior: ``mean(δ) − offset`` (higher δ = better → leakier)."""
         if self.new_team_defence is not None:
             return float(self.new_team_defence)
-        if self.use_weak_tier_priors:
-            return float(WEAK_TIER_NEW_TEAM_DEFENCE)
-        return float(WEAK_TIER_NEW_TEAM_DEFENCE)
+        _, mean_d = self.league_mean_strengths()
+        return float(mean_d - float(self.new_team_defence_offset))
 
     def team_match_count(self, team: str) -> int:
         """Historical match count from the last ``fit`` (0 if unseen)."""
@@ -385,14 +606,21 @@ class DixonColesModel:
         known = self.fitted_teams_ or set()
         if name in known and name in self.attack and name in self.defence:
             return float(self.attack[name]), float(self.defence[name])
-        # Already injected priors for this process — reuse without re-logging.
-        if name in self.attack and name in self.defence and name not in known:
-            return float(self.attack[name]), float(self.defence[name])
         atk = self._prior_attack()
         deff = self._prior_defence()
+        # Already injected the current priors — reuse without re-logging.
+        # (Stale cached values, e.g. absolute priors from an older pickle,
+        # are refreshed.)
+        if (
+            name in self.attack
+            and name in self.defence
+            and abs(float(self.attack[name]) - atk) < 1e-12
+            and abs(float(self.defence[name]) - deff) < 1e-12
+        ):
+            return atk, deff
         n_hist = self.team_match_count(name)
         logger.warning(
-            "⚠️ Detecting new/thin team: %s (n=%d). Using weak-tier priors "
+            "⚠️ Detecting new/thin team: %s (n=%d). Using relative weak-tier priors "
             "(α=%.2f, δ=%.2f).",
             name,
             n_hist,
@@ -422,14 +650,7 @@ class DixonColesModel:
         """
         lam, mu = self.expected_goals(home_team, away_team)
         g = self.max_goals if max_goals is None else max_goals
-        mat = np.zeros((g + 1, g + 1), dtype=float)
-        for x in range(g + 1):
-            for y in range(g + 1):
-                mat[x, y] = score_probability(x, y, lam, mu, self.rho)
-        total = mat.sum()
-        if total <= 0:
-            raise RuntimeError("Score matrix has non-positive mass; check parameters.")
-        return mat / total
+        return score_matrix(lam, mu, self.rho, int(g))
 
     def predict_match_probs(
         self,
@@ -439,10 +660,7 @@ class DixonColesModel:
     ) -> dict[str, float]:
         """Return 1X2 probabilities ``{\"H\", \"D\", \"A\"}`` from the score matrix."""
         mat = self.predict_score_matrix(home_team, away_team, max_goals=max_goals)
-        home_win = float(np.tril(mat, k=-1).sum())  # x > y
-        draw = float(np.trace(mat))
-        away_win = float(np.triu(mat, k=1).sum())  # x < y
-        return {"H": home_win, "D": draw, "A": away_win}
+        return match_probs_from_matrix(mat)
 
     def predict_over_under(
         self,
@@ -467,31 +685,18 @@ class DixonColesModel:
         Returns
         -------
         dict
-            ``over`` / ``under`` = effective cover probabilities
-            ``p_win + 0.5 * p_half_win`` (suitable for EV = P × odds − 1),
-            plus detailed settlement masses ``over_*`` / ``under_*``, and
-            ``line``.
+            ``over`` / ``under`` = push-adjusted cover probabilities ``p*``
+            (:func:`settlement_cover_probability`; ``1/p*`` is the exact fair
+            price and ``over + under = 1``). ``over_*`` / ``under_*`` hold the
+            settlement masses (``win``/``half_win``/``push``/``half_lose``/
+            ``lose``) used for the exact EV
+            (:func:`settlement_expected_value`); ``over_effective`` keeps the
+            legacy ``win + ½·half_win`` mass. Note ``p* × odds − 1`` is the EV
+            *conditional on the stake being settled*; the unconditional EV is
+            that times :func:`settlement_stake_at_risk`.
         """
         mat = self.predict_score_matrix(home_team, away_team, max_goals=max_goals)
-        over_s = _empty_settlement()
-        under_s = _empty_settlement()
-        g = mat.shape[0] - 1
-        for x in range(g + 1):
-            for y in range(g + 1):
-                p = float(mat[x, y])
-                if p <= 0.0:
-                    continue
-                total = x + y
-                over_s[_combine_settlements(_settle_over(total, line))] += p
-                under_s[_combine_settlements(_settle_under(total, line))] += p
-
-        return {
-            "line": float(line),
-            "over": _effective_cover_prob(over_s),
-            "under": _effective_cover_prob(under_s),
-            **{f"over_{k}": float(v) for k, v in over_s.items()},
-            **{f"under_{k}": float(v) for k, v in under_s.items()},
-        }
+        return over_under_from_matrix(mat, line)
 
     def predict_asian_handicap(
         self,
@@ -512,30 +717,13 @@ class DixonColesModel:
         Returns
         -------
         dict
-            ``home`` / ``away`` effective cover probabilities, detailed
-            ``home_*`` / ``away_*`` settlement masses, and ``handicap``.
+            ``home`` / ``away`` push-adjusted cover probabilities ``p*``
+            (see :meth:`predict_over_under`), detailed ``home_*`` / ``away_*``
+            settlement masses, ``home_effective`` / ``away_effective`` legacy
+            masses, and ``handicap``.
         """
         mat = self.predict_score_matrix(home_team, away_team, max_goals=max_goals)
-        home_s = _empty_settlement()
-        away_s = _empty_settlement()
-        g = mat.shape[0] - 1
-        for x in range(g + 1):
-            for y in range(g + 1):
-                p = float(mat[x, y])
-                if p <= 0.0:
-                    continue
-                home_outcome = _combine_settlements(_settle_ah_home(x, y, handicap))
-                home_s[home_outcome] += p
-                # Away side is the mirror settlement of the home side.
-                away_s[_mirror_settlement(home_outcome)] += p
-
-        return {
-            "handicap": float(handicap),
-            "home": _effective_cover_prob(home_s),
-            "away": _effective_cover_prob(away_s),
-            **{f"home_{k}": float(v) for k, v in home_s.items()},
-            **{f"away_{k}": float(v) for k, v in away_s.items()},
-        }
+        return asian_handicap_from_matrix(mat, handicap)
 
     # ------------------------------------------------------------------
     # Fitting
@@ -642,7 +830,7 @@ class DixonColesModel:
             self.attack[t] = float(atk_prior)
             self.defence[t] = float(def_prior)
             logger.warning(
-                "⚠️ Thin-sample team: %s (n=%d < %d). Using weak-tier priors "
+                "⚠️ Thin-sample team: %s (n=%d < %d). Using relative weak-tier priors "
                 "(α=%.2f, δ=%.2f).",
                 t,
                 counts[t],

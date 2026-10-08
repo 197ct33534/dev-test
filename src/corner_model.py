@@ -9,8 +9,9 @@ Legacy :class:`CornerModel` fits independent Poisson GLMs on HC / AC team
 effects. New :class:`CornerPredictor` adds rolling shot/corner features
 (:mod:`src.features`) and LightGBM Poisson regressors, then exposes:
 
-* Over/Under 9.5 / 10.5 / 11.5 total corners
-* Corner handicap (Skellam on independent Poisson rates)
+* Over/Under 9.5 / 10.5 / 11.5 total corners (Negative Binomial when the
+  training residuals are overdispersed, else Poisson)
+* Corner handicap (Skellam on independent Poisson rates; whole lines → push)
 * :meth:`CornerPredictor.predict_corner_ev` for bookmaker EV %
 """
 
@@ -23,7 +24,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import pandas as pd
 import statsmodels.formula.api as smf
-from scipy.stats import poisson, skellam
+from scipy.stats import nbinom, poisson, skellam
 
 from src.features import (
     DEFAULT_ROLL_WINDOWS,
@@ -214,11 +215,42 @@ class CornerModel:
 # ---------------------------------------------------------------------------
 
 
-def _expected_value(p: float, odds: float) -> float:
-    """EV = P · Odds − 1."""
+def _expected_value(p: float, odds: float, push: float = 0.0) -> float:
+    """EV = P(win) · Odds + P(push) − 1 (stake refunded on push)."""
     if odds <= 1.0 or p <= 0:
         return -1.0
-    return float(p) * float(odds) - 1.0
+    return float(p) * float(odds) + float(push) - 1.0
+
+
+def estimate_nb_dispersion(y: Any, mu: Any) -> float:
+    """Method-of-moments NB2 dispersion ``alpha`` (``Var = mu + alpha * mu^2``).
+
+    ``alpha = sum((y - mu)^2 - mu) / sum(mu^2)`` over rows with finite
+    ``y`` / positive ``mu``. Returns ``0.0`` (→ Poisson) when the residual
+    variance is ≤ the mean or inputs are unusable. Clipped to ``[0, 1]``.
+    """
+    y_arr = np.asarray(y, dtype=float)
+    mu_arr = np.asarray(mu, dtype=float)
+    ok = np.isfinite(y_arr) & np.isfinite(mu_arr) & (mu_arr > 0)
+    if ok.sum() < 2:
+        return 0.0
+    y_arr, mu_arr = y_arr[ok], mu_arr[ok]
+    denom = float(np.sum(mu_arr**2))
+    if denom <= 0:
+        return 0.0
+    alpha = float(np.sum((y_arr - mu_arr) ** 2 - mu_arr)) / denom
+    if not np.isfinite(alpha) or alpha <= 0:
+        return 0.0
+    return float(min(alpha, 1.0))
+
+
+def _count_dist(mu: float, alpha: float) -> Any:
+    """Frozen scipy distribution: NB2(mu, alpha) when ``alpha > 0`` else Poisson."""
+    mu = max(float(mu), 1e-9)
+    if alpha and alpha > 0:
+        n = 1.0 / float(alpha)
+        return nbinom(n, n / (n + mu))
+    return poisson(mu)
 
 
 @dataclass
@@ -236,12 +268,18 @@ class CornerPredictor:
         Rolling feature windows (default 5 & 10).
     min_prior_matches:
         Drop training rows with thinner history than this.
+    total_dist:
+        Distribution for total corners. ``"auto"`` (default) / ``"nbinom"``:
+        Negative Binomial with method-of-moments dispersion estimated from
+        training residuals, falling back to Poisson when residual variance
+        ≤ mean. ``"poisson"``: legacy Poisson.
     """
 
     backend: str = "auto"
     max_corners: int = DEFAULT_MAX_CORNERS
     roll_windows: tuple[int, ...] = DEFAULT_ROLL_WINDOWS
     min_prior_matches: int = 3
+    total_dist: str = "auto"
 
     teams: list[str] = field(default_factory=list, init=False)
     fitted_: bool = field(default=False, init=False)
@@ -254,6 +292,8 @@ class CornerPredictor:
     history_matches_: pd.DataFrame | None = field(default=None, init=False, repr=False)
     league_avg_hc_: float = field(default=5.0, init=False)
     league_avg_ac_: float = field(default=4.5, init=False)
+    # NB2 dispersion for total corners (0.0 → Poisson).
+    total_alpha_: float = field(default=0.0, init=False)
 
     def fit(self, matches: pd.DataFrame) -> CornerPredictor:
         """Fit corner models on historical matches (needs HC/AC; shots optional)."""
@@ -317,15 +357,38 @@ class CornerPredictor:
                 self.feature_names_ = names
                 self.train_features_ = eng
                 self.backend_used_ = "lightgbm"
+                train_y = (y_hc + y_ac).to_numpy(dtype=float)
+                train_mu = np.asarray(
+                    self.model_hc_.predict(X), dtype=float
+                ) + np.asarray(self.model_ac_.predict(X), dtype=float)
 
         if not use_lgb:
             self.backend_used_ = "poisson"
             self.model_hc_ = None
             self.model_ac_ = None
             self.feature_names_ = []
+            hist = self.history_matches_
+            newdata = hist[["HomeTeam", "AwayTeam"]].astype(str)
+            train_y = (hist["HC"] + hist["AC"]).to_numpy(dtype=float)
+            train_mu = np.asarray(
+                self.glm_.model_hc_.predict(newdata), dtype=float
+            ) + np.asarray(self.glm_.model_ac_.predict(newdata), dtype=float)
+
+        # Overdispersion (corners: Var > mean) → NB2 for totals.
+        dist = str(self.total_dist or "poisson").lower().strip()
+        self.total_alpha_ = 0.0
+        if dist in {"auto", "nbinom", "negbin", "nb"}:
+            try:
+                self.total_alpha_ = estimate_nb_dispersion(train_y, train_mu)
+            except Exception:  # noqa: BLE001
+                self.total_alpha_ = 0.0
 
         self.fitted_ = True
         return self
+
+    def total_distribution(self, mu_total: float) -> Any:
+        """Frozen scipy distribution for total corners (NB2 or Poisson)."""
+        return _count_dist(mu_total, self.total_alpha_)
 
     def _feature_row(self, home_team: str, away_team: str) -> pd.DataFrame | None:
         """Build one inference row from rolling history (as-of last known match)."""
@@ -393,7 +456,7 @@ class CornerPredictor:
     ) -> np.ndarray:
         rates = self.expected_corners(home_team, away_team)
         g = self.max_corners if max_corners is None else max_corners
-        pmf = poisson.pmf(np.arange(g + 1), rates["total"])
+        pmf = self.total_distribution(rates["total"]).pmf(np.arange(g + 1))
         s = pmf.sum()
         return pmf / s if s > 0 else pmf
 
@@ -403,18 +466,34 @@ class CornerPredictor:
         away_team: str,
         line: float = 10.5,
     ) -> dict[str, float]:
-        """P(Over / Under) for total corners vs ``line`` (typically X.5)."""
+        """P(Over / Under) for total corners vs ``line``.
+
+        Uses NB2 when ``total_alpha_ > 0`` (overdispersed training residuals),
+        else Poisson. On whole lines (e.g. ``10.0``) the exact-hit mass is
+        returned as ``push`` (``over + under + push = 1``); ``.5`` → push 0.
+        """
         rates = self.expected_corners(home_team, away_team)
         lam = rates["total"]
-        over = float(poisson.sf(np.floor(line), lam))
-        under = float(poisson.cdf(np.floor(line), lam))
+        dist = self.total_distribution(lam)
+        line_f = float(line)
+        if line_f.is_integer():
+            k = int(line_f)
+            over = float(dist.sf(k))
+            under = float(dist.cdf(k - 1))
+            push = float(dist.pmf(k))
+        else:
+            over = float(dist.sf(np.floor(line_f)))
+            under = float(dist.cdf(np.floor(line_f)))
+            push = 0.0
         return {
             "over": over,
             "under": under,
-            "line": float(line),
+            "push": push,
+            "line": line_f,
             "expected_total": lam,
             "hc": rates["hc"],
             "ac": rates["ac"],
+            "dispersion": float(self.total_alpha_),
         }
 
     def predict_lines(
@@ -441,25 +520,57 @@ class CornerPredictor:
         Parameters
         ----------
         handicap:
-            Asian-style line on home corners (e.g. ``-1.5`` means home −1.5).
-            ``home`` wins when ``HC - AC > handicap`` (for .5 lines).
+            Asian-style line applied to **home** corners (e.g. ``-1.5`` means
+            home −1.5). Home covers when ``HC − AC + handicap > 0``, i.e.
+            ``P(diff > −handicap)``.
+
+        Returns
+        -------
+        dict
+            ``home`` (home covers), ``away`` (away covers) and ``push``
+            (stake refunded: exact hit on whole lines, 0 on ``.5`` lines),
+            with ``home + away + push = 1``. Quarter lines (``.25`` / ``.75``)
+            are split into the two neighbouring half-stakes and averaged so
+            EV = ``home * odds + push − 1`` stays linear.
         """
         rates = self.expected_corners(home_team, away_team)
         mu1, mu2 = rates["hc"], rates["ac"]
-        # For line L=.5k: home covers if HC-AC >= ceil(L+eps) i.e. > floor(L)
-        # P(HC-AC > L) = P(diff >= floor(L)+1) = skellam.sf(floor(L), mu1, mu2)
-        thr = int(np.floor(handicap))
-        p_home = float(skellam.sf(thr, mu1, mu2))  # P(diff >= thr+1) = P(diff > thr)
-        p_away = float(skellam.cdf(thr, mu1, mu2))  # P(diff <= thr)
-        # renormalise tiny mass on exact integer lines (push ignored for .5)
-        mass = p_home + p_away
+        h = float(handicap)
+
+        def _single(line: float) -> tuple[float, float, float]:
+            k = -line  # home covers iff diff > k
+            if float(k).is_integer():
+                ki = int(k)
+                return (
+                    float(skellam.sf(ki, mu1, mu2)),  # P(diff > k)
+                    float(skellam.cdf(ki - 1, mu1, mu2)),  # P(diff < k)
+                    float(skellam.pmf(ki, mu1, mu2)),  # P(diff == k) → push
+                )
+            thr = int(np.floor(k))
+            return (
+                float(skellam.sf(thr, mu1, mu2)),  # P(diff >= thr + 1)
+                float(skellam.cdf(thr, mu1, mu2)),  # P(diff <= thr)
+                0.0,
+            )
+
+        if np.isclose((abs(h) * 4.0) % 2.0, 1.0):
+            # Quarter line → half stake on each neighbouring line.
+            lo, hi = _single(h - 0.25), _single(h + 0.25)
+            p_home = 0.5 * (lo[0] + hi[0])
+            p_away = 0.5 * (lo[1] + hi[1])
+            p_push = 0.5 * (lo[2] + hi[2])
+        else:
+            p_home, p_away, p_push = _single(h)
+        mass = p_home + p_away + p_push
         if mass > 0:
             p_home /= mass
             p_away /= mass
+            p_push /= mass
         return {
             "home": p_home,
             "away": p_away,
-            "handicap": float(handicap),
+            "push": p_push,
+            "handicap": h,
             "expected_diff": mu1 - mu2,
             "hc": mu1,
             "ac": mu2,
@@ -502,7 +613,7 @@ class CornerPredictor:
                 continue
             odds_f = float(odds)
             p = float(ou[key])
-            ev = _expected_value(p, odds_f)
+            ev = _expected_value(p, odds_f, float(ou.get("push", 0.0)))
             if ev >= float(min_ev):
                 out.append(
                     {
@@ -531,12 +642,12 @@ class CornerPredictor:
                     continue
                 odds_f = float(odds_v)
                 p = float(ah[key])
-                ev = _expected_value(p, odds_f)
+                ev = _expected_value(p, odds_f, float(ah.get("push", 0.0)))
                 if ev >= float(min_ev):
                     out.append(
                         {
                             "market": "Corners",
-                            "selection": f"{sel} {ah_line:+g}",
+                            "selection": f"{sel} {(ah_line if key == 'home' else -ah_line) + 0.0:+g}",
                             "line": ah_line,
                             "p_model": p,
                             "odds": odds_f,

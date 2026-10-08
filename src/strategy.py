@@ -22,6 +22,16 @@ from src.config import (
     MAX_KELLY_FRACTION,
     MAX_STAKE_PCT,
 )
+from src.dixon_coles import (
+    SETTLEMENT_KEYS,
+    asian_handicap_from_matrix,
+    over_under_from_matrix,
+    settlement_cover_probability,
+    settlement_expected_value,
+    settlement_fair_odds,
+    settlement_stake_at_risk,
+    split_handicap_line,
+)
 
 # Common Asian quarter grids used when searching the 50%-cover fair line.
 COMMON_OU_LINES: tuple[float, ...] = (
@@ -110,6 +120,107 @@ def capped_kelly_fraction(
     return stake_pct
 
 
+# ---------------------------------------------------------------------------
+# Exact settlement pricing (Asian handicap / totals with push & half outcomes)
+# ---------------------------------------------------------------------------
+
+# Profit per unit stake for each settlement outcome, given b = odds − 1.
+def _settlement_returns(odds: float) -> tuple[float, float, float, float, float]:
+    b = float(odds) - 1.0
+    return (b, b / 2.0, 0.0, -0.5, -1.0)
+
+
+def settlement_full_kelly_fraction(
+    settlement: Mapping[str, float],
+    odds_bookmaker: float,
+) -> float:
+    """Full Kelly for a win / half-win / push / half-lose / lose payoff.
+
+    Maximises expected log growth ``Σ p_i·log(1 + f·r_i)`` with returns
+    ``r = (b, b/2, 0, −½, −1)``. Closed form when there are no half outcomes:
+    ``f = (b·p_w − p_l)/b`` with push mass removed and ``p_w, p_l``
+    renormalised (reduces to ``(p·o − 1)/(o − 1)`` for 1X2). Quarter lines are
+    solved numerically (bisection on the concave growth derivative).
+    Clipped to ``[0, 1]``.
+    """
+    o = float(odds_bookmaker)
+    if o <= 1.0:
+        return 0.0
+    if settlement_expected_value(settlement, o) <= 0.0:
+        return 0.0
+    probs = [max(0.0, float(settlement.get(k, 0.0) or 0.0)) for k in SETTLEMENT_KEYS]
+    total = sum(probs)
+    if total <= 0.0:
+        return 0.0
+    probs = [p / total for p in probs]
+    win, half_win, _push, half_lose, lose = probs
+    b = o - 1.0
+    if half_win <= 1e-15 and half_lose <= 1e-15:
+        denom = win + lose
+        if denom <= 1e-15:
+            return 0.0
+        f = (b * (win / denom) - (lose / denom)) / b
+        return float(max(0.0, min(1.0, f)))
+
+    returns = _settlement_returns(o)
+
+    def _grad(f: float) -> float:
+        return sum(p * r / (1.0 + f * r) for p, r in zip(probs, returns) if p > 0.0)
+
+    hi = 1.0 - 1e-9
+    if _grad(hi) >= 0.0:
+        return 1.0
+    lo = 0.0
+    for _ in range(100):
+        mid = 0.5 * (lo + hi)
+        if _grad(mid) > 0.0:
+            lo = mid
+        else:
+            hi = mid
+    return float(max(0.0, min(1.0, 0.5 * (lo + hi))))
+
+
+def capped_settlement_kelly_fraction(
+    settlement: Mapping[str, float],
+    odds_bookmaker: float,
+    *,
+    kelly_fraction: float = DEFAULT_KELLY_FRACTION,
+    max_stake_pct: float = MAX_STAKE_PCT,
+) -> float:
+    """Fractional, capped Kelly (bankroll fraction) on the exact settlement payoff."""
+    frac = float(max(0.0, min(float(kelly_fraction), float(MAX_KELLY_FRACTION))))
+    cap = float(max(0.0, min(1.0, float(max_stake_pct))))
+    raw = settlement_full_kelly_fraction(settlement, odds_bookmaker) * frac
+    return float(min(max(0.0, raw), cap))
+
+
+def price_settlement(
+    settlement: Mapping[str, float],
+    odds_bookmaker: float,
+    *,
+    kelly_fraction: float = DEFAULT_KELLY_FRACTION,
+    max_stake_pct: float = MAX_STAKE_PCT,
+) -> dict[str, float | None]:
+    """One-stop exact pricing for an AH / O/U selection.
+
+    Returns ``p_cover`` (push-adjusted, ``fair_odds = 1/p_cover``), ``ev``
+    (exact settlement EV per unit stake), ``fair_odds``, ``stake_at_risk``,
+    ``full_kelly`` and capped fractional ``kelly``.
+    """
+    o = float(odds_bookmaker)
+    full = settlement_full_kelly_fraction(settlement, o)
+    return {
+        "p_cover": settlement_cover_probability(settlement),
+        "ev": settlement_expected_value(settlement, o),
+        "fair_odds": settlement_fair_odds(settlement),
+        "stake_at_risk": settlement_stake_at_risk(settlement),
+        "full_kelly": full,
+        "kelly": capped_settlement_kelly_fraction(
+            settlement, o, kelly_fraction=kelly_fraction, max_stake_pct=max_stake_pct
+        ),
+    }
+
+
 def has_edge(
     p_model: float,
     odds_bookmaker: float,
@@ -128,60 +239,38 @@ def has_edge(
 
 
 def _split_quarter_line(line: float) -> tuple[float, float]:
-    """Mirror of dixon_coles.split_handicap_line (local to avoid circular import)."""
-    frac = abs(float(line)) % 1.0
-    is_q = abs(frac - 0.25) < 1e-9 or abs(frac - 0.75) < 1e-9
-    if not is_q:
-        L = float(line)
-        return (L, L)
-    lower = float(np.floor(line * 2.0) / 2.0)
-    upper = float(np.ceil(line * 2.0) / 2.0)
-    return (lower, upper)
+    """Mirror of :func:`src.dixon_coles.split_handicap_line`."""
+    return split_handicap_line(float(line))
 
 
-def _effective_cover_from_ranks(mat: np.ndarray, avg_rank: np.ndarray) -> float:
-    """Map combined settlement ranks → cover mass ``win + 0.5·half_win``.
+def over_cover_from_matrix(
+    prob_matrix: np.ndarray,
+    line: float,
+    *,
+    push_adjusted: bool = True,
+) -> float:
+    """P(Over covers) on ``line`` from a score matrix (vectorised).
 
-    Rank convention matches :mod:`src.dixon_coles`: win=2, half_win=1, push=0,
-    half_lose=-1, lose=-2. Cover weight = ``max(0, rank/2)``.
+    Default: push-adjusted cover ``p* = W'/(W'+L')`` (``W' = win + ½·half_win``,
+    ``L' = lose + ½·half_lose``) so ``1/p*`` is the exact fair price on
+    whole / quarter lines. ``push_adjusted=False`` returns the legacy raw mass
+    ``win + ½·half_win``.
     """
-    weight = np.maximum(0.0, avg_rank / 2.0)
-    return float(np.sum(mat * weight))
+    key = "over" if push_adjusted else "over_effective"
+    return float(over_under_from_matrix(np.asarray(prob_matrix, dtype=float), line)[key])
 
 
-def over_cover_from_matrix(prob_matrix: np.ndarray, line: float) -> float:
-    """Effective P(Over covers) on ``line`` from a score matrix (vectorised)."""
-    mat = np.asarray(prob_matrix, dtype=float)
-    g = mat.shape[0] - 1
-    totals = np.add.outer(np.arange(g + 1, dtype=float), np.arange(g + 1, dtype=float))
-    lo, hi = _split_quarter_line(float(line))
-
-    def _atomic_rank(L: float) -> np.ndarray:
-        return np.where(totals > L, 2.0, np.where(totals < L, -2.0, 0.0))
-
-    if abs(lo - hi) < 1e-12:
-        return _effective_cover_from_ranks(mat, _atomic_rank(lo))
-    avg = (_atomic_rank(lo) + _atomic_rank(hi)) / 2.0
-    return _effective_cover_from_ranks(mat, avg)
-
-
-def ah_home_cover_from_matrix(prob_matrix: np.ndarray, handicap: float) -> float:
-    """Effective P(AH Home covers) on home ``handicap`` from a score matrix."""
-    mat = np.asarray(prob_matrix, dtype=float)
-    g = mat.shape[0] - 1
-    xs = np.arange(g + 1, dtype=float)
-    # margin = X − Y + h  → broadcast (x, y)
-    margin0 = xs[:, None] - xs[None, :]
-    lo, hi = _split_quarter_line(float(handicap))
-
-    def _atomic_rank(h: float) -> np.ndarray:
-        margin = margin0 + h
-        return np.where(margin > 0.0, 2.0, np.where(margin < 0.0, -2.0, 0.0))
-
-    if abs(lo - hi) < 1e-12:
-        return _effective_cover_from_ranks(mat, _atomic_rank(lo))
-    avg = (_atomic_rank(lo) + _atomic_rank(hi)) / 2.0
-    return _effective_cover_from_ranks(mat, avg)
+def ah_home_cover_from_matrix(
+    prob_matrix: np.ndarray,
+    handicap: float,
+    *,
+    push_adjusted: bool = True,
+) -> float:
+    """P(AH Home covers) on home ``handicap`` (see :func:`over_cover_from_matrix`)."""
+    key = "home" if push_adjusted else "home_effective"
+    return float(
+        asian_handicap_from_matrix(np.asarray(prob_matrix, dtype=float), handicap)[key]
+    )
 
 
 def _nearest_50pct_line(
@@ -240,12 +329,14 @@ class ModelFairLines:
     fair_total_goals:
         ``λ_home + λ_away``.
     fair_ou_line:
-        Common O/U line whose effective P(Over) is closest to 50%.
+        Common O/U line whose push-adjusted P(Over) is closest to 50%.
     fair_ah_line:
-        Common home AH line whose effective P(Home covers) is closest to 50%.
+        Common home AH line whose push-adjusted P(Home covers) is closest to 50%.
     fair_odds:
         Outcome → ``1/P`` (no-vig): ``H``/``D``/``A``, ``Over``/``Under`` at
-        ``fair_ou_line``, ``AH_Home``/``AH_Away`` at ``fair_ah_line``.
+        ``fair_ou_line``, ``AH_Home``/``AH_Away`` at ``fair_ah_line``. For
+        O/U and AH, ``P`` is the push-adjusted cover probability, so ``1/P``
+        is the exact zero-EV price including push / half-lose refunds.
     p_over_at_fair / p_ah_home_at_fair:
         Cover probs at the chosen fair lines (for diagnostics).
     """
@@ -350,38 +441,15 @@ def calculate_model_fair_lines(
 
 
 def _under_cover_from_matrix(prob_matrix: np.ndarray, line: float) -> float:
-    """Effective P(Under covers) — mirror of :func:`over_cover_from_matrix`."""
-    mat = np.asarray(prob_matrix, dtype=float)
-    g = mat.shape[0] - 1
-    totals = np.add.outer(np.arange(g + 1, dtype=float), np.arange(g + 1, dtype=float))
-    lo, hi = _split_quarter_line(float(line))
-
-    def _atomic_rank(L: float) -> np.ndarray:
-        return np.where(totals < L, 2.0, np.where(totals > L, -2.0, 0.0))
-
-    if abs(lo - hi) < 1e-12:
-        return _effective_cover_from_ranks(mat, _atomic_rank(lo))
-    avg = (_atomic_rank(lo) + _atomic_rank(hi)) / 2.0
-    return _effective_cover_from_ranks(mat, avg)
+    """Push-adjusted P(Under covers) — mirror of :func:`over_cover_from_matrix`."""
+    return float(over_under_from_matrix(np.asarray(prob_matrix, dtype=float), line)["under"])
 
 
 def _ah_away_cover_from_matrix(prob_matrix: np.ndarray, handicap: float) -> float:
-    """Away AH cover = mirror of home settlement on the same home handicap."""
-    mat = np.asarray(prob_matrix, dtype=float)
-    g = mat.shape[0] - 1
-    xs = np.arange(g + 1, dtype=float)
-    margin0 = xs[:, None] - xs[None, :]
-    lo, hi = _split_quarter_line(float(handicap))
-
-    def _atomic_home_rank(h: float) -> np.ndarray:
-        margin = margin0 + h
-        return np.where(margin > 0.0, 2.0, np.where(margin < 0.0, -2.0, 0.0))
-
-    # Away rank = −home rank (win↔lose, half_win↔half_lose).
-    if abs(lo - hi) < 1e-12:
-        return _effective_cover_from_ranks(mat, -_atomic_home_rank(lo))
-    avg_home = (_atomic_home_rank(lo) + _atomic_home_rank(hi)) / 2.0
-    return _effective_cover_from_ranks(mat, -avg_home)
+    """Push-adjusted away AH cover on the same home handicap."""
+    return float(
+        asian_handicap_from_matrix(np.asarray(prob_matrix, dtype=float), handicap)["away"]
+    )
 
 
 def line_disparity_score(
@@ -714,7 +782,7 @@ def select_value_bets(
     *,
     max_per_day: int = MAX_BETS_PER_DAY,
     already_today: int = 0,
-    allow_multi_picks_per_match: bool = True,
+    allow_multi_picks_per_match: bool = False,
     one_per_match: bool | None = None,
     apply_sanity: bool = True,
 ) -> pd.DataFrame:
@@ -731,9 +799,11 @@ def select_value_bets(
         Bets already placed / journalled on the VN calendar day. Remaining
         slots = ``max(0, max_per_day - already_today)``.
     allow_multi_picks_per_match:
-        When True (default), keep multiple markets/legs on the same match and
-        rank purely by EV descending. When False, keep only the single
-        highest-EV selection per ``match_id`` (fallback home|away|date).
+        When False (default), keep only the single highest-EV selection per
+        ``match_id`` (fallback home|away|date): legs on one fixture are highly
+        correlated (e.g. 1X2 Home and AH Home −0.5 are the *same* payoff), so
+        stacking them silently multiplies exposure. Opt in with ``True`` to
+        keep every leg and rank purely by EV descending (display / research).
     one_per_match:
         Backward-compatible override. When set, ``True`` forces one pick per
         match (staking / auto_scanner); ``False`` allows multi. Takes

@@ -1,11 +1,21 @@
 r"""Value Betting engine.
 
-Fair Odds = 1 / P_model
-EV        = (P_model × Odds_bookmaker) - 1
-Recommend only when EV ≥ min_ev (default 0.05 = 5%).
+1X2 (binary):
+    Fair Odds = 1 / P_model
+    EV        = (P_model × Odds_bookmaker) - 1
 
-Fractional Kelly (default 10% of full Kelly, capped at 1% bankroll):
-    f* = min( kelly_fraction × EV / (Odds − 1), MAX_STAKE_PCT )
+Asian handicap / Over-Under (whole, half and quarter lines) use the exact
+settlement payoff (push and half-lose refunds included):
+    EV        = win·(o−1) + half_win·(o−1)/2 + push·0 − half_lose·½ − lose
+    Fair Odds = 1 + (lose + ½·half_lose) / (win + ½·half_win) = 1 / P_model
+with ``P_model`` the push-adjusted cover probability
+(:func:`src.dixon_coles.settlement_cover_probability`).
+
+Recommend only when EV ≥ min_ev (default ``DEFAULT_MIN_EV`` = 0.05 = 5%).
+
+Fractional Kelly (``DEFAULT_KELLY_FRACTION`` of full Kelly, capped at
+``MAX_STAKE_PCT`` of bankroll). AH / O/U Kelly maximises log growth over the
+exact settlement outcomes.
 """
 
 from __future__ import annotations
@@ -18,11 +28,19 @@ import pandas as pd
 from src.config import (
     DEFAULT_KELLY_FRACTION,
     DEFAULT_MIN_EV,
+    MAX_KELLY_FRACTION,
     MAX_STAKE_PCT,
 )
-from src.dixon_coles import DixonColesModel
+from src.dixon_coles import (
+    DixonColesModel,
+    settlement_cover_probability,
+    settlement_expected_value,
+    settlement_fair_odds,
+    settlement_from_prediction,
+    settlement_stake_at_risk,
+)
 from src.models import NEW_TEAM_KELLY_CAP, apply_new_team_kelly_cap
-from src.strategy import capped_kelly_fraction
+from src.strategy import capped_kelly_fraction, capped_settlement_kelly_fraction
 
 MarketKind = Literal["1X2", "OU", "AH"]
 
@@ -188,22 +206,48 @@ class ValueBetRecommender:
         match_date: object | None = None,
         detail: dict[str, Any] | None = None,
         has_new_team: bool = False,
+        settlement: Mapping[str, float] | None = None,
     ) -> ValueBet | None:
-        if p_model <= 0.0 or bookmaker_odds <= 1.0:
-            return None
+        """Price one selection.
+
+        ``settlement`` (AH / O/U): ``{win, half_win, push, half_lose, lose}``
+        masses. When given, EV / fair odds / Kelly use the exact settlement
+        payoff and ``p_model`` is the push-adjusted cover probability.
+        Without it (1X2) the binary formulas apply unchanged.
+        """
         if pd.isna(p_model) or pd.isna(bookmaker_odds):
             return None
-        ev = expected_value(p_model, bookmaker_odds)
-        kelly = capped_kelly_fraction(
-            p_model,
-            bookmaker_odds,
-            kelly_fraction=self.kelly_fraction,
-            max_stake_pct=self.max_stake_pct,
-        )
+        detail_out = dict(detail or {})
+        if settlement is not None:
+            p_model = settlement_cover_probability(settlement)
+        if p_model <= 0.0 or bookmaker_odds <= 1.0:
+            return None
+        if settlement is not None:
+            ev = settlement_expected_value(settlement, bookmaker_odds)
+            fair = settlement_fair_odds(settlement)
+            if fair is None:
+                return None
+            kelly = capped_settlement_kelly_fraction(
+                settlement,
+                bookmaker_odds,
+                kelly_fraction=self.kelly_fraction,
+                max_stake_pct=self.max_stake_pct,
+            )
+            detail_out.setdefault("ev_method", "settlement")
+            detail_out.setdefault("p_push", float(settlement.get("push", 0.0)))
+            detail_out.setdefault("stake_at_risk", settlement_stake_at_risk(settlement))
+        else:
+            ev = expected_value(p_model, bookmaker_odds)
+            fair = fair_odds(p_model)
+            kelly = capped_kelly_fraction(
+                p_model,
+                bookmaker_odds,
+                kelly_fraction=self.kelly_fraction,
+                max_stake_pct=self.max_stake_pct,
+            )
         kelly = apply_new_team_kelly_cap(
             kelly, has_new_team=has_new_team, cap=NEW_TEAM_KELLY_CAP
         )
-        detail_out = dict(detail or {})
         if has_new_team:
             detail_out.setdefault("new_team_fallback", True)
             detail_out.setdefault("kelly_cap", NEW_TEAM_KELLY_CAP)
@@ -213,7 +257,7 @@ class ValueBetRecommender:
             market=market,
             selection=selection,
             p_model=float(p_model),
-            fair_odds=fair_odds(p_model),
+            fair_odds=float(fair),
             bookmaker_odds=float(bookmaker_odds),
             ev=ev,
             ev_pct=ev * 100.0,
@@ -303,6 +347,7 @@ class ValueBetRecommender:
                 match_date=match_date,
                 detail={k: preds[k] for k in preds if k.startswith(side)},
                 has_new_team=has_new_team,
+                settlement=settlement_from_prediction(preds, side),
             )
             if bet is not None:
                 out.append(bet)
@@ -346,6 +391,7 @@ class ValueBetRecommender:
                 match_date=match_date,
                 detail={k: preds[k] for k in preds if k.startswith(key)},
                 has_new_team=has_new_team,
+                settlement=settlement_from_prediction(preds, key),
             )
             if bet is not None:
                 out.append(bet)
@@ -389,9 +435,11 @@ class ValueBetRecommender:
         Returns
         -------
         list[ValueBet]
-            Sorted by EV descending. Each bet includes Quarter-Kelly stake
-            (``kelly_pct`` = % of bankroll). New-team fixtures are capped at
-            ``NEW_TEAM_KELLY_CAP`` (1% bankroll).
+            Sorted by EV descending. Each bet includes the fractional-Kelly
+            stake (``kelly_fraction`` × full Kelly, ``kelly_pct`` = % of
+            bankroll, capped at ``max_stake_pct``). New-team fixtures are
+            capped at ``NEW_TEAM_KELLY_CAP`` (½ of ``MAX_STAKE_PCT``). AH / O/U
+            EV includes push and half-lose refunds (exact settlement).
         """
         # Detect BEFORE expected_goals injects priors into attack/defence.
         has_new = bool(self.model.has_new_team(home_team, away_team))
@@ -827,6 +875,7 @@ class MatchPrediction:
     comparison_rows: list[dict[str, Any]]
     model_summary: dict[str, Any]
     min_ev: float
+    kelly_fraction: float = DEFAULT_KELLY_FRACTION
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -839,6 +888,7 @@ class MatchPrediction:
             "comparison_rows": self.comparison_rows,
             "model_summary": self.model_summary,
             "min_ev": self.min_ev,
+            "kelly_fraction": self.kelly_fraction,
         }
 
 
@@ -870,7 +920,8 @@ def predict_upcoming_match(
     min_ev:
         Value-bet threshold (default 0.05 = 5%).
     kelly_fraction:
-        Fractional Kelly (default 0.10, capped at 1% bankroll).
+        Fractional Kelly (default ``DEFAULT_KELLY_FRACTION``, capped at
+        ``MAX_STAKE_PCT`` of bankroll).
 
     Returns
     -------
@@ -930,6 +981,7 @@ def predict_upcoming_match(
         comparison_rows=comparison_rows,
         model_summary=model.summary(),
         min_ev=min_ev,
+        kelly_fraction=float(rec.kelly_fraction),
     )
 
 
@@ -940,6 +992,15 @@ def format_match_card(prediction: MatchPrediction) -> str:
     lam = prediction.lambda_home
     mu = prediction.lambda_away
     min_ev_pct = prediction.min_ev * 100.0
+    # Effective fraction = what src.strategy actually enforces (≤ MAX_KELLY_FRACTION).
+    kelly_frac = max(
+        0.0,
+        min(
+            float(getattr(prediction, "kelly_fraction", DEFAULT_KELLY_FRACTION)),
+            float(MAX_KELLY_FRACTION),
+        ),
+    )
+    kelly_label = f"Kelly ({kelly_frac:.0%})"
 
     w = 64
     bar = "=" * w
@@ -996,7 +1057,7 @@ def format_match_card(prediction: MatchPrediction) -> str:
                     f"  (công bằng {bet.fair_odds:.2f})",
                     f"      P_model      : {bet.p_model:.1%}",
                     f"      EV           : {bet.ev_pct:+.1f}%",
-                    f"      Kelly (25%)  : {bet.kelly_pct:.2f}% vốn",
+                    f"      {kelly_label:<13}: {bet.kelly_pct:.2f}% vốn",
                     "",
                 ]
             )
@@ -1008,7 +1069,9 @@ def format_match_card(prediction: MatchPrediction) -> str:
         [
             "",
             thin,
-            "  Ghi chú: EV = P_model × Odds − 1 · Kelly = 0.10 × EV / (Odds − 1) "
+            "  Ghi chú: EV = P_model × Odds − 1 (AH/Tài Xỉu: EV theo settlement, "
+            "tính cả hoàn tiền push / thua nửa)",
+            f"  Kelly = {kelly_frac:.2f} × Kelly đầy đủ "
             f"(trần {MAX_STAKE_PCT:.0%} bankroll)",
             "  Chỉ đặt cược khi EV ≥ {:.0f}% (theo .cursorrules).".format(min_ev_pct),
             bar,

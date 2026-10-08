@@ -18,14 +18,17 @@ from typing import Any, Callable, Sequence
 import numpy as np
 import pandas as pd
 
-from src.config import DEFAULT_W_ML, MAX_STAKE_PCT, MIN_TEAM_MATCHES
+from src.config import DEFAULT_W_ML, MIN_TEAM_MATCHES, NEW_TEAM_MAX_STAKE_PCT
 from src.corner_model import CornerPredictor
 from src.data_loader import normalize_league, normalize_team_name
 from src.dixon_coles import (
     DixonColesModel,
-    score_probability,
-    WEAK_TIER_NEW_TEAM_ATTACK,
-    WEAK_TIER_NEW_TEAM_DEFENCE,
+    WEAK_TIER_ATTACK_OFFSET,
+    WEAK_TIER_DEFENCE_OFFSET,
+    asian_handicap_from_matrix,
+    match_probs_from_matrix,
+    over_under_from_matrix,
+    score_matrix,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,8 +37,11 @@ logger = logging.getLogger(__name__)
 MIN_MATCHES_FOR_FULL_ML: int = 100
 # Absolute cap on ensemble w_ML when sample is thin (≤ default blend).
 SMALL_SAMPLE_W_ML_CAP: float = min(0.15, float(DEFAULT_W_ML))
-# Max Kelly fraction of bankroll when either side is a new team.
-NEW_TEAM_KELLY_CAP: float = float(MAX_STAKE_PCT)
+# Max Kelly fraction of bankroll when either side is a new team. Strictly
+# tighter than the global ``MAX_STAKE_PCT`` (half of it) so the cap binds.
+NEW_TEAM_KELLY_CAP: float = float(NEW_TEAM_MAX_STAKE_PCT)
+# Competitions whose fixtures mix clubs from different domestic leagues.
+_CUP_COMPETITIONS: frozenset[str] = frozenset({"UWCL", "EMPERORS_CUP", "J_LEAGUE_CUP"})
 
 
 def ensemble_weight_for_sample(
@@ -139,7 +145,7 @@ def apply_new_team_kelly_cap(
     has_new_team: bool,
     cap: float = NEW_TEAM_KELLY_CAP,
 ) -> float:
-    """Clamp Kelly stake to ``cap`` (default 1% bankroll) for new-team fixtures."""
+    """Clamp Kelly stake to ``cap`` (default ½ ``MAX_STAKE_PCT``) for new-team fixtures."""
     k = float(max(0.0, kelly_fraction))
     if has_new_team:
         return float(min(k, float(cap)))
@@ -200,10 +206,11 @@ def expected_goals_multi_comp(
 class LeagueWeightDixonColesProxy:
     """Non-mutating wrapper: scale λ/μ by per-team competition weights.
 
-    Does **not** alter the cached inner :class:`DixonColesModel`. Prediction
-    methods that depend on ``expected_goals`` are reimplemented so Ensemble /
-    recommender paths pick up the offset. Other attributes delegate to
-    ``inner``.
+    Does **not** alter the cached inner :class:`DixonColesModel`. Every
+    prediction method that depends on ``expected_goals`` (score matrix, 1X2,
+    Over/Under, Asian Handicap) is reimplemented on the *weighted* λ/μ so all
+    markets are priced from the same score matrix. Other attributes delegate
+    to ``inner``.
     """
 
     def __init__(
@@ -257,15 +264,7 @@ class LeagueWeightDixonColesProxy:
     ) -> np.ndarray:
         lam, mu = self.expected_goals(home_team, away_team)
         g = self._inner.max_goals if max_goals is None else max_goals
-        mat = np.zeros((g + 1, g + 1), dtype=float)
-        rho = float(self._inner.rho)
-        for x in range(g + 1):
-            for y in range(g + 1):
-                mat[x, y] = score_probability(x, y, lam, mu, rho)
-        total = mat.sum()
-        if total <= 0:
-            raise RuntimeError("Score matrix has non-positive mass; check parameters.")
-        return mat / total
+        return score_matrix(lam, mu, float(self._inner.rho), int(g))
 
     def predict_match_probs(
         self,
@@ -274,11 +273,29 @@ class LeagueWeightDixonColesProxy:
         max_goals: int | None = None,
     ) -> dict[str, float]:
         mat = self.predict_score_matrix(home_team, away_team, max_goals=max_goals)
-        return {
-            "H": float(np.tril(mat, k=-1).sum()),
-            "D": float(np.trace(mat)),
-            "A": float(np.triu(mat, k=1).sum()),
-        }
+        return match_probs_from_matrix(mat)
+
+    def predict_over_under(
+        self,
+        home_team: str,
+        away_team: str,
+        line: float = 2.5,
+        max_goals: int | None = None,
+    ) -> dict[str, float]:
+        """O/U on the weighted score matrix (same keys as the inner model)."""
+        mat = self.predict_score_matrix(home_team, away_team, max_goals=max_goals)
+        return over_under_from_matrix(mat, line)
+
+    def predict_asian_handicap(
+        self,
+        home_team: str,
+        away_team: str,
+        handicap: float = -0.5,
+        max_goals: int | None = None,
+    ) -> dict[str, float]:
+        """Asian Handicap on the weighted score matrix (same keys as inner)."""
+        mat = self.predict_score_matrix(home_team, away_team, max_goals=max_goals)
+        return asian_handicap_from_matrix(mat, handicap)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
@@ -289,12 +306,20 @@ def maybe_wrap_with_league_weights(
     league: str,
     *,
     db_path: Path | str | None = None,
-    w_ref: float = 1.0,
+    w_ref: float | None = None,
 ) -> DixonColesModel | LeagueWeightDixonColesProxy:
     """Wrap ``model`` when ``global_matches.db`` can supply team weights.
 
     EPL baseline (all weights 1.0) skips wrapping. Missing / empty global DB
     returns ``model`` unchanged so Streamlit never breaks.
+
+    ``w_ref`` (reference weight) defaults to the league's **own** weight for
+    domestic competitions: the model was fitted on that league, so clubs whose
+    home competition is ``league`` get a relative weight of exactly 1.0 and
+    their λ/μ are left untouched; only clubs from a different (stronger /
+    weaker) domestic league are scaled. Cup competitions (mixed leagues) keep
+    the absolute EPL baseline ``w_ref = 1.0``. Pass an explicit float to
+    override.
     """
     code = normalize_league(league)
     try:
@@ -315,6 +340,16 @@ def maybe_wrap_with_league_weights(
     # Domestic EPL baseline weights are 1.0 — skip proxy overhead.
     if code == "EPL":
         return model
+
+    if w_ref is None:
+        ref = 1.0
+        if code not in _CUP_COMPETITIONS:
+            try:
+                with connect_global_db(path, init=False) as conn:
+                    ref = float(get_competition_weight(conn, code, default=1.0))
+            except Exception:  # noqa: BLE001
+                ref = 1.0
+        w_ref = ref if ref > 0 else 1.0
 
     cache: dict[str, float] = {}
 
@@ -387,20 +422,18 @@ def fit_league_models(
                 f"UWCL sample size={n} < {MIN_MATCHES_FOR_FULL_ML}: "
                 f"using w_ML={w_eff:.0%}."
             )
-    if use_weak:
-        warnings.append(
-            f"Weak-tier DC priors (α={WEAK_TIER_NEW_TEAM_ATTACK}, "
-            f"δ={WEAK_TIER_NEW_TEAM_DEFENCE}) for new/thin clubs "
-            f"(< {MIN_TEAM_MATCHES} matches)."
-        )
-
     dc = DixonColesModel(
         xi=float(xi),
         use_weak_tier_priors=use_weak,
-        new_team_attack=WEAK_TIER_NEW_TEAM_ATTACK if use_weak else None,
-        new_team_defence=WEAK_TIER_NEW_TEAM_DEFENCE if use_weak else None,
         min_team_matches=MIN_TEAM_MATCHES,
     ).fit(matches)
+    if use_weak:
+        atk_prior, def_prior = dc.new_team_priors()
+        warnings.append(
+            f"Weak-tier DC priors (α=mean−{WEAK_TIER_ATTACK_OFFSET:g}={atk_prior:.2f}, "
+            f"δ=mean−{WEAK_TIER_DEFENCE_OFFSET:g}={def_prior:.2f}) for new/thin clubs "
+            f"(< {MIN_TEAM_MATCHES} matches)."
+        )
 
     ml_model = None
     ml_error = None
