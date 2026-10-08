@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
+import threading
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -10,12 +14,7 @@ import pandas as pd
 
 from src.config import DEFAULT_KELLY_FRACTION, DEFAULT_MIN_EV, DEFAULT_W_ML, MAX_STAKE_PCT
 from src.data_loader import PROJECT_ROOT, league_label, load_league_data, normalize_league
-from src.dixon_coles import (
-    DEFAULT_XI,
-    WEAK_TIER_NEW_TEAM_ATTACK,
-    WEAK_TIER_NEW_TEAM_DEFENCE,
-    DixonColesModel,
-)
+from src.dixon_coles import DEFAULT_XI, DixonColesModel
 from src.features import attach_rest_days_from_db
 from src.global_db import load_upcoming_from_db
 from src.models import maybe_wrap_with_league_weights
@@ -38,8 +37,20 @@ _LEAGUE_DEFAULTS: dict[str, dict[str, int]] = {
 # LaLiga / cups marks every side as thin and inflates EV — only use for EPL.
 _PICKLE_COMPATIBLE_LEAGUES = frozenset({"EPL"})
 
-# In-process cache for cold-fitted DC models (league → resolve tuple).
+# In-process cache for resolved models (league → resolve tuple).
 _MODEL_CACHE: dict[str, tuple[Any, Any | None, float, str]] = {}
+# league → (pickle signature | None, monotonic load time) for invalidation.
+_MODEL_CACHE_META: dict[str, tuple[Any, float]] = {}
+# Per-league locks so concurrent cold requests fit Dixon–Coles only once.
+_MODEL_LOCKS: dict[str, threading.Lock] = {}
+_MODEL_LOCKS_GUARD = threading.Lock()
+
+# Cold-fitted models are refreshed after this many minutes (new results land).
+DEFAULT_COLD_FIT_TTL_MINUTES = 720.0
+
+# Upcoming-fixtures cache freshness (odds move — never serve hours-old prices).
+FIXTURES_MAX_AGE_ENV = "FIXTURES_MAX_AGE_MINUTES"
+DEFAULT_FIXTURES_MAX_AGE_MINUTES = 60.0
 
 VALID_MARKETS = frozenset({"1X2", "AH", "OU", "Corners"})
 
@@ -119,17 +130,73 @@ def _fit_dc(league: str, n_seasons: int, n_train: int, xi: float = DEFAULT_XI) -
     history = load_league_data(code, n_seasons=n_seasons, force_refresh=False)
     train = history.sort_values("Date").tail(int(n_train)).reset_index(drop=True)
     use_weak = code == "UWCL" or int(len(train)) < 100
+    # New-team α/δ priors are relative to the fitted league means
+    # (``model.new_team_priors()``) — no absolute WEAK_TIER_* constants.
     return DixonColesModel(
         xi=float(xi),
         use_weak_tier_priors=use_weak,
-        new_team_attack=WEAK_TIER_NEW_TEAM_ATTACK if use_weak else None,
-        new_team_defence=WEAK_TIER_NEW_TEAM_DEFENCE if use_weak else None,
     ).fit(train)
 
 
 def clear_model_cache() -> None:
     """Drop in-process cold-fit cache (tests / after retrain)."""
     _MODEL_CACHE.clear()
+    _MODEL_CACHE_META.clear()
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        return float(default)
+
+
+def _pickle_signature() -> tuple[tuple[int, int] | None, ...]:
+    """(mtime_ns, size) of the shared pickles — changes after a retrain."""
+    sig: list[tuple[int, int] | None] = []
+    for name in (DC_PICKLE, LGBM_PICKLE):
+        try:
+            st = (MODELS_DIR / name).stat()
+            sig.append((int(st.st_mtime_ns), int(st.st_size)))
+        except OSError:
+            sig.append(None)
+    return tuple(sig)
+
+
+def _league_lock(code: str) -> threading.Lock:
+    with _MODEL_LOCKS_GUARD:
+        lock = _MODEL_LOCKS.get(code)
+        if lock is None:
+            lock = threading.Lock()
+            _MODEL_LOCKS[code] = lock
+        return lock
+
+
+def _cached_models(code: str) -> tuple[Any, Any | None, float, str] | None:
+    """Return a still-valid cache entry, else ``None``.
+
+    EPL (pickle) entries are invalidated when ``models/*.pkl`` mtime/size
+    change; cold-fitted entries expire after ``MODEL_COLD_FIT_TTL_MINUTES``.
+    """
+    cached = _MODEL_CACHE.get(code)
+    if cached is None:
+        return None
+    meta = _MODEL_CACHE_META.get(code)
+    if meta is None:
+        # Entry injected directly (tests / legacy) — trust it.
+        return cached
+    sig, loaded_at = meta
+    if sig is not None:
+        if sig != _pickle_signature():
+            return None
+    else:
+        ttl_min = _env_float("MODEL_COLD_FIT_TTL_MINUTES", DEFAULT_COLD_FIT_TTL_MINUTES)
+        if ttl_min > 0 and (time.monotonic() - loaded_at) > ttl_min * 60.0:
+            return None
+    return cached
 
 
 def _resolve_models(league: str) -> tuple[Any, Any | None, float, str]:
@@ -138,13 +205,24 @@ def _resolve_models(league: str) -> tuple[Any, Any | None, float, str]:
     Prefer ``models/*_latest.pkl`` **only** for EPL (pickle training target).
     Other leagues cold-fit Dixon–Coles on that league's history (cached
     in-process) so WebApp/API EV is not driven by EPL thin-team priors.
+
+    A per-league lock ensures concurrent cold requests fit only once; the
+    cache reloads when the pickle files change on disk.
     """
     code = normalize_league(league)
-    cached = _MODEL_CACHE.get(code)
+    cached = _cached_models(code)
     if cached is not None:
         return cached
+    with _league_lock(code):
+        cached = _cached_models(code)
+        if cached is not None:
+            return cached
+        return _resolve_models_uncached(code)
 
+
+def _resolve_models_uncached(code: str) -> tuple[Any, Any | None, float, str]:
     if code in _PICKLE_COMPATIBLE_LEAGUES:
+        sig = _pickle_signature()
         dc = _load_joblib(MODELS_DIR / DC_PICKLE)
         ml = _load_joblib(MODELS_DIR / LGBM_PICKLE)
         if dc is not None:
@@ -161,6 +239,7 @@ def _resolve_models(league: str) -> tuple[Any, Any | None, float, str]:
                 "+".join(notes),
             )
             _MODEL_CACHE[code] = result
+            _MODEL_CACHE_META[code] = (sig, time.monotonic())
             return result
 
     defaults = _LEAGUE_DEFAULTS.get(code, {"n_seasons": 3, "n_train": 800})
@@ -172,24 +251,185 @@ def _resolve_models(league: str) -> tuple[Any, Any | None, float, str]:
         "dc_fitted_cold",
     )
     _MODEL_CACHE[code] = result
+    _MODEL_CACHE_META[code] = (None, time.monotonic())
     return result
 
 
-def _load_fixtures(comp_id: str) -> tuple[pd.DataFrame, str]:
-    """Prefer ``upcoming_fixtures`` cache; network only on empty cache."""
-    code = normalize_league(comp_id)
-    db_df, _last = load_upcoming_from_db(code)
-    if db_df is not None and not db_df.empty:
-        return db_df, "db_cache"
-    try:
-        from src.data_loader import load_upcoming_fixtures
+# ---------------------------------------------------------------------------
+# Upcoming fixtures (freshness-aware)
+# ---------------------------------------------------------------------------
 
-        fx = load_upcoming_fixtures(league=code, only_future=True, include_odds=True)
-        if fx is not None and not fx.empty:
-            return fx, "network"
+
+def fixtures_max_age_minutes() -> float:
+    """Max acceptable age of the ``upcoming_fixtures`` cache (env, minutes)."""
+    return _env_float(FIXTURES_MAX_AGE_ENV, DEFAULT_FIXTURES_MAX_AGE_MINUTES)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def filter_future_fixtures(
+    df: pd.DataFrame | None, now: datetime | None = None
+) -> pd.DataFrame:
+    """Keep rows whose kickoff is strictly after ``now`` (UTC).
+
+    ``Kickoff`` / ``kickoff`` are naive-UTC in this project; tz-aware values
+    are converted. Rows with an unparseable kickoff are dropped (not
+    actionable). Frames without any kickoff column are returned unchanged.
+    """
+    if df is None:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    col = next((c for c in ("Kickoff", "kickoff", "kickoff_utc") if c in df.columns), None)
+    if col is None:
+        return df
+    ref = now or _utc_now()
+    if ref.tzinfo is None:
+        ref = ref.replace(tzinfo=timezone.utc)
+    kick = pd.to_datetime(df[col], errors="coerce", utc=True)
+    mask = (kick > pd.Timestamp(ref).tz_convert("UTC")).fillna(False)
+    out = df.loc[mask.to_numpy(dtype=bool)].reset_index(drop=True)
+    out.attrs.update(dict(getattr(df, "attrs", {}) or {}))
+    return out
+
+
+def refresh_upcoming_fixtures(comp_id: str, *, persist: bool = True) -> pd.DataFrame:
+    """Fetch upcoming fixtures + odds over the network and refresh the DB cache.
+
+    Shared by the API fallback path and ``src.workers.fixtures_worker``. Only a
+    non-empty result is persisted (an empty write would wipe the cache).
+    """
+    from src.data_loader import load_upcoming_fixtures
+
+    code = normalize_league(comp_id)
+    results = None
+    try:
+        results = load_league_data(code, n_seasons=1, force_refresh=False)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("network fixtures failed for %s: %s", code, exc)
-    return pd.DataFrame(), "empty"
+        logger.info("history load for %s failed (fixtures still fetched): %s", code, exc)
+    fx = load_upcoming_fixtures(
+        league=code,
+        results=results,
+        only_future=True,
+        exclude_played=True,
+        include_odds=True,
+    )
+    if fx is None:
+        return pd.DataFrame()
+    if persist and not fx.empty:
+        try:
+            from src.global_db import save_upcoming_to_db
+
+            save_upcoming_to_db(code, fx)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("persist upcoming fixtures for %s failed: %s", code, exc)
+    return fx
+
+
+_REFRESH_LOCKS: dict[str, threading.Lock] = {}
+# league → (monotonic time of last network attempt, succeeded?)
+_LAST_REFRESH: dict[str, tuple[float, bool]] = {}
+DEFAULT_REFRESH_BACKOFF_SECONDS = 300.0
+
+
+def _guarded_refresh(code: str, ref: datetime) -> pd.DataFrame | None:
+    """Network refresh serialised per league, with backoff after attempts.
+
+    Concurrent stale requests wait for one fetch instead of all hitting
+    Flashscore; within the backoff window a recent success is re-read from
+    the DB and a recent failure is not retried.
+    """
+    with _MODEL_LOCKS_GUARD:
+        lock = _REFRESH_LOCKS.setdefault(code, threading.Lock())
+    backoff = _env_float("FIXTURES_REFRESH_BACKOFF_SECONDS", DEFAULT_REFRESH_BACKOFF_SECONDS)
+    with lock:
+        last = _LAST_REFRESH.get(code)
+        if last is not None and (time.monotonic() - last[0]) < backoff:
+            if not last[1]:
+                return None
+            db_df, _ts = load_upcoming_from_db(code)
+            return filter_future_fixtures(db_df, ref)
+        ok = False
+        try:
+            fx = filter_future_fixtures(refresh_upcoming_fixtures(code), ref)
+            ok = not fx.empty
+            return fx
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("network fixtures failed for %s: %s", code, exc)
+            return None
+        finally:
+            _LAST_REFRESH[code] = (time.monotonic(), ok)
+
+
+def load_fixtures_with_meta(
+    comp_id: str,
+    *,
+    max_age_minutes: float | None = None,
+    now: datetime | None = None,
+    allow_network: bool = True,
+) -> dict[str, Any]:
+    """Load future fixtures, refreshing over the network when the cache is stale.
+
+    Returns ``{"df", "source", "stale", "age_minutes"}``:
+
+    * fresh cache (age ≤ max age) with future rows → ``source="db_cache"``
+    * otherwise try :func:`refresh_upcoming_fixtures` → ``source="network"``
+    * network failed/empty but cache has future rows → ``source="db_cache"``,
+      ``stale=True`` (callers must not push alerts built on these prices)
+    """
+    code = normalize_league(comp_id)
+    ref = now or _utc_now()
+    if ref.tzinfo is None:
+        ref = ref.replace(tzinfo=timezone.utc)
+    limit = fixtures_max_age_minutes() if max_age_minutes is None else float(max_age_minutes)
+
+    db_df, last_ts = load_upcoming_from_db(code)
+    age_min: float | None = None
+    if last_ts is not None:
+        try:
+            age_min = max(0.0, (ref.timestamp() - float(last_ts)) / 60.0)
+        except (TypeError, ValueError):
+            age_min = None
+    cached_future = filter_future_fixtures(db_df, ref)
+    # Unknown age counts as stale; ``limit <= 0`` disables the age check.
+    fresh = limit <= 0 or (age_min is not None and age_min <= limit)
+
+    if fresh and not cached_future.empty:
+        return {
+            "df": cached_future,
+            "source": "db_cache",
+            "stale": False,
+            "age_minutes": age_min,
+        }
+
+    if allow_network:
+        fx = _guarded_refresh(code, ref)
+        if fx is not None and not fx.empty:
+            return {"df": fx, "source": "network", "stale": False, "age_minutes": 0.0}
+
+    if not cached_future.empty:
+        logger.warning(
+            "serving STALE upcoming fixtures for %s (age=%s min, max=%s)",
+            code,
+            None if age_min is None else round(age_min, 1),
+            limit,
+        )
+        return {
+            "df": cached_future,
+            "source": "db_cache",
+            "stale": True,
+            "age_minutes": age_min,
+        }
+    return {"df": pd.DataFrame(), "source": "empty", "stale": False, "age_minutes": age_min}
+
+
+def _load_fixtures(comp_id: str) -> tuple[pd.DataFrame, str]:
+    """Back-compat wrapper: ``(df, source)``; see :func:`load_fixtures_with_meta`."""
+    meta = load_fixtures_with_meta(comp_id)
+    src = str(meta["source"]) + (":stale" if meta.get("stale") else "")
+    return meta["df"], src
 
 
 def _row_to_bet(row: dict[str, Any] | pd.Series) -> dict[str, Any]:
@@ -291,13 +531,18 @@ def scan_value_bets_api(
 ) -> dict[str, Any]:
     """Scan Top-N value bets (mirrors Streamlit Top-20 path).
 
-    Warm path: cached upcoming fixtures + ``models/*.pkl``.
+    Units: ``min_ev_pct`` is **always percent** (``5.0`` = 5 %, ``1.0`` = 1 %).
+    Values ≤ 0 fall back to ``src.config.DEFAULT_MIN_EV`` (fraction × 100).
+
+    Warm path: fresh cached upcoming fixtures + ``models/*.pkl``.
     Cold path: may fit Dixon–Coles (slow) and/or fetch fixtures over the network.
+    The response carries ``stale=True`` when any league was served from a cache
+    older than ``FIXTURES_MAX_AGE_MINUTES`` because the network refresh failed.
     """
     mkt_list = parse_markets(markets)
     # Scanner ignores Corners today (goal markets only); keep in response meta.
     goal_markets = tuple(m for m in mkt_list if m != "Corners") or ("1X2",)
-    min_ev = float(min_ev_pct) / 100.0 if float(min_ev_pct) > 1.0 else float(min_ev_pct)
+    min_ev = float(min_ev_pct) / 100.0
     if min_ev <= 0:
         min_ev = float(DEFAULT_MIN_EV)
 
@@ -307,18 +552,25 @@ def scan_value_bets_api(
     results = []
     source_bits: list[str] = []
     notes: list[str] = []
+    stale_leagues: list[str] = []
 
     for lg in leagues:
-        fx, fx_src = _load_fixtures(lg)
+        fx_meta = load_fixtures_with_meta(lg)
+        fx = fx_meta["df"]
+        fx_src = str(fx_meta["source"])
+        if fx_meta.get("stale"):
+            fx_src += ":stale"
         source_bits.append(f"{lg}:{fx_src}")
         if fx is None or fx.empty:
             continue
+        if fx_meta.get("stale"):
+            stale_leagues.append(str(lg))
         try:
             dc, ml, w_ml, model_note = _resolve_models(lg)
             notes.append(f"{lg}:{model_note}")
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             logger.exception("model resolve failed for %s", lg)
-            notes.append(f"{lg}:model_error:{exc}")
+            notes.append(f"{lg}:model_error")
             continue
         results.append(
             scan_top_value_bets(
@@ -348,6 +600,8 @@ def scan_value_bets_api(
             "comp_id": scope,
             "below_threshold": True,
             "odds_missing": False,
+            "stale": bool(stale_leagues),
+            "stale_leagues": stale_leagues,
             "source": ",".join(source_bits) or "empty",
             "notes": (
                 "No cached fixtures and cold network/model path failed or empty. "
@@ -384,6 +638,12 @@ def scan_value_bets_api(
             (note_txt + "; " if note_txt else "")
             + "Cold path may load/fit models — subsequent calls are faster with DB cache + pickles."
         )
+    if stale_leagues:
+        note_txt = (
+            (note_txt + "; " if note_txt else "")
+            + "STALE odds (cache older than FIXTURES_MAX_AGE_MINUTES, refresh failed): "
+            + ",".join(stale_leagues)
+        )
 
     return {
         "bets": bets,
@@ -395,6 +655,8 @@ def scan_value_bets_api(
         "comp_id": scope,
         "below_threshold": bool(merged.below_threshold),
         "odds_missing": bool(merged.odds_missing),
+        "stale": bool(stale_leagues),
+        "stale_leagues": stale_leagues,
         "source": ",".join(source_bits),
         "notes": note_txt,
     }

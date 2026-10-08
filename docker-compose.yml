@@ -4,6 +4,8 @@
 #   • Value alerts  → telegram_bot  (ENABLE_VALUE_SCHEDULER=true)
 #   • Settlement    → settlement_worker
 #   • Data monitor  → data_monitor_worker
+#   • Odds/fixtures → fixtures_worker (keeps upcoming_fixtures fresh; API and
+#                     alerts treat cache older than FIXTURES_MAX_AGE_MINUTES as stale)
 #
 # Usage:
 #   cp .env.example .env   # fill DOMAIN, TELEGRAM_*, SIGNAL_*
@@ -16,17 +18,23 @@ services:
     build: .
     image: score-quant:latest
     container_name: score-web
+    # --proxy-headers: trust X-Forwarded-* from nginx (only reachable on score-net).
     command: >
       uvicorn src.api.main:app
       --host 0.0.0.0
       --port 8000
       --workers 2
+      --proxy-headers
+      --forwarded-allow-ips=*
     env_file:
       - .env
     environment:
       # Multi-worker: never run APScheduler in FastAPI lifespan here
       ENABLE_VALUE_SCHEDULER: "false"
       ENABLE_SETTLE_SCHEDULER: "false"
+      # APP_ENV=prod → app refuses to start if TELEGRAM_AUTH_DISABLED=true,
+      # hides /docs (ENABLE_DOCS=true to expose) and restricts CORS to DOMAIN.
+      APP_ENV: ${APP_ENV:-prod}
       TELEGRAM_AUTH_DISABLED: ${TELEGRAM_AUTH_DISABLED:-false}
       WEBAPP_URL: ${WEBAPP_URL}
     volumes:
@@ -34,6 +42,16 @@ services:
       - ./models:/app/models
     expose:
       - "8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
     networks:
       - score-net
     restart: unless-stopped
@@ -50,6 +68,29 @@ services:
     volumes:
       - ./data:/app/data
       - ./models:/app/models
+    networks:
+      - score-net
+    restart: unless-stopped
+
+  fixtures_worker:
+    # Refreshes upcoming fixtures + odds into global_matches.db so the API /
+    # value alerts never price on stale odds (nothing else refreshes it in Docker).
+    image: score-quant:latest
+    container_name: score-fixtures
+    command: python -m src.workers.fixtures_worker
+    env_file:
+      - .env
+    environment:
+      FIXTURES_REFRESH_INTERVAL_MINUTES: ${FIXTURES_REFRESH_INTERVAL_MINUTES:-20}
+      FIXTURES_REFRESH_LEAGUES: ${FIXTURES_REFRESH_LEAGUES:-EPL,UWCL}
+      ENABLE_VALUE_SCHEDULER: "false"
+      ENABLE_SETTLE_SCHEDULER: "false"
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    depends_on:
+      web_api:
+        condition: service_healthy
     networks:
       - score-net
     restart: unless-stopped
@@ -89,7 +130,8 @@ services:
       - ./data:/app/data
       - ./models:/app/models
     depends_on:
-      - web_api
+      web_api:
+        condition: service_healthy
     networks:
       - score-net
     restart: unless-stopped
@@ -102,13 +144,16 @@ services:
       - "443:443"
     environment:
       DOMAIN: ${DOMAIN:-localhost}
+      # 1 → HTTP 301 to HTTPS (only after ssl.conf.template + certs exist)
+      NGINX_FORCE_HTTPS: ${NGINX_FORCE_HTTPS:-0}
     volumes:
       # Official nginx image runs envsubst on *.template → conf.d/
       - ./nginx/templates:/etc/nginx/templates:ro
       - ./nginx/certbot/www:/var/www/certbot:ro
       - ./nginx/certbot/conf:/etc/letsencrypt:ro
     depends_on:
-      - web_api
+      web_api:
+        condition: service_healthy
     networks:
       - score-net
     restart: unless-stopped

@@ -18,6 +18,7 @@ from typing import Any, Mapping
 from src.bot.notifier import broadcast_value_signal
 from src.bot.signal_store import (
     DEFAULT_DB_PATH,
+    already_notified,
     make_signal_key,
     mark_notified,
 )
@@ -32,6 +33,7 @@ DEFAULT_MIN_LINE_DELTA = 0.5
 DEFAULT_MIN_DATA_SCORE = 0.0
 
 # Scan below signal EV so line-disparity-only picks still appear.
+# Units: percent (``scan_value_bets_api`` treats min_ev_pct as percent → 1 %).
 _SCAN_MIN_EV_PCT = 1.0
 _SCAN_LIMIT = 80
 
@@ -231,8 +233,8 @@ def filter_hot_signals(
     return out
 
 
-def _scan_candidates() -> list[dict[str, Any]]:
-    """Blocking scan — call via ``asyncio.to_thread``."""
+def _scan_candidates_with_meta() -> tuple[list[dict[str, Any]], set[str]]:
+    """Blocking scan → (bets, stale_leagues). Call via ``asyncio.to_thread``."""
     from src.api.services.value_bets import scan_value_bets_api
 
     result = scan_value_bets_api(
@@ -242,7 +244,41 @@ def _scan_candidates() -> list[dict[str, Any]]:
         league=None,
     )
     bets = result.get("bets") or []
-    return [dict(b) for b in bets if isinstance(b, Mapping)]
+    stale = {str(x).upper() for x in (result.get("stale_leagues") or [])}
+    if result.get("stale") and not stale:
+        stale = {"*"}
+    return [dict(b) for b in bets if isinstance(b, Mapping)], stale
+
+
+def _scan_candidates() -> list[dict[str, Any]]:
+    """Blocking scan — call via ``asyncio.to_thread`` (fresh-odds bets only)."""
+    bets, stale = _scan_candidates_with_meta()
+    return drop_stale_bets(bets, stale)
+
+
+def drop_stale_bets(
+    bets: list[dict[str, Any]], stale_leagues: set[str] | frozenset[str]
+) -> list[dict[str, Any]]:
+    """Remove bets priced from a stale odds cache (never alert on old prices)."""
+    if not stale_leagues:
+        return list(bets)
+    if "*" in stale_leagues:
+        return []
+    out = []
+    for b in bets:
+        lg = str(b.get("league") or b.get("comp_id") or "").upper()
+        if not lg or lg in stale_leagues:
+            continue
+        out.append(b)
+    return out
+
+
+def _send_succeeded(res: Mapping[str, Any]) -> bool:
+    """A signal counts as delivered when at least one subscriber received it."""
+    try:
+        return int(res.get("sent") or 0) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 async def run_value_signal_job(
@@ -259,10 +295,18 @@ async def run_value_signal_job(
     store = db_path or DEFAULT_DB_PATH
 
     try:
-        candidates = await asyncio.to_thread(_scan_candidates)
+        scanned, stale_leagues = await asyncio.to_thread(_scan_candidates_with_meta)
     except Exception as exc:  # noqa: BLE001
         logger.exception("value-signal scan failed: %s", exc)
-        return {"ok": False, "error": str(exc), "pushed": 0}
+        return {"ok": False, "error": "scan_failed", "pushed": 0}
+
+    candidates = drop_stale_bets(scanned, stale_leagues)
+    if stale_leagues:
+        logger.warning(
+            "value-signal job: skipping %s candidate(s) built on STALE odds (%s)",
+            len(scanned) - len(candidates),
+            ",".join(sorted(stale_leagues)),
+        )
 
     hot = filter_hot_signals(
         candidates,
@@ -273,6 +317,7 @@ async def run_value_signal_job(
     )
     pushed = 0
     skipped_dup = 0
+    retry_later = 0
     errors: list[str] = []
 
     for bet in hot:
@@ -287,27 +332,35 @@ async def run_value_signal_job(
         if dry_run:
             logger.info("dry-run signal %s", key)
             continue
-        if not mark_notified(
-            key,
-            match_id=bet.get("match_id"),
-            market=bet.get("market"),
-            selection=bet.get("selection"),
-            db_path=store,
-        ):
+        if already_notified(key, db_path=store):
             skipped_dup += 1
             continue
+        # Send first; record the key only after a successful delivery so a
+        # failed push (network, 429, no subscribers yet) is retried next tick.
         try:
             res = await broadcast_value_signal(
                 bet,
                 bot_token=bot_token,
                 db_path=store,
             )
-            pushed += int(res.get("sent") or 0)
-            if res.get("errors"):
-                errors.extend(list(res["errors"]))
         except Exception as exc:  # noqa: BLE001
             logger.warning("broadcast failed for %s: %s", key, exc)
-            errors.append(str(exc))
+            errors.append(f"{key}: broadcast_failed")
+            retry_later += 1
+            continue
+        pushed += int(res.get("sent") or 0)
+        if res.get("errors"):
+            errors.extend(str(e) for e in res["errors"])
+        if _send_succeeded(res):
+            mark_notified(
+                key,
+                match_id=bet.get("match_id"),
+                market=bet.get("market"),
+                selection=bet.get("selection"),
+                db_path=store,
+            )
+        else:
+            retry_later += 1
 
     summary = {
         "ok": True,
@@ -315,6 +368,8 @@ async def run_value_signal_job(
         "hot": len(hot),
         "pushed": pushed,
         "skipped_dup": skipped_dup,
+        "retry_later": retry_later,
+        "stale_leagues": sorted(stale_leagues),
         "errors": errors,
     }
     if hot or candidates:
@@ -405,7 +460,7 @@ async def run_settlement_job() -> dict[str, Any]:
         summary = await settle_completed_matches_async()
     except Exception as exc:  # noqa: BLE001
         logger.exception("settlement job failed: %s", exc)
-        return {"ok": False, "error": str(exc)}
+        return {"ok": False, "error": "settlement_failed"}
     if summary.get("settled"):
         logger.info(
             "settlement job: settled=%s pnl=%.2f",

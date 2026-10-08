@@ -16,6 +16,8 @@ from src.api.main import create_app
 @pytest.fixture()
 def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.setenv("TELEGRAM_AUTH_DISABLED", "true")
+    # Auth bypass is refused in prod (APP_ENV=prod / public DOMAIN).
+    monkeypatch.setenv("APP_ENV", "test")
     return TestClient(create_app())
 
 

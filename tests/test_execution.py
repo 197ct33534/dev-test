@@ -436,5 +436,87 @@ async def test_settle_1x2_won_uses_pinnacle_closing(session: AsyncSession) -> No
     await session.refresh(bet)
     assert bet.status == "WON"
     assert bet.pnl == pytest.approx(50.0 * (2.20 - 1.0))
-    assert bet.clv_value == pytest.approx(math.log(2.20 / 2.00))
+    # CLV is measured vs the de-vigged close (full H/D/A closing market seeded).
+    overround = 1 / 2.00 + 1 / 3.5 + 1 / 4.0
+    assert bet.clv_value == pytest.approx(math.log(2.20 / (2.00 * overround)))
     assert bet.sharp_closing_odds == pytest.approx(2.00)
+
+
+# ---------------------------------------------------------------------------
+# Regression: finished-status gate, void statuses, corners, status labels
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_live_match_with_goals_is_not_settled(session: AsyncSession) -> None:
+    bet, match = await _seed_finished_match_with_bet(
+        session, market_type="1X2", selection="Home", ft_home=1, ft_away=0
+    )
+    match.status = "LIVE"  # partial score present, match not finished
+    await session.flush()
+    engine = SettlementEngineV2(session, closing_odds_lookup=lambda *_a, **_k: None)
+    summary = await engine.settle_pending_bets(KICKOFF + timedelta(hours=1))
+    assert summary["settled"] == 0
+    await session.refresh(bet)
+    assert bet.status == "PENDING"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["POSTPONED", "ABANDONED", "CANCELLED"])
+async def test_void_statuses_void_the_bet(session: AsyncSession, status: str) -> None:
+    bet, match = await _seed_finished_match_with_bet(
+        session, market_type="1X2", selection="Home"
+    )
+    match.status = status
+    match.ft_home_goals = None
+    match.ft_away_goals = None
+    await session.flush()
+    engine = SettlementEngineV2(session, closing_odds_lookup=lambda *_a, **_k: None)
+    summary = await engine.settle_pending_bets(KICKOFF + timedelta(hours=3))
+    assert summary["voided"] == 1
+    await session.refresh(bet)
+    assert bet.status == "VOID"
+    assert bet.pnl == 0.0
+
+
+@pytest.mark.asyncio
+async def test_corners_bet_stays_pending_without_corner_counts(
+    session: AsyncSession, caplog: pytest.LogCaptureFixture
+) -> None:
+    bet, _match = await _seed_finished_match_with_bet(
+        session, market_type="Corners", selection="Over 9.5"
+    )
+    engine = SettlementEngineV2(session, closing_odds_lookup=lambda *_a, **_k: None)
+    with caplog.at_level("WARNING"):
+        summary = await engine.settle_pending_bets(KICKOFF + timedelta(hours=3))
+    assert summary["pending_no_corners"] == 1
+    assert "Corners bet" in caplog.text
+    await session.refresh(bet)
+    assert bet.status == "PENDING"
+
+
+def test_settle_market_corners_with_counts() -> None:
+    from src.execution.settlement_v2 import settle_market
+
+    status, pnl, _ = settle_market(
+        market_type="Corners",
+        selection="Over 9.5",
+        taken_odds=1.9,
+        stake=10.0,
+        ft_home=1,
+        ft_away=0,
+        home_corners=6,
+        away_corners=5,
+    )
+    assert status == "WON"
+    assert pnl == pytest.approx(9.0)
+
+
+def test_normalize_settlement_status_aliases() -> None:
+    from src.services.settlement_service import normalize_settlement_status
+
+    assert normalize_settlement_status("WON") == "WIN"
+    assert normalize_settlement_status("lost") == "LOSS"
+    assert normalize_settlement_status("HALF_WIN") == "HALF_WIN"
+    assert normalize_settlement_status("VOID") == "VOID"
+    assert normalize_settlement_status("PENDING") == "PENDING"

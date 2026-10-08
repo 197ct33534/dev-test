@@ -6,6 +6,7 @@ Configure ``bot_token`` + ``chat_id`` from the Streamlit sidebar or ``.env``.
 
 from __future__ import annotations
 
+import html
 import logging
 from typing import Any, Mapping, Sequence
 
@@ -14,6 +15,24 @@ import requests
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 logger = logging.getLogger(__name__)
+
+
+def _esc(value: Any) -> str:
+    """HTML-escape scraped / user text for ``parse_mode=HTML`` messages."""
+    return html.escape(str(value if value is not None else ""), quote=False)
+
+
+def redact_token(text: Any, token: str | None) -> str:
+    """Replace the bot token with ``***``.
+
+    ``requests`` exception messages embed the full request URL, which for the
+    Bot API contains the secret token — never log or surface it verbatim.
+    """
+    out = str(text if text is not None else "")
+    tok = (token or "").strip()
+    if tok:
+        out = out.replace(tok, "***")
+    return out
 
 
 def format_value_bet_alert(
@@ -35,13 +54,14 @@ def format_value_bet_alert(
     # If caller already passed ev as percent (> 1 looks like 12.4), keep as-is.
     if abs(float(ev)) > 2:
         ev_pct = float(ev)
-    tag = str(league or "EPL").strip().upper() or "EPL"
+    tag = _esc(str(league or "EPL").strip().upper() or "EPL")
+    when_s = f" ({_esc(when)})" if when and when != "TBD" else ""
     return (
         f"⚽ <b>[{tag} Value Bet Alert]</b>\n"
-        f"📌 Trận: <b>{home_team}</b> vs <b>{away_team}</b>"
-        f"{f' ({when})' if when and when != 'TBD' else ''}\n"
-        f"🏟 Thị trường: <b>{market}</b>\n"
-        f"🎯 Cửa đặt: <b>{selection}</b>\n"
+        f"📌 Trận: <b>{_esc(home_team)}</b> vs <b>{_esc(away_team)}</b>"
+        f"{when_s}\n"
+        f"🏟 Thị trường: <b>{_esc(market)}</b>\n"
+        f"🎯 Cửa đặt: <b>{_esc(selection)}</b>\n"
         f"📊 Odds nhà cái: <b>{float(odds):.2f}</b> | "
         f"EV: <b>{ev_pct:+.1f}%</b>\n"
         f"💰 Vốn khuyến nghị: <b>{float(kelly_pct):.1f}% Kelly "
@@ -78,13 +98,16 @@ def send_telegram_message(
     try:
         resp = requests.post(url, json=payload, timeout=timeout)
     except requests.Timeout as exc:
-        logger.exception("Telegram POST timeout")
-        raise RuntimeError(f"Telegram request timeout after {timeout}s: {exc}") from exc
+        safe = redact_token(exc, token)
+        logger.error("Telegram POST timeout: %s", safe)
+        # ``from None``: the original exception message contains the token URL.
+        raise RuntimeError(f"Telegram request timeout after {timeout}s: {safe}") from None
     except requests.RequestException as exc:
-        logger.exception("Telegram POST failed")
+        safe = redact_token(exc, token)
+        logger.error("Telegram POST failed (%s): %s", type(exc).__name__, safe)
         raise RuntimeError(
-            f"Telegram request error ({type(exc).__name__}): {exc}"
-        ) from exc
+            f"Telegram request error ({type(exc).__name__}): {safe}"
+        ) from None
 
     try:
         data = resp.json() if resp.content else {}
@@ -96,8 +119,8 @@ def send_telegram_message(
         if isinstance(data, dict):
             desc = str(data.get("description") or "")
         desc = desc or resp.reason or resp.text[:200]
-        err = f"HTTP {resp.status_code}: {desc}"
-        logger.error("Telegram API error: %s | body=%s", err, data)
+        err = redact_token(f"HTTP {resp.status_code}: {desc}", token)
+        logger.error("Telegram API error: %s | body=%s", err, redact_token(data, token))
         raise RuntimeError(f"Telegram API lỗi — {err}")
 
     logger.info(
@@ -288,10 +311,10 @@ def format_recheck_summary(
         lines.append(f"Skipped (no result yet): {int(skipped)}")
     if retrain_ok is True:
         detail = retrain_detail or "DC + LGBM"
-        lines.append(f"Retrain: <b>OK</b> ({detail})")
+        lines.append(f"Retrain: <b>OK</b> ({_esc(detail)})")
     elif retrain_ok is False:
         detail = retrain_detail or "failed"
-        lines.append(f"Retrain: <b>FAIL</b> — {detail}")
+        lines.append(f"Retrain: <b>FAIL</b> — {_esc(detail)}")
     elif retrain_ok is None and retrain_detail:
-        lines.append(f"Retrain: {retrain_detail}")
+        lines.append(f"Retrain: {_esc(retrain_detail)}")
     return "\n".join(lines)

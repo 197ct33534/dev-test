@@ -476,6 +476,36 @@ _SETTLED = frozenset({"WIN", "LOSS", "PUSH", "HALF_WIN", "HALF_LOSS", "VOID"})
 _WIN_LIKE = frozenset({"WIN", "HALF_WIN"})
 _LOSS_LIKE = frozenset({"LOSS", "HALF_LOSS"})
 
+# Journal (settlement_service) writes WIN/LOSS/PUSH; SettlementEngineV2 writes
+# WON/LOST/VOID. Readers normalise to the journal vocabulary — stored rows are
+# never rewritten.
+_STATUS_ALIASES: dict[str, str] = {
+    "WON": "WIN",
+    "LOST": "LOSS",
+    "LOSE": "LOSS",
+    "HALF_WON": "HALF_WIN",
+    "HALF_LOST": "HALF_LOSS",
+    "HALF_LOSE": "HALF_LOSS",
+    "PUSHED": "PUSH",
+    "REFUND": "VOID",
+    "REFUNDED": "VOID",
+}
+
+
+def normalize_settlement_status(status: Any) -> str:
+    """Map any settlement label (WIN/WON, LOSS/LOST, …) → WIN/LOSS/HALF_*/PUSH/VOID.
+
+    Unknown / pending labels are returned upper-cased unchanged.
+    """
+    key = str(status if status is not None else "").strip().upper().replace("-", "_")
+    key = key.replace(" ", "_")
+    return _STATUS_ALIASES.get(key, key)
+
+
+def normalize_status_series(statuses: pd.Series) -> pd.Series:
+    """Vectorised :func:`normalize_settlement_status` for DataFrame readers."""
+    return statuses.map(normalize_settlement_status)
+
 
 def _ev_to_percent(ev: float) -> float:
     """Normalise stored EV (fraction or already-percent) → percent points."""
@@ -538,13 +568,16 @@ def compute_performance_analytics(
 
     total_placed = int(len(df))
     settled = (
-        df.loc[df["status"].astype(str).str.upper().isin(_SETTLED)].copy()
+        df.loc[normalize_status_series(df["status"]).isin(_SETTLED)].copy()
         if not df.empty and "status" in df.columns
         else pd.DataFrame()
     )
+    if not settled.empty:
+        # Downstream helpers (e.g. journal.compute_settled_brier) expect WIN/LOSS.
+        settled["status"] = normalize_status_series(settled["status"])
 
     status_u = (
-        settled["status"].astype(str).str.upper()
+        normalize_status_series(settled["status"])
         if not settled.empty
         else pd.Series(dtype=str)
     )

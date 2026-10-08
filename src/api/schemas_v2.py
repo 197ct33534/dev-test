@@ -78,8 +78,11 @@ class PlaceBetRequest(BaseModel):
     candidates: list[BetCandidateIn] | None = None
     raw_records: list[dict[str, Any]] | None = None
     persist: bool = Field(
-        default=True,
-        description="Persist bet_snapshots when a DB session is available",
+        default=False,
+        description=(
+            "Persist bet_snapshots when a DB session is available (opt-in; "
+            "requires as_of_time within a few minutes of server time)"
+        ),
     )
 
 

@@ -6,6 +6,7 @@ does not share a ``python-telegram-bot`` Application with the polling bot.
 
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import os
@@ -19,6 +20,48 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 DEFAULT_WEBAPP_URL = "http://127.0.0.1:8000/webapp/"
+
+# Telegram global limit is ~30 msg/s per bot; stay under it.
+DEFAULT_SEND_RATE_PER_SEC = 25.0
+# Max times one message is retried after HTTP 429 ``retry_after``.
+MAX_RETRY_AFTER_ATTEMPTS = 3
+# Never sleep longer than this for a single 429 (seconds).
+MAX_RETRY_AFTER_SECONDS = 60.0
+
+
+class TelegramRateLimited(RuntimeError):
+    """HTTP 429 from the Bot API after exhausting retries."""
+
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _send_interval() -> float:
+    raw = (os.getenv("TELEGRAM_SEND_RATE") or "").strip()
+    try:
+        rate = float(raw) if raw else DEFAULT_SEND_RATE_PER_SEC
+    except ValueError:
+        rate = DEFAULT_SEND_RATE_PER_SEC
+    return 1.0 / rate if rate > 0 else 0.0
+
+
+def _redact(text: Any, token: str | None) -> str:
+    out = str(text if text is not None else "")
+    tok = (token or "").strip()
+    return out.replace(tok, "***") if tok else out
+
+
+def _retry_after_seconds(data: Any) -> float | None:
+    if not isinstance(data, Mapping):
+        return None
+    params = data.get("parameters")
+    if isinstance(params, Mapping) and params.get("retry_after") is not None:
+        try:
+            return max(0.0, float(params["retry_after"]))
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def _esc(value: Any) -> str:
@@ -158,18 +201,40 @@ async def send_telegram_message_async(
     owns = client is None
     http = client or httpx.AsyncClient(timeout=timeout)
     try:
-        resp = await http.post(url, json=payload)
-        try:
-            data = resp.json() if resp.content else {}
-        except Exception:  # noqa: BLE001
-            data = {"raw": (resp.text or "")[:500]}
-        if resp.status_code != 200 or not (isinstance(data, dict) and data.get("ok")):
-            desc = ""
-            if isinstance(data, dict):
-                desc = str(data.get("description") or "")
-            desc = desc or resp.reason_phrase or (resp.text or "")[:200]
-            raise RuntimeError(f"Telegram API lỗi — HTTP {resp.status_code}: {desc}")
-        return data if isinstance(data, dict) else {"ok": True, "result": data}
+        attempt = 0
+        while True:
+            try:
+                resp = await http.post(url, json=payload)
+            except httpx.HTTPError as exc:
+                # httpx messages can embed the request URL (contains the token).
+                raise RuntimeError(
+                    f"Telegram request error ({type(exc).__name__}): {_redact(exc, token)}"
+                ) from None
+            try:
+                data = resp.json() if resp.content else {}
+            except Exception:  # noqa: BLE001
+                data = {"raw": (resp.text or "")[:500]}
+            if resp.status_code == 429:
+                wait = _retry_after_seconds(data)
+                wait = 1.0 if wait is None else wait
+                attempt += 1
+                if attempt > MAX_RETRY_AFTER_ATTEMPTS or wait > MAX_RETRY_AFTER_SECONDS:
+                    raise TelegramRateLimited(
+                        f"Telegram API lỗi — HTTP 429: retry_after={wait}",
+                        retry_after=wait,
+                    )
+                logger.warning("Telegram 429 — sleeping %.1fs (attempt %s)", wait, attempt)
+                await asyncio.sleep(wait)
+                continue
+            if resp.status_code != 200 or not (isinstance(data, dict) and data.get("ok")):
+                desc = ""
+                if isinstance(data, dict):
+                    desc = str(data.get("description") or "")
+                desc = desc or resp.reason_phrase or (resp.text or "")[:200]
+                raise RuntimeError(
+                    _redact(f"Telegram API lỗi — HTTP {resp.status_code}: {desc}", token)
+                )
+            return data if isinstance(data, dict) else {"ok": True, "result": data}
     finally:
         if owns:
             await http.aclose()
@@ -198,9 +263,13 @@ async def broadcast_value_signal(
     sent = 0
     failed = 0
     errors: list[str] = []
+    interval = _send_interval()
 
     async with httpx.AsyncClient(timeout=20.0) as client:
-        for cid in recipients:
+        for idx, cid in enumerate(recipients):
+            if idx and interval > 0:
+                # Throttle bursts (~25 msg/s) to stay below Telegram's flood limit.
+                await asyncio.sleep(interval)
             try:
                 await send_telegram_message_async(
                     token,
@@ -212,7 +281,7 @@ async def broadcast_value_signal(
                 sent += 1
             except Exception as exc:  # noqa: BLE001
                 failed += 1
-                msg = f"{cid}: {exc}"
+                msg = f"{cid}: {_redact(exc, token)}"
                 errors.append(msg)
                 logger.warning("Telegram push failed: %s", msg)
                 err_l = str(exc).lower()

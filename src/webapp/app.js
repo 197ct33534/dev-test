@@ -12,7 +12,19 @@
     view: "bets",
     loading: false,
     perf: null,
+    // Response meta from /api/v1/value-bets (EV threshold is in percent).
+    minEvPct: 5,
+    belowThreshold: false,
+    stale: false,
   };
+
+  function thresholdLabel() {
+    // below_threshold=true → API fell back to the best picks UNDER min EV.
+    const base = state.belowThreshold
+      ? `Dưới ngưỡng EV ${state.minEvPct}% (chỉ tham khảo)`
+      : `EV ≥ ${state.minEvPct}%`;
+    return state.stale ? `${base} · ⚠ Odds cũ (chưa cập nhật)` : base;
+  }
 
   const el = {
     user: document.getElementById("user-name"),
@@ -121,7 +133,7 @@
         : "Không có kèo phù hợp bộ lọc.";
       return;
     }
-    el.status.textContent = `${list.length} kèo · EV ≥ ngưỡng`;
+    el.status.textContent = `${list.length} kèo · ${thresholdLabel()}`;
     el.bets.innerHTML = list
       .map((b, i) => {
         const reasons = (b.ai_reasons || [])
@@ -210,6 +222,10 @@
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       state.bets = data.bets || [];
+      const minEv = Number(data.min_ev_pct);
+      state.minEvPct = Number.isFinite(minEv) ? minEv : 5;
+      state.belowThreshold = Boolean(data.below_threshold);
+      state.stale = Boolean(data.stale);
       renderCards();
     } catch (err) {
       el.status.textContent = `Lỗi tải kèo: ${err.message || err}`;

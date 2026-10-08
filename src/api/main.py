@@ -11,7 +11,7 @@ from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from src.api.auth import require_telegram_webapp
+from src.api.auth import assert_auth_config_safe, is_production, require_telegram_webapp
 from src.api.routes import api_v1, router as root_router
 from src.api.routes_analytics import router as analytics_router
 from src.api.routes_v2 import api_v2
@@ -19,10 +19,28 @@ from src.data_loader import PROJECT_ROOT
 
 
 def _cors_origins() -> list[str]:
-    raw = os.getenv("CORS_ORIGINS", "*").strip()
-    if not raw or raw == "*":
+    """Allowed CORS origins from ``CORS_ORIGINS`` (comma-separated).
+
+    Unset: ``*`` for local/dev; in production only ``https://$DOMAIN`` (the
+    WebApp is served same-origin, so no wildcard is needed).
+    """
+    raw = (os.getenv("CORS_ORIGINS") or "").strip()
+    if raw == "*":
         return ["*"]
-    return [o.strip() for o in raw.split(",") if o.strip()]
+    if raw:
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    if not is_production():
+        return ["*"]
+    domain = (os.getenv("DOMAIN") or "").strip()
+    return [f"https://{domain}"] if domain else []
+
+
+def _docs_enabled() -> bool:
+    """Swagger / ReDoc / OpenAPI: on locally, off in prod unless ``ENABLE_DOCS=true``."""
+    raw = (os.getenv("ENABLE_DOCS") or "").strip().lower()
+    if raw:
+        return raw in {"1", "true", "yes", "on"}
+    return not is_production()
 
 
 def _webapp_dir() -> Path:
@@ -58,6 +76,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 def create_app() -> FastAPI:
+    # Fail fast: never serve a public deployment with auth bypassed.
+    assert_auth_config_safe()
+    docs = _docs_enabled()
     app = FastAPI(
         title="Score Value-Bet API",
         description=(
@@ -66,8 +87,9 @@ def create_app() -> FastAPI:
         ),
         version="1.0.0",
         lifespan=lifespan,
-        docs_url="/docs",
-        redoc_url="/redoc",
+        docs_url="/docs" if docs else None,
+        redoc_url="/redoc" if docs else None,
+        openapi_url="/openapi.json" if docs else None,
     )
     origins = _cors_origins()
     app.add_middleware(

@@ -1,7 +1,8 @@
 pandas>=2.0.0
 numpy>=1.24.0
 scipy>=1.10.0
-streamlit>=1.30.0
+# st.pills(required=True) needs a recent Streamlit
+streamlit>=1.40.0
 plotly>=5.18.0
 statsmodels>=0.14.0
 lightgbm>=4.0.0

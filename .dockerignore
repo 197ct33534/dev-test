@@ -33,10 +33,24 @@ htmlcov
 dist
 build
 
-# Large local artifacts already volume-mounted in compose
-# (keep models/ out of build context when present on host; compose mounts ./models)
-# Uncomment next line if you prefer always mounting models at runtime only:
-# models
+# Runtime state is volume-mounted by docker-compose (./data, ./models) —
+# never bake local DBs / pickles into the image or build context.
+data/*
+!data/.gitkeep
+models/*.pkl
+*.db
+*.sqlite
+*.log
+
+# Frontend build artefacts / deps (dashboard is built separately)
+dashboard/node_modules
+dashboard/dist
+**/node_modules
+
+# Test caches
+.pytest_cache
+**/.pytest_cache
+.hypothesis
 
 # Agent / editor noise
 .cursor

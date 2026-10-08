@@ -3,7 +3,8 @@
 # Steps (on VPS):
 #   1. Issue cert (see DEPLOY.md)
 #   2. cp nginx/templates/ssl.conf.template.example nginx/templates/ssl.conf.template
-#   3. Optionally edit default.conf.template to redirect HTTP → HTTPS
+#   3. Set NGINX_FORCE_HTTPS=1 in .env → port 80 (default.conf) 301-redirects
+#      every request except /.well-known/acme-challenge/ to HTTPS
 #   4. docker compose up -d nginx
 #
 # Files expected:
@@ -22,6 +23,26 @@ server {
     ssl_session_cache shared:SSL:10m;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers off;
+
+    # Security headers. Telegram Mini Apps are framed by web.telegram.org, so
+    # no X-Frame-Options DENY/SAMEORIGIN — restrict framing via CSP instead.
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Content-Security-Policy "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org" always;
+
+    location /api/ {
+        limit_req zone=api_limit burst=20 nodelay;
+        proxy_pass http://web_api:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 120s;
+        proxy_connect_timeout 10s;
+        client_max_body_size 1m;
+    }
 
     location / {
         proxy_pass http://web_api:8000;

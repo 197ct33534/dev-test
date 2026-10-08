@@ -3,9 +3,27 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from typing import Any, Optional
 
 logger = logging.getLogger("src.monitoring.data_monitor")
+
+# Records kept per buffer; older entries are dropped (long-lived workers).
+DEFAULT_MAX_RECORDS = 1000
+
+
+class _RingBuffer(deque):
+    """Bounded ``deque`` that still compares equal to a plain ``list``."""
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, list):
+            return list(self) == other
+        return super().__eq__(other)
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+    __hash__ = None  # type: ignore[assignment]
 
 
 class DataMonitor:
@@ -14,11 +32,18 @@ class DataMonitor:
     Replace / extend with metrics sinks later; methods are intentionally thin.
     """
 
-    def __init__(self, *, logger_: Optional[logging.Logger] = None) -> None:
+    def __init__(
+        self,
+        *,
+        logger_: Optional[logging.Logger] = None,
+        max_records: int = DEFAULT_MAX_RECORDS,
+    ) -> None:
         self._logger = logger_ or logger
-        self.warnings: list[dict[str, Any]] = []
-        self.alerts: list[dict[str, Any]] = []
-        self.hard_gates: list[dict[str, Any]] = []
+        cap = max(1, int(max_records))
+        # Bounded: ``default_monitor`` lives for the whole worker process.
+        self.warnings: deque[dict[str, Any]] = _RingBuffer(maxlen=cap)
+        self.alerts: deque[dict[str, Any]] = _RingBuffer(maxlen=cap)
+        self.hard_gates: deque[dict[str, Any]] = _RingBuffer(maxlen=cap)
 
     def warn(self, message: str, *, code: Optional[str] = None, **context: Any) -> None:
         """Log a non-fatal data-quality warning (e.g. UNMAPPED entity)."""

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
+from src.api.auth import require_admin
 from src.api.schemas import (
     HealthOut,
     TeamImportRequest,
@@ -16,6 +18,12 @@ from src.api.schemas import (
 )
 from src.api.services import teams as teams_svc
 from src.api.services import value_bets as vb_svc
+from src.config import DEFAULT_MIN_EV
+
+logger = logging.getLogger(__name__)
+
+# Project rule: EV >= 5 %. API EV thresholds are always in **percent**.
+DEFAULT_MIN_EV_PCT = float(DEFAULT_MIN_EV) * 100.0
 
 router = APIRouter()
 api_v1 = APIRouter(prefix="/api/v1")
@@ -35,8 +43,8 @@ async def health() -> HealthOut:
 async def get_value_bets(
     min_ev: Annotated[
         float,
-        Query(description="Minimum EV in percent (default 5.0 = 5%)"),
-    ] = 5.0,
+        Query(description="Minimum EV in percent (default 5.0 = 5%; 1.0 = 1%)"),
+    ] = DEFAULT_MIN_EV_PCT,
     markets: Annotated[
         str | None,
         Query(description="Comma-separated: 1X2,AH,OU,Corners"),
@@ -78,7 +86,8 @@ async def get_team_profile(team_id: str) -> TeamProfileOut:
     "/teams/import-url",
     response_model=TeamImportResponse,
     tags=["teams"],
-    summary="Import team history from a Flashscore team URL",
+    summary="Import team history from a Flashscore team URL (admin only)",
+    dependencies=[Depends(require_admin)],
 )
 async def import_team(body: TeamImportRequest) -> TeamImportResponse:
     result = await asyncio.to_thread(

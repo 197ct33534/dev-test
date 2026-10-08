@@ -66,9 +66,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: data/epl_matches.db
-          # One shared cache key so PENDING bets / CLV survive across daily runs
-          key: epl-sqlite-${{ runner.os }}-v1
+          # actions/cache entries are immutable: a fixed key is saved once and
+          # never updated. Use a per-run key (always a miss → saved at job end)
+          # and restore the most recent previous run via the prefix, so
+          # PENDING bets / CLV carry forward run-to-run.
+          key: epl-sqlite-${{ runner.os }}-v2-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            epl-sqlite-${{ runner.os }}-v2-
             epl-sqlite-${{ runner.os }}-
 
       - name: Run auto scanner

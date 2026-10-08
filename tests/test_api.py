@@ -15,6 +15,8 @@ from src.api.main import create_app
 def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     # Local / CI: skip Telegram Mini App HMAC on /api/v1/*
     monkeypatch.setenv("TELEGRAM_AUTH_DISABLED", "true")
+    # Auth bypass is refused in prod (APP_ENV=prod / public DOMAIN).
+    monkeypatch.setenv("APP_ENV", "test")
     return TestClient(create_app())
 
 

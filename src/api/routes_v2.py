@@ -8,15 +8,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Mapping
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from src.api.auth import require_admin
 from src.api.schemas_v2 import (
     AuditPredictionOut,
     PlaceBetRequest,
@@ -24,6 +26,7 @@ from src.api.schemas_v2 import (
     ValueBetV2Out,
     ValueBetsV2Response,
 )
+from src.config import DEFAULT_MIN_EV
 from src.data.quality_monitor import HARD_GATE_CODE
 from src.db.schema_v2 import CanonicalCompetition, CanonicalMatch, RawDataLake
 from src.db.session import get_session_factory
@@ -38,6 +41,19 @@ api_v2 = APIRouter(prefix="/api/v2")
 # Concurrent pipeline pricing for the scan endpoint.
 _DEFAULT_CONCURRENCY = 8
 _MODEL_TIER_X = HARD_GATE_CODE  # "MODEL_TIER_X"
+# Project rule EV >= 5 %; API EV thresholds are in **percent**.
+DEFAULT_MIN_EV_PCT = float(DEFAULT_MIN_EV) * 100.0
+# Persisted bets must be priced "now": reject backdated / future as_of_time.
+DEFAULT_AS_OF_MAX_SKEW_SECONDS = 300
+
+
+def _as_of_max_skew() -> timedelta:
+    raw = (os.getenv("PLACE_AS_OF_MAX_SKEW_SECONDS") or "").strip()
+    try:
+        secs = int(float(raw)) if raw else DEFAULT_AS_OF_MAX_SKEW_SECONDS
+    except ValueError:
+        secs = DEFAULT_AS_OF_MAX_SKEW_SECONDS
+    return timedelta(seconds=max(0, secs))
 
 
 # ---------------------------------------------------------------------------
@@ -331,8 +347,8 @@ async def _run_place_with_session(
 async def get_value_bets_v2(
     min_ev: Annotated[
         float,
-        Query(description="Minimum EV in percent (default 3.0 = 3%)"),
-    ] = 3.0,
+        Query(description="Minimum EV in percent (default 5.0 = 5%, src.config.DEFAULT_MIN_EV)"),
+    ] = DEFAULT_MIN_EV_PCT,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
     league: Annotated[str | None, Query()] = None,
 ) -> ValueBetsV2Response:
@@ -363,7 +379,7 @@ async def get_value_bets_v2(
             limit=int(limit),
             league=league,
             scanned=0,
-            notes=f"Database unavailable: {exc}",
+            notes="Database unavailable",
         )
 
     if not fixtures:
@@ -408,11 +424,23 @@ async def get_value_bets_v2(
     "/bets/place",
     response_model=PlaceBetResponse,
     tags=["bets-v2"],
-    summary="Place paper value bets via PaperTrader",
+    summary="Place paper value bets via PaperTrader (admin only)",
+    dependencies=[Depends(require_admin)],
 )
 async def place_bets_v2(body: PlaceBetRequest) -> PlaceBetResponse:
-    """Forward WebApp payload to ``PaperTrader.execute_value_bets``."""
-    as_of = _ensure_aware(body.as_of_time or datetime.now(timezone.utc))
+    """Forward WebApp payload to ``PaperTrader.execute_value_bets``.
+
+    Admin-only (``ADMIN_TELEGRAM_IDS``). When ``persist=true`` the
+    ``as_of_time`` must be within ``PLACE_AS_OF_MAX_SKEW_SECONDS`` (default
+    300 s) of server time; backdated snapshots would corrupt the PIT journal.
+    """
+    now = datetime.now(timezone.utc)
+    as_of = _ensure_aware(body.as_of_time or now)
+    if body.persist and abs(as_of - now) > _as_of_max_skew():
+        raise HTTPException(
+            status_code=400,
+            detail="as_of_time too far from server time for a persisted bet",
+        )
     try:
         factory = None
         if body.persist:
@@ -432,8 +460,8 @@ async def place_bets_v2(body: PlaceBetRequest) -> PlaceBetResponse:
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
-        logger.exception("v2 place failed")
-        raise HTTPException(status_code=500, detail=f"Place bet failed: {exc}") from exc
+        logger.exception("v2 place failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Place bet failed") from exc
 
 
 @api_v2.get(
@@ -450,7 +478,7 @@ async def audit_prediction_v2(prediction_id: UUID) -> AuditPredictionOut:
         logger.warning("v2 audit: DB unavailable: %s", exc)
         raise HTTPException(
             status_code=503,
-            detail=f"Database unavailable: {exc}",
+            detail="Database unavailable",
         ) from exc
 
     try:
@@ -466,8 +494,8 @@ async def audit_prediction_v2(prediction_id: UUID) -> AuditPredictionOut:
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
-        logger.exception("v2 audit failed for %s", prediction_id)
-        raise HTTPException(status_code=500, detail=f"Audit failed: {exc}") from exc
+        logger.exception("v2 audit failed for %s: %s", prediction_id, exc)
+        raise HTTPException(status_code=500, detail="Audit failed") from exc
 
 
 __all__ = ["api_v2", "fetch_upcoming_matches"]

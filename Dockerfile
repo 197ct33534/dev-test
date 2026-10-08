@@ -25,4 +25,4 @@ USER appuser
 EXPOSE 8000
 
 # Compose overrides CMD for web_api / workers / telegram_bot
-CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=*"]

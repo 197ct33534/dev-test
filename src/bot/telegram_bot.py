@@ -61,6 +61,10 @@ logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
     level=logging.INFO,
 )
+# httpx/httpcore log every request URL at INFO — Bot API URLs embed the
+# token (``/bot<TOKEN>/getUpdates``), so keep them at WARNING.
+for _noisy in ("httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 logger = logging.getLogger("telegram_bot")
 
 DEFAULT_WEBAPP_URL = "http://127.0.0.1:8000/webapp/"

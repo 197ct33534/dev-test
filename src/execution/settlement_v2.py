@@ -52,8 +52,49 @@ _SERVICE_TO_V2: dict[str, SettleStatusV2] = {
 }
 
 _FINISHED_MATCH_STATUSES = frozenset(
-    {"FINISHED", "FT", "COMPLETE", "COMPLETED", "SETTLED", "CLOSED"}
+    {"FINISHED", "FT", "FULL_TIME", "COMPLETE", "COMPLETED", "SETTLED", "CLOSED"}
 )
+
+# Matches that will not produce a valid result → bets are voided (stake back).
+_VOID_MATCH_STATUSES = frozenset(
+    {
+        "POSTPONED",
+        "PST",
+        "ABANDONED",
+        "ABD",
+        "CANCELLED",
+        "CANCELED",
+        "CANC",
+        "VOID",
+    }
+)
+
+_CORNER_MARKETS = frozenset({"CORNERS", "CORNER"})
+
+# Optional attribute names for FT corner counts on ``CanonicalMatch`` (the
+# current schema has none — Corners bets stay PENDING until it does).
+_HOME_CORNER_ATTRS = ("home_corners", "ft_home_corners", "hc")
+_AWAY_CORNER_ATTRS = ("away_corners", "ft_away_corners", "ac")
+
+
+def _match_corners(match: Any) -> tuple[int | None, int | None]:
+    """Return (home_corners, away_corners) when the match row exposes them."""
+
+    def _first(attrs: tuple[str, ...]) -> int | None:
+        for name in attrs:
+            val = getattr(match, name, None)
+            if val is None:
+                continue
+            try:
+                f = float(val)
+            except (TypeError, ValueError):
+                continue
+            if f != f:  # NaN
+                continue
+            return int(f)
+        return None
+
+    return _first(_HOME_CORNER_ATTRS), _first(_AWAY_CORNER_ATTRS)
 
 # Window around kickoff to accept a Pinnacle closing observation.
 _CLOSING_WINDOW = timedelta(minutes=30)
@@ -81,9 +122,71 @@ def map_settle_status(service_status: str) -> SettleStatusV2:
     raise ValueError(f"Unknown settlement status: {service_status!r}")
 
 
-def compute_clv_value(taken_odds: float, closing_odds: float) -> float:
-    """CLV = ``log(taken_odds / closing_odds)`` (NaN when inputs invalid)."""
-    return QuantMetrics.closing_line_value(taken_odds, closing_odds)
+def compute_clv_value(
+    taken_odds: float,
+    closing_odds: float,
+    *,
+    closing_market_odds: Mapping[str, float] | list[float] | None = None,
+) -> float:
+    """CLV = ``log(taken_odds / closing_fair_odds)`` (NaN when inputs invalid).
+
+    When the full closing market (all outcomes) is given the closing price is
+    de-vigged first (canonical :meth:`QuantMetrics.closing_line_value`).
+    """
+    return QuantMetrics.closing_line_value(
+        taken_odds, closing_odds, closing_market_odds=closing_market_odds
+    )
+
+
+def _extract_closing_market_from_payload(
+    payload: Mapping[str, Any] | None,
+    *,
+    market_type: str,
+    selection: str,
+) -> list[float] | None:
+    """All outcome prices of the bet's closing market (for de-vig), else ``None``.
+
+    1X2 → H/D/A; OU → Over/Under; AH → Home/Away. Needs ≥ 2 valid prices.
+    """
+    if not payload:
+        return None
+    odds_map: Any = payload.get("odds")
+    if not isinstance(odds_map, Mapping):
+        odds_map = payload.get("markets") or payload.get("prices") or payload
+    if not isinstance(odds_map, Mapping):
+        return None
+    mkt = str(market_type or "").strip().upper()
+    nested = odds_map.get(mkt) or odds_map.get(mkt.lower()) or odds_map.get("1X2")
+    if isinstance(nested, Mapping):
+        odds_map = nested
+
+    sel_l = str(selection or "").strip().lower()
+    if "over" in sel_l or "under" in sel_l:
+        groups: tuple[tuple[str, ...], ...] = (("over", "Over", "O"), ("under", "Under", "U"))
+    elif mkt in {"AH", "ASIAN", "ASIAN HANDICAP"}:
+        groups = (_SELECTION_ODDS_KEYS["home"], _SELECTION_ODDS_KEYS["away"])
+    else:
+        groups = (
+            _SELECTION_ODDS_KEYS["home"],
+            _SELECTION_ODDS_KEYS["draw"],
+            _SELECTION_ODDS_KEYS["away"],
+        )
+
+    prices: list[float] = []
+    for keys in groups:
+        for k in keys:
+            if k not in odds_map:
+                continue
+            try:
+                v = float(odds_map[k])
+            except (TypeError, ValueError):
+                continue
+            if v > 1.0:
+                prices.append(v)
+                break
+        else:
+            return None  # incomplete market → cannot de-vig
+    return prices if len(prices) >= 2 else None
 
 
 def settle_market(
@@ -95,6 +198,8 @@ def settle_market(
     ft_home: int,
     ft_away: int,
     line: float | None = None,
+    home_corners: int | None = None,
+    away_corners: int | None = None,
 ) -> tuple[SettleStatusV2, float, float]:
     """Settle one bet → ``(status_v2, pnl, payout)``.
 
@@ -130,6 +235,8 @@ def settle_market(
         fthg=fthg,
         ftag=ftag,
         ftr=ftr,
+        hc=home_corners,
+        ac=away_corners,
     )
     return map_settle_status(service_status), float(pnl), float(payout)
 
@@ -233,6 +340,8 @@ class SettlementEngineV2:
         pending = await self._load_pending_with_match()
         details: list[dict[str, Any]] = []
         settled_n = skipped = 0
+        voided = 0
+        pending_no_corners = 0
         status_counts: dict[str, int] = {
             "WON": 0,
             "LOST": 0,
@@ -250,17 +359,59 @@ class SettlementEngineV2:
 
             ft_h = match.ft_home_goals
             ft_a = match.ft_away_goals
-            finished = (
-                str(match.status or "").strip().upper() in _FINISHED_MATCH_STATUSES
-                or (ft_h is not None and ft_a is not None)
-            )
-            if not finished or ft_h is None or ft_a is None:
+            match_status = str(match.status or "").strip().upper()
+
+            if match_status in _VOID_MATCH_STATUSES:
+                # Postponed / abandoned / cancelled → void, stake returned.
+                bet.status = "VOID"
+                bet.pnl = 0.0
+                bet.clv_value = None
+                bet.settled_at = as_of
+                settled_n += 1
+                voided += 1
+                status_counts["VOID"] = status_counts.get("VOID", 0) + 1
+                details.append(
+                    {
+                        "bet_id": bet.bet_id,
+                        "canonical_match_id": match.canonical_match_id,
+                        "market_type": bet.market_type,
+                        "selection": bet.selection,
+                        "status": "VOID",
+                        "pnl": 0.0,
+                        "clv_value": None,
+                        "closing_odds": None,
+                        "score": None,
+                        "ht_score": None,
+                        "void_reason": match_status,
+                    }
+                )
+                continue
+
+            # Require an explicit finished status: goals on a LIVE row are
+            # partial scores and must never settle a bet.
+            if (
+                match_status not in _FINISHED_MATCH_STATUSES
+                or ft_h is None
+                or ft_a is None
+            ):
                 skipped += 1
                 continue
 
             stake = float(bet.final_stake_amount or 0.0)
             odds = float(bet.taken_odds or 0.0)
             if stake <= 0.0 or odds <= 1.0:
+                skipped += 1
+                continue
+
+            hc, ac = _match_corners(match)
+            is_corners = str(bet.market_type or "").strip().upper() in _CORNER_MARKETS
+            if is_corners and (hc is None or ac is None):
+                logger.warning(
+                    "Corners bet %s left PENDING: match %s has no corner counts",
+                    bet.bet_id,
+                    match.canonical_match_id,
+                )
+                pending_no_corners += 1
                 skipped += 1
                 continue
 
@@ -272,16 +423,21 @@ class SettlementEngineV2:
                     stake=stake,
                     ft_home=int(ft_h),
                     ft_away=int(ft_a),
+                    home_corners=hc,
+                    away_corners=ac,
                 )
             except ValueError as exc:
                 logger.warning("Skip bet %s: %s", bet.bet_id, exc)
                 skipped += 1
                 continue
 
-            closing = await self._resolve_closing_odds(bet, match)
+            closing, closing_market = await self._resolve_closing_quote(bet, match)
             clv: float | None = None
             if closing is not None and closing > 0.0 and odds > 0.0:
-                clv_raw = compute_clv_value(odds, closing)
+                # De-vigged close when the full closing market is known.
+                clv_raw = compute_clv_value(
+                    odds, closing, closing_market_odds=closing_market
+                )
                 clv = None if (isinstance(clv_raw, float) and math.isnan(clv_raw)) else clv_raw
                 bet.sharp_closing_odds = float(closing)
 
@@ -317,6 +473,8 @@ class SettlementEngineV2:
         return {
             "settled": settled_n,
             "skipped": skipped,
+            "voided": voided,
+            "pending_no_corners": pending_no_corners,
             "pnl": pnl_sum,
             "by_status": status_counts,
             "details": details,
@@ -353,14 +511,27 @@ class SettlementEngineV2:
         bet: BetSnapshot,
         match: CanonicalMatch,
     ) -> float | None:
+        price, _market = await self._resolve_closing_quote(bet, match)
+        return price
+
+    async def _resolve_closing_quote(
+        self,
+        bet: BetSnapshot,
+        match: CanonicalMatch,
+    ) -> tuple[float | None, list[float] | None]:
+        """(closing price for the selection, full closing market or ``None``)."""
         if self.closing_odds_lookup is not None:
-            return self.closing_odds_lookup(
-                match.canonical_match_id,
-                str(bet.market_type),
-                str(bet.selection),
-                _ensure_aware(match.kickoff_utc),
+            # Injected lookup returns only the selection price (no de-vig).
+            return (
+                self.closing_odds_lookup(
+                    match.canonical_match_id,
+                    str(bet.market_type),
+                    str(bet.selection),
+                    _ensure_aware(match.kickoff_utc),
+                ),
+                None,
             )
-        return await self._pinnacle_closing_odds(
+        return await self._pinnacle_closing_quote(
             match.canonical_match_id,
             market_type=str(bet.market_type),
             selection=str(bet.selection),
@@ -375,6 +546,23 @@ class SettlementEngineV2:
         selection: str,
         kickoff_utc: datetime,
     ) -> float | None:
+        """Nearest Pinnacle closing price (selection only) — see ``_pinnacle_closing_quote``."""
+        price, _market = await self._pinnacle_closing_quote(
+            canonical_match_id,
+            market_type=market_type,
+            selection=selection,
+            kickoff_utc=kickoff_utc,
+        )
+        return price
+
+    async def _pinnacle_closing_quote(
+        self,
+        canonical_match_id: UUID,
+        *,
+        market_type: str,
+        selection: str,
+        kickoff_utc: datetime,
+    ) -> tuple[float | None, list[float] | None]:
         """Nearest Pinnacle observation at/before kickoff within ``closing_window``."""
         lo = kickoff_utc - self.closing_window
         hi = kickoff_utc + self.closing_window
@@ -408,6 +596,7 @@ class SettlementEngineV2:
             rows = (await self.session.execute(stmt_all)).scalars().all()
 
         best: float | None = None
+        best_market: list[float] | None = None
         best_delta: float | None = None
         for row in rows:
             obs = row.observed_at
@@ -425,7 +614,12 @@ class SettlementEngineV2:
             if best_delta is None or delta < best_delta:
                 best_delta = delta
                 best = price
-        return best
+                best_market = _extract_closing_market_from_payload(
+                    row.payload,
+                    market_type=market_type,
+                    selection=selection,
+                )
+        return best, best_market
 
 
 # Re-export AH/OU helpers for tests that want direct access.

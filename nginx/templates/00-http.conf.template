@@ -1,0 +1,15 @@
+# http-level settings shared by default.conf + ssl.conf (loaded first: "00-").
+# Rendered by the nginx image entrypoint (envsubst only replaces variables that
+# are set in the container env, so nginx's own $vars are left intact).
+
+server_tokens off;
+
+# /api rate limit: per client IP, 10 req/s with a small burst (see locations).
+limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
+limit_req_status 429;
+
+# NGINX_FORCE_HTTPS=1 (compose env) → port 80 redirects to HTTPS except ACME.
+# Enable only after certificates exist and ssl.conf.template is in place.
+map $host $force_https {
+    default "${NGINX_FORCE_HTTPS}";
+}

@@ -130,6 +130,14 @@ class ValueBetsResponse(BaseModel):
     comp_id: str | None = None
     below_threshold: bool = False
     odds_missing: bool = False
+    stale: bool = Field(
+        default=False,
+        description=(
+            "True when odds came from an upcoming-fixtures cache older than "
+            "FIXTURES_MAX_AGE_MINUTES because the network refresh failed"
+        ),
+    )
+    stale_leagues: list[str] = Field(default_factory=list)
     source: str = "scan"
     notes: str | None = None
 
