@@ -344,13 +344,17 @@ def scan_top_value_bets(
     odds_family: str = "B365",
     filter_vn_window: bool = True,
     now: Any | None = None,
+    include_started: bool = False,
 ) -> TopScanResult:
     """Scan fixtures for Top-N value bets (EV descending).
 
     Blends Ensemble ``w_ML`` on 1X2 when ``ml_model`` is provided. Filters to
-    the VN today+tomorrow window by default. When fewer than ``top_n`` bets
-    meet ``min_ev``, ``fallback_bets`` holds the best-EV ranking (may be below
-    threshold) and ``below_threshold`` is True when no EV≥threshold bets exist.
+    the VN today+tomorrow window by default; with ``filter_vn_window`` the
+    window starts at VN midnight, so matches whose kickoff is ``<= now`` are
+    dropped unless ``include_started=True`` (naive ``now`` = UTC). When fewer
+    than ``top_n`` bets meet ``min_ev``, ``fallback_bets`` holds the best-EV
+    ranking (may be below threshold) and ``below_threshold`` is True when no
+    EV≥threshold bets exist.
     """
     from src.timezone_utils import get_vn_today_tomorrow_window
 
@@ -371,7 +375,12 @@ def scan_top_value_bets(
 
     fx = fixtures.copy()
     if filter_vn_window and "Kickoff" in fx.columns:
-        fx = filter_matches_today_tomorrow(fx, kickoff_col="Kickoff", now=now)
+        fx = filter_matches_today_tomorrow(
+            fx,
+            kickoff_col="Kickoff",
+            now=now,
+            exclude_started=not include_started,
+        )
 
     markets = tuple(allowed_markets) or DEFAULT_ALLOWED_MARKETS
     include_ou = "OU" in markets
@@ -436,17 +445,20 @@ def scan_top_value_bets(
             odds_missing=True,
         )
 
-    # Recompute capped Kelly for all rows (recommend_upcoming uses uncapped fractional).
+    # Re-apply this scan's stake cap. Never raise the recommender's own Kelly:
+    # it already carries the new-team cap and the exact push-aware OU/AH sizing.
     kelly_vals = []
     for _, r in recs.iterrows():
-        kelly_vals.append(
-            capped_kelly_fraction(
-                float(r["p_model"]),
-                float(r["bookmaker_odds"]),
-                kelly_fraction=kelly_fraction,
-                max_stake_pct=max_stake_pct,
-            )
+        capped = capped_kelly_fraction(
+            float(r["p_model"]),
+            float(r["bookmaker_odds"]),
+            kelly_fraction=kelly_fraction,
+            max_stake_pct=max_stake_pct,
         )
+        existing = r.get("kelly_fraction")
+        if existing is not None and pd.notna(existing):
+            capped = min(capped, float(existing))
+        kelly_vals.append(capped)
     recs = recs.copy()
     recs["kelly_fraction"] = kelly_vals
     recs["kelly_pct"] = recs["kelly_fraction"] * 100.0

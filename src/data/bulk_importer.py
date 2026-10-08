@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from typing import Any, Optional
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from sqlalchemy import select
@@ -28,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 SOURCE_TYPE = "football-data"
 DEFAULT_BATCH_SIZE = 100
+# football-data.co.uk publishes Date/Time as UK local kickoff time.
+FOOTBALL_DATA_TZ = ZoneInfo("Europe/London")
+# Same fixture (competition + home + away) within this window is one match.
+MATCH_DEDUP_TOLERANCE = timedelta(days=1)
 USER_AGENT = "score-quant-engine/1.0 (+bulk-importer; research)"
 
 # football-data.co.uk division code → canonical display name.
@@ -52,6 +59,7 @@ class ImportStats:
     rows_read: int = 0
     rows_skipped: int = 0
     raw_inserted: int = 0
+    raw_duplicates: int = 0
     matches_upserted: int = 0
     matches_updated: int = 0
     competition_id: Optional[str] = None
@@ -62,6 +70,7 @@ class ImportStats:
             "rows_read": self.rows_read,
             "rows_skipped": self.rows_skipped,
             "raw_inserted": self.raw_inserted,
+            "raw_duplicates": self.raw_duplicates,
             "matches_upserted": self.matches_upserted,
             "matches_updated": self.matches_updated,
             "competition_id": self.competition_id,
@@ -135,6 +144,7 @@ class BulkFootballDataImporter:
 
         pending_raw: list[RawDataLake] = []
         pending_flush = 0
+        seen_raw: set[tuple[str, str]] = set()
 
         for idx, row in df.iterrows():
             try:
@@ -181,10 +191,19 @@ class BulkFootballDataImporter:
             else:
                 stats.matches_updated += 1
 
+            source_entity_id = self._source_entity_id(code, home_name, away_name, kickoff)
+            digest = _payload_hash(payload)
+            if (source_entity_id, digest) in seen_raw or await self._raw_exists(
+                source_entity_id, digest
+            ):
+                stats.raw_duplicates += 1
+                continue
+            seen_raw.add((source_entity_id, digest))
+
             raw = RawDataLake(
                 source=SOURCE_TYPE,
                 entity_type="match",
-                source_entity_id=self._source_entity_id(code, home_name, away_name, kickoff),
+                source_entity_id=source_entity_id,
                 payload=payload,
                 source_timestamp=kickoff,
                 observed_at=kickoff,  # PIT-safe: no post-kickoff leak for history
@@ -315,6 +334,56 @@ class BulkFootballDataImporter:
         )
         await self.session.flush()
 
+    async def _raw_exists(self, source_entity_id: str, digest: str) -> bool:
+        """True when an identical payload is already stored for this source key."""
+        rows = (
+            await self.session.execute(
+                select(RawDataLake.payload).where(
+                    RawDataLake.source == SOURCE_TYPE,
+                    RawDataLake.entity_type == "match",
+                    RawDataLake.source_entity_id == source_entity_id,
+                )
+            )
+        ).scalars().all()
+        return any(_payload_hash(existing) == digest for existing in rows)
+
+    async def _find_existing_match(
+        self,
+        *,
+        competition_id: Any,
+        home_team_id: Any,
+        away_team_id: Any,
+        kickoff_utc: datetime,
+    ) -> Optional[CanonicalMatch]:
+        """Same competition + teams with kickoff within :data:`MATCH_DEDUP_TOLERANCE`.
+
+        Tolerates timezone corrections / kickoff-time edits between imports;
+        picks the candidate closest to ``kickoff_utc``.
+        """
+        lo = kickoff_utc - MATCH_DEDUP_TOLERANCE
+        hi = kickoff_utc + MATCH_DEDUP_TOLERANCE
+        candidates = (
+            await self.session.execute(
+                select(CanonicalMatch).where(
+                    CanonicalMatch.competition_id == competition_id,
+                    CanonicalMatch.home_team_id == home_team_id,
+                    CanonicalMatch.away_team_id == away_team_id,
+                    CanonicalMatch.kickoff_utc >= lo,
+                    CanonicalMatch.kickoff_utc <= hi,
+                )
+            )
+        ).scalars().all()
+        if not candidates:
+            return None
+
+        def _distance(m: CanonicalMatch) -> float:
+            k = m.kickoff_utc
+            if k.tzinfo is None:
+                k = k.replace(tzinfo=timezone.utc)
+            return abs((k - kickoff_utc).total_seconds())
+
+        return min(candidates, key=_distance)
+
     async def _upsert_finished_match(
         self,
         *,
@@ -326,16 +395,12 @@ class BulkFootballDataImporter:
         payload: dict[str, Any],
     ) -> tuple[CanonicalMatch, bool]:
         """Insert or update a finished match; return ``(match, created)``."""
-        existing = (
-            await self.session.execute(
-                select(CanonicalMatch).where(
-                    CanonicalMatch.competition_id == competition_id,
-                    CanonicalMatch.home_team_id == home_team_id,
-                    CanonicalMatch.away_team_id == away_team_id,
-                    CanonicalMatch.kickoff_utc == kickoff_utc,
-                )
-            )
-        ).scalar_one_or_none()
+        existing = await self._find_existing_match(
+            competition_id=competition_id,
+            home_team_id=home_team_id,
+            away_team_id=away_team_id,
+            kickoff_utc=kickoff_utc,
+        )
 
         ft_h = _as_optional_int(payload.get("FTHG"))
         ft_a = _as_optional_int(payload.get("FTAG"))
@@ -349,6 +414,8 @@ class BulkFootballDataImporter:
             existing.ht_home_goals = ht_h
             existing.ht_away_goals = ht_a
             existing.status = status
+            # Correct kickoffs stored by older imports (UK wall clock as UTC).
+            existing.kickoff_utc = kickoff_utc
             if season_id and not existing.season_id:
                 existing.season_id = season_id
             await self.session.flush()
@@ -460,10 +527,10 @@ def _as_optional_int(value: Any) -> Optional[int]:
 
 
 def _parse_kickoff(date_val: Any, time_val: Any) -> Optional[datetime]:
-    """Parse football-data ``Date`` (+ optional ``Time``) as UTC-naive → aware UTC.
+    """Parse football-data ``Date`` (+ optional ``Time``) into aware UTC.
 
-    Football-Data dates are local kickoff dates without a reliable TZ; we store
-    them as UTC wall-clock (common for historical FD imports).
+    Football-Data publishes kickoff ``Date``/``Time`` in UK local time, so the
+    wall clock is localized to ``Europe/London`` (GMT/BST) and converted to UTC.
     """
     date_str = _as_str(date_val)
     if not date_str:
@@ -482,14 +549,25 @@ def _parse_kickoff(date_val: Any, time_val: Any) -> Optional[datetime]:
         except (TypeError, ValueError, IndexError):
             logger.debug("Could not parse Time %r; using default 15:00", time_str)
 
-    return datetime(
-        int(parsed_date.year),
-        int(parsed_date.month),
-        int(parsed_date.day),
-        hour,
-        minute,
-        tzinfo=timezone.utc,
-    )
+    try:
+        local = datetime(
+            int(parsed_date.year),
+            int(parsed_date.month),
+            int(parsed_date.day),
+            hour,
+            minute,
+            tzinfo=FOOTBALL_DATA_TZ,
+        )
+    except ValueError:
+        logger.debug("Invalid kickoff %s %s:%s", date_str, hour, minute)
+        return None
+    return local.astimezone(timezone.utc)
+
+
+def _payload_hash(payload: Any) -> str:
+    """Stable SHA-256 of a JSON payload (key order independent)."""
+    text = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _row_to_payload(row: pd.Series) -> dict[str, Any]:

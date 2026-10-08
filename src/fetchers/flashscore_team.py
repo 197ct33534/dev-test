@@ -109,6 +109,7 @@ def _fetch_text_retry(
             return _fetch_text(
                 url,
                 timeout=timeout,
+                retries=1,  # this wrapper owns the retry loop
                 referer="https://www.flashscore.com/",
                 extra_headers={
                     "Accept": "text/html,*/*",
@@ -659,31 +660,71 @@ def matches_to_legacy_frames(
     return frames
 
 
-def _existing_match_keys(conn: Any) -> set[tuple[str, str, str]]:
+_SQL_IN_CHUNK = 500
+
+
+def _chunks(values: Sequence[str], size: int = _SQL_IN_CHUNK) -> list[list[str]]:
+    vals = list(values)
+    return [vals[i : i + size] for i in range(0, len(vals), size)]
+
+
+def _existing_match_keys(
+    conn: Any,
+    dates: Sequence[str] | None = None,
+) -> set[tuple[str, str, str]]:
     """Set of ``(match_date, home_canon, away_canon)`` already in DB (cross-comp).
 
     Uses stored ``canonical_name`` values as-is (no live alias remap). Re-applying
     ``canonical_team_name`` would map legacy ``Barcelona`` rows to ``ES_BARCELONA``
     and incorrectly block fresh team-feed upserts under stable codes.
+
+    When ``dates`` (``YYYY-MM-DD``) is given, only those match days are loaded
+    instead of the whole table.
     """
-    rows = conn.execute(
-        """
+    base = """
         SELECT m.match_date, th.canonical_name, ta.canonical_name
         FROM matches m
         JOIN teams th ON th.team_id = m.home_team_id
         JOIN teams ta ON ta.team_id = m.away_team_id
         """
-    ).fetchall()
+    rows: list[Any] = []
+    if dates is None:
+        rows = conn.execute(base).fetchall()
+    else:
+        uniq = sorted({str(d)[:10] for d in dates if d})
+        for chunk in _chunks(uniq):
+            marks = ",".join("?" for _ in chunk)
+            rows.extend(
+                conn.execute(
+                    base + f" WHERE substr(m.match_date, 1, 10) IN ({marks})",
+                    chunk,
+                ).fetchall()
+            )
     keys: set[tuple[str, str, str]] = set()
     for date_s, home, away in rows:
         keys.add((str(date_s)[:10], str(home), str(away)))
     return keys
 
 
-def _existing_event_match_ids(conn: Any) -> set[str]:
-    """Match ids that already embed a Flashscore event id (``COMP|eventId``)."""
-    rows = conn.execute("SELECT match_id FROM matches").fetchall()
-    return {str(r[0]) for r in rows}
+def _existing_event_match_ids(
+    conn: Any,
+    match_ids: Sequence[str] | None = None,
+) -> set[str]:
+    """Match ids already stored (``COMP|eventId`` or date-key ids).
+
+    When ``match_ids`` is given, only those candidates are looked up.
+    """
+    if match_ids is None:
+        rows = conn.execute("SELECT match_id FROM matches").fetchall()
+        return {str(r[0]) for r in rows}
+    out: set[str] = set()
+    for chunk in _chunks(sorted({str(m) for m in match_ids if m})):
+        marks = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT match_id FROM matches WHERE match_id IN ({marks})", chunk
+        ).fetchall()
+        out.update(str(r[0]) for r in rows)
+    return out
 
 
 def persist_team_matches_to_global_db(
@@ -747,8 +788,32 @@ def persist_team_matches_to_global_db(
 
     conn = connect_global_db(path, init=True)
     try:
-        existing_keys = _existing_match_keys(conn) if skip_cross_comp_duplicates else set()
-        existing_ids = _existing_event_match_ids(conn)
+        # Only load DB rows relevant to this batch (dates / candidate ids).
+        batch_dates: set[str] = set()
+        candidate_ids: set[str] = set()
+        for comp_c, df_c in frames.items():
+            for _, row_c in df_c.iterrows():
+                d_s = pd.Timestamp(row_c["Date"]).strftime("%Y-%m-%d")
+                batch_dates.add(d_s)
+                candidate_ids.add(
+                    build_global_match_id(
+                        comp_c,
+                        d_s,
+                        canonical_team_name(str(row_c["HomeTeam"])),
+                        canonical_team_name(str(row_c["AwayTeam"])),
+                    )
+                )
+                eid_c = str(
+                    row_c.get("Match_ID") or row_c.get("FlashscoreEventId") or ""
+                ).strip()
+                if eid_c:
+                    candidate_ids.add(f"{comp_c}|{eid_c}")
+        existing_keys = (
+            _existing_match_keys(conn, dates=sorted(batch_dates))
+            if skip_cross_comp_duplicates
+            else set()
+        )
+        existing_ids = _existing_event_match_ids(conn, match_ids=sorted(candidate_ids))
 
         for comp, df in frames.items():
             upsert_competition(
@@ -796,7 +861,7 @@ def persist_team_matches_to_global_db(
                     away_score=int(row["FTAG"]),
                     extras={
                         "FTR": row.get("FTR"),
-                        "fotmob_match_id": eid or None,
+                        "flashscore_event_id": eid or None,
                     },
                 )
                 existing_keys.add(key)

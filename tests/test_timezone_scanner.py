@@ -440,3 +440,63 @@ def test_merge_top_scan_results_ranks_across_leagues() -> None:
     assert list(merged.display_bets["ev"]) == sorted(
         merged.display_bets["ev"], reverse=True
     )
+
+
+def test_naive_now_is_treated_as_utc() -> None:
+    """Naive ``now`` follows the module-wide naive-UTC convention."""
+    aware = datetime(2026, 3, 15, 0, 30, tzinfo=VN_TZ)  # = 2026-03-14 17:30 UTC
+    naive_utc = datetime(2026, 3, 14, 17, 30)
+    assert get_vn_today_tomorrow_window(now=naive_utc) == get_vn_today_tomorrow_window(
+        now=aware
+    )
+    # Same wall-clock digits as naive would previously have been read as VN time.
+    start, _ = get_vn_today_tomorrow_window(now=datetime(2026, 3, 15, 0, 30))
+    # 00:30 UTC = 07:30 VN on Mar 15 -> window starts Mar 15 00:00 VN = Mar 14 17:00 UTC
+    assert start == pd.Timestamp("2026-03-14 17:00:00")
+    start2, _ = get_vn_today_tomorrow_window(now=datetime(2026, 3, 14, 16, 0))
+    # 16:00 UTC Mar 14 = 23:00 VN Mar 14 -> window starts Mar 13 17:00 UTC
+    assert start2 == pd.Timestamp("2026-03-13 17:00:00")
+
+
+def test_filter_exclude_started_drops_past_kickoffs() -> None:
+    now_vn = datetime(2026, 9, 22, 12, 0, tzinfo=VN_TZ)  # 05:00 UTC
+    df = pd.DataFrame(
+        {
+            "Kickoff": pd.to_datetime(
+                ["2026-09-21 18:00:00", "2026-09-22 05:00:00", "2026-09-22 06:00:00"]
+            ),
+            "HomeTeam": ["Early", "Now", "Later"],
+            "AwayTeam": ["x", "y", "z"],
+        }
+    )
+    kept_all = filter_matches_today_tomorrow(df, now=now_vn)
+    assert list(kept_all["HomeTeam"]) == ["Early", "Now", "Later"]
+    kept = filter_matches_today_tomorrow(df, now=now_vn, exclude_started=True)
+    assert list(kept["HomeTeam"]) == ["Later"]
+
+
+def test_scan_excludes_started_matches(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src import scanner as scanner_mod
+
+    monkeypatch.setattr(
+        scanner_mod, "recommend_upcoming", lambda *a, **k: pd.DataFrame()
+    )
+    now_vn = datetime(2026, 9, 22, 20, 0, tzinfo=VN_TZ)  # 13:00 UTC
+    fixtures = pd.DataFrame(
+        [
+            {"Kickoff": pd.Timestamp("2026-09-22 02:00:00"), "HomeTeam": "Done", "AwayTeam": "X"},
+            {"Kickoff": pd.Timestamp("2026-09-22 19:00:00"), "HomeTeam": "Soon", "AwayTeam": "Y"},
+        ]
+    )
+    result = scan_top_value_bets(
+        fixtures, _ToyDC(), now=now_vn, filter_vn_window=True  # type: ignore[arg-type]
+    )
+    assert list(result.display_bets["home"]) == ["Soon"]
+    with_started = scan_top_value_bets(
+        fixtures,
+        _ToyDC(),  # type: ignore[arg-type]
+        now=now_vn,
+        filter_vn_window=True,
+        include_started=True,
+    )
+    assert set(with_started.display_bets["home"]) == {"Done", "Soon"}

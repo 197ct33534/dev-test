@@ -17,11 +17,14 @@ matched against refreshed historical rows in the league SQLite DB
 
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Iterator, Literal, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -34,7 +37,13 @@ from src.config import (
 )
 from src.data_loader import DEFAULT_DB_PATH
 
+logger = logging.getLogger(__name__)
+
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+
+# SQLite contention: wait up to 30 s on locks instead of failing immediately.
+SQLITE_TIMEOUT_S = 30.0
+SQLITE_BUSY_TIMEOUT_MS = 30000
 
 LIVE_BETS_TABLE = "live_bets"
 PAPER_TRADES_VIEW = "paper_trades"
@@ -114,11 +123,136 @@ def _match_day_key(match_date: Any) -> str | None:
         return text[:10] if len(text) >= 10 else text or None
 
 
+_ENSURED_PATHS: set[str] = set()
+_ENSURE_LOCK = threading.Lock()
+
+PENDING_UNIQUE_INDEX = "idx_live_bets_pending_unique"
+
+_JOURNAL_HISTORY_SQL = (
+    f"CREATE VIEW {JOURNAL_HISTORY_VIEW} AS "
+    f"SELECT * FROM {LIVE_BETS_TABLE} "
+    "WHERE status IN ('WIN', 'LOSS', 'PUSH', 'HALF_WIN', 'HALF_LOSS', 'VOID')"
+)
+
+
+def _path_key(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path)
+
+
+def _apply_pragmas(conn: sqlite3.Connection, *, wal: bool = False) -> None:
+    """Per-connection busy timeout; optionally switch the file to WAL."""
+    try:
+        conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        if wal:
+            conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.Error as exc:  # pragma: no cover - best effort
+        logger.warning("journal PRAGMA failed: %s", exc)
+
+
+@contextmanager
+def _connect(
+    path: Path | str, *, autocommit: bool = False
+) -> Iterator[sqlite3.Connection]:
+    """Open a journal connection that is always closed on exit.
+
+    ``sqlite3.connect`` used as a context manager only commits/rolls back; it
+    never closes the handle. This helper commits on success, rolls back on
+    error and closes in all cases. ``autocommit=True`` opens with
+    ``isolation_level=None`` so callers can issue ``BEGIN IMMEDIATE`` manually.
+    """
+    if autocommit:
+        conn = sqlite3.connect(path, timeout=SQLITE_TIMEOUT_S, isolation_level=None)
+    else:
+        conn = sqlite3.connect(path, timeout=SQLITE_TIMEOUT_S)
+    try:
+        _apply_pragmas(conn)
+        if autocommit:
+            yield conn
+        else:
+            with conn:
+                yield conn
+    finally:
+        conn.close()
+
+
+def _normalize_sql(sql: str | None) -> str:
+    return " ".join(str(sql or "").split()).lower()
+
+
+def _ensure_journal_history_view(conn: sqlite3.Connection) -> None:
+    """(Re)create ``journal_history`` only when missing or its SQL differs."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='view' AND name=?",
+        (JOURNAL_HISTORY_VIEW,),
+    ).fetchone()
+    if row is not None and _normalize_sql(row[0]) == _normalize_sql(
+        _JOURNAL_HISTORY_SQL
+    ):
+        return
+    # Recreate so HALF_* / VOID are included after upgrades.
+    conn.execute(f"DROP VIEW IF EXISTS {JOURNAL_HISTORY_VIEW}")
+    conn.execute(_JOURNAL_HISTORY_SQL)
+
+
+def _ensure_pending_unique_index(conn: sqlite3.Connection) -> bool:
+    """Best-effort UNIQUE partial index on the PENDING dedup key.
+
+    Existing DBs may already hold duplicate PENDING rows; in that case the
+    index cannot be built. We log and keep the non-unique index -- user rows
+    are never deleted. Returns True when the unique index exists.
+    """
+    try:
+        conn.execute(
+            f"""
+            CREATE UNIQUE INDEX IF NOT EXISTS {PENDING_UNIQUE_INDEX}
+            ON {LIVE_BETS_TABLE} (
+                home_team,
+                away_team,
+                UPPER(market),
+                selection,
+                SUBSTR(COALESCE(match_date, ''), 1, 10)
+            )
+            WHERE status = 'PENDING'
+            """
+        )
+        return True
+    except sqlite3.IntegrityError as exc:
+        logger.warning(
+            "live_bets: duplicate PENDING rows present -- UNIQUE dedup index not "
+            "created (%s). Keeping non-unique index; resolve duplicates manually.",
+            exc,
+        )
+    except sqlite3.OperationalError as exc:  # very old SQLite (no expr index)
+        logger.warning("live_bets: cannot create UNIQUE dedup index: %s", exc)
+    return False
+
+
 def ensure_live_bets_table(db_path: Path | str = DEFAULT_DB_PATH) -> Path:
-    """Create ``live_bets`` if missing and migrate CLV columns + alias views."""
+    """Create ``live_bets`` if missing and migrate CLV columns + alias views.
+
+    The DDL runs once per process per DB path (thread-safe); later calls
+    return immediately while the file still exists.
+    """
     path = Path(db_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
+    key = _path_key(path)
+    if key in _ENSURED_PATHS and path.exists():
+        return path
+    with _ENSURE_LOCK:
+        if key in _ENSURED_PATHS and path.exists():
+            return path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_live_bets_schema(path)
+        _ENSURED_PATHS.add(key)
+    return path
+
+
+def _ensure_live_bets_schema(path: Path) -> None:
+    conn = sqlite3.connect(path, timeout=SQLITE_TIMEOUT_S)
+    try:
+        _apply_pragmas(conn, wal=True)
         conn.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {LIVE_BETS_TABLE} (
@@ -166,6 +300,8 @@ def ensure_live_bets_table(db_path: Path | str = DEFAULT_DB_PATH) -> Path:
             ON {LIVE_BETS_TABLE} (home_team, away_team, market, selection, status)
             """
         )
+        conn.commit()
+        _ensure_pending_unique_index(conn)
         # Compatibility aliases requested by post-match pipeline / external tools.
         conn.execute(
             f"""
@@ -179,19 +315,115 @@ def ensure_live_bets_table(db_path: Path | str = DEFAULT_DB_PATH) -> Path:
             SELECT * FROM {LIVE_BETS_TABLE}
             """
         )
-        # Recreate history view so HALF_* / VOID are included after upgrades.
-        conn.execute(f"DROP VIEW IF EXISTS {JOURNAL_HISTORY_VIEW}")
-        conn.execute(
-            f"""
-            CREATE VIEW {JOURNAL_HISTORY_VIEW} AS
-            SELECT * FROM {LIVE_BETS_TABLE}
-            WHERE status IN (
-                'WIN', 'LOSS', 'PUSH', 'HALF_WIN', 'HALF_LOSS', 'VOID'
-            )
-            """
-        )
+        _ensure_journal_history_view(conn)
         conn.commit()
-    return path
+    finally:
+        conn.close()
+
+
+def _find_pending_id(
+    conn: sqlite3.Connection,
+    *,
+    home_team: str,
+    away_team: str,
+    selection: str,
+    market: str,
+    match_date: Any,
+) -> int | None:
+    """PENDING dedup lookup on an open connection (see :func:`pending_bet_exists`)."""
+    sel = normalize_selection(selection)
+    day = _match_day_key(match_date)
+    rows = conn.execute(
+        f"""
+        SELECT id, match_date, selection FROM {LIVE_BETS_TABLE}
+        WHERE status = 'PENDING'
+          AND home_team = ?
+          AND away_team = ?
+          AND UPPER(market) = UPPER(?)
+        ORDER BY id
+        """,
+        (str(home_team).strip(), str(away_team).strip(), str(market).strip()),
+    ).fetchall()
+    for bet_id, md, sel_db in rows:
+        if normalize_selection(str(sel_db)) != sel:
+            continue
+        if day is None or _match_day_key(md) in {None, day}:
+            return int(bet_id)
+    return None
+
+
+def _insert_live_bet(
+    conn: sqlite3.Connection,
+    *,
+    home_team: str,
+    away_team: str,
+    selection: str,
+    odds: float,
+    stake_amount: float,
+    match_date: Any,
+    market: str,
+    stake_pct: float | None,
+    ev: float | None,
+    p_model: float | None,
+) -> int:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    md = match_date
+    if md is not None and not isinstance(md, str):
+        md = pd.Timestamp(md).strftime("%Y-%m-%d %H:%M")
+    sel = normalize_selection(selection)
+    cur = conn.execute(
+        f"""
+        INSERT INTO {LIVE_BETS_TABLE} (
+            match_date, home_team, away_team, market, selection,
+            odds, stake_amount, stake_pct, ev, p_model,
+            status, pnl, closing_odds, clv_pct, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, NULL, NULL, ?)
+        """,
+        (
+            md,
+            str(home_team).strip(),
+            str(away_team).strip(),
+            str(market).strip(),
+            sel,
+            float(odds),
+            float(stake_amount),
+            float(stake_pct) if stake_pct is not None else None,
+            float(ev) if ev is not None else None,
+            float(p_model) if p_model is not None else None,
+            now,
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def _insert_if_no_pending(path: Path, **fields: Any) -> tuple[int | None, bool]:
+    """Atomic dedup check + insert inside one ``BEGIN IMMEDIATE`` transaction.
+
+    Returns ``(id, created)``; ``id`` is the existing PENDING row when deduped.
+    """
+    lookup = {
+        k: fields[k]
+        for k in ("home_team", "away_team", "selection", "market", "match_date")
+    }
+    with _connect(path, autocommit=True) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = _find_pending_id(conn, **lookup)
+            if existing is not None:
+                conn.execute("COMMIT")
+                return existing, False
+            try:
+                new_id = _insert_live_bet(conn, **fields)
+            except sqlite3.IntegrityError:
+                # UNIQUE partial index caught a duplicate the Python key missed.
+                conn.execute("ROLLBACK")
+                return _find_pending_id(conn, **lookup), False
+            conn.execute("COMMIT")
+            return new_id, True
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
 
 
 def pending_bet_exists(
@@ -205,25 +437,15 @@ def pending_bet_exists(
 ) -> int | None:
     """Return existing PENDING bet id if same fixture/selection already queued."""
     path = ensure_live_bets_table(db_path)
-    sel = normalize_selection(selection)
-    day = _match_day_key(match_date)
-    with sqlite3.connect(path) as conn:
-        rows = conn.execute(
-            f"""
-            SELECT id, match_date, selection FROM {LIVE_BETS_TABLE}
-            WHERE status = 'PENDING'
-              AND home_team = ?
-              AND away_team = ?
-              AND UPPER(market) = UPPER(?)
-            """,
-            (str(home_team).strip(), str(away_team).strip(), str(market).strip()),
-        ).fetchall()
-    for bet_id, md, sel_db in rows:
-        if normalize_selection(str(sel_db)) != sel:
-            continue
-        if day is None or _match_day_key(md) in {None, day}:
-            return int(bet_id)
-    return None
+    with _connect(path) as conn:
+        return _find_pending_id(
+            conn,
+            home_team=home_team,
+            away_team=away_team,
+            selection=selection,
+            market=market,
+            match_date=match_date,
+        )
 
 
 def add_live_bet(
@@ -241,51 +463,31 @@ def add_live_bet(
     db_path: Path | str = DEFAULT_DB_PATH,
     skip_if_pending: bool = False,
 ) -> int | None:
-    """Insert a PENDING paper bet. Returns new row ``id`` (or ``None`` if deduped)."""
-    if skip_if_pending:
-        existing = pending_bet_exists(
-            home_team=home_team,
-            away_team=away_team,
-            selection=selection,
-            market=market,
-            match_date=match_date,
-            db_path=db_path,
-        )
-        if existing is not None:
-            return None
+    """Insert a PENDING paper bet. Returns new row ``id`` (or ``None`` if deduped).
 
+    With ``skip_if_pending`` the dedup check and insert run atomically in one
+    ``BEGIN IMMEDIATE`` transaction. Without it, the row is inserted as-is;
+    if the UNIQUE PENDING index rejects it, ``sqlite3.IntegrityError`` is raised.
+    """
     path = ensure_live_bets_table(db_path)
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    md = match_date
-    if md is not None and not isinstance(md, str):
-        md = pd.Timestamp(md).strftime("%Y-%m-%d %H:%M")
-    sel = normalize_selection(selection)
+    fields: dict[str, Any] = {
+        "home_team": home_team,
+        "away_team": away_team,
+        "selection": selection,
+        "odds": odds,
+        "stake_amount": stake_amount,
+        "match_date": match_date,
+        "market": market,
+        "stake_pct": stake_pct,
+        "ev": ev,
+        "p_model": p_model,
+    }
+    if skip_if_pending:
+        new_id, created = _insert_if_no_pending(path, **fields)
+        return new_id if created else None
 
-    with sqlite3.connect(path) as conn:
-        cur = conn.execute(
-            f"""
-            INSERT INTO {LIVE_BETS_TABLE} (
-                match_date, home_team, away_team, market, selection,
-                odds, stake_amount, stake_pct, ev, p_model,
-                status, pnl, closing_odds, clv_pct, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, NULL, NULL, ?)
-            """,
-            (
-                md,
-                str(home_team).strip(),
-                str(away_team).strip(),
-                str(market).strip(),
-                sel,
-                float(odds),
-                float(stake_amount),
-                float(stake_pct) if stake_pct is not None else None,
-                float(ev) if ev is not None else None,
-                float(p_model) if p_model is not None else None,
-                now,
-            ),
-        )
-        conn.commit()
-        return int(cur.lastrowid)
+    with _connect(path) as conn:
+        return _insert_live_bet(conn, **fields)
 
 
 def add_to_journal(
@@ -304,27 +506,18 @@ def add_to_journal(
 ) -> dict[str, Any]:
     """Dedup-aware journal insert for the auto scanner / UI.
 
+    The PENDING lookup and the INSERT share one connection and one
+    ``BEGIN IMMEDIATE`` transaction, so concurrent scanners cannot both insert
+    the same bet.
+
     Returns
     -------
     dict
         ``{\"id\": int|None, \"created\": bool, \"reason\": str}``.
     """
-    existing = pending_bet_exists(
-        home_team=home_team,
-        away_team=away_team,
-        selection=selection,
-        market=market,
-        match_date=match_date,
-        db_path=db_path,
-    )
-    if existing is not None:
-        return {
-            "id": existing,
-            "created": False,
-            "reason": f"duplicate_pending:{existing}",
-        }
-
-    new_id = add_live_bet(
+    path = ensure_live_bets_table(db_path)
+    new_id, created = _insert_if_no_pending(
+        path,
         home_team=home_team,
         away_team=away_team,
         selection=selection,
@@ -335,9 +528,13 @@ def add_to_journal(
         stake_pct=stake_pct,
         ev=ev,
         p_model=p_model,
-        db_path=db_path,
-        skip_if_pending=False,
     )
+    if not created:
+        return {
+            "id": new_id,
+            "created": False,
+            "reason": f"duplicate_pending:{new_id}",
+        }
     return {"id": new_id, "created": True, "reason": "created"}
 
 
@@ -484,7 +681,7 @@ def update_closing_odds(
         raise ValueError("closing_odds / odds_close is required")
 
     path = ensure_live_bets_table(db_path)
-    with sqlite3.connect(path) as conn:
+    with _connect(path) as conn:
         row = conn.execute(
             f"SELECT odds FROM {LIVE_BETS_TABLE} WHERE id = ?",
             (int(bet_id),),
@@ -564,11 +761,15 @@ def count_bets_on_vn_day(
     *,
     now: datetime | None = None,
 ) -> int:
-    """Count journal bets created on the current VN (Asia/Ho_Chi_Minh) calendar day."""
+    """Count journal bets created on the current VN (Asia/Ho_Chi_Minh) calendar day.
+
+    A naive ``now`` is interpreted as UTC (project-wide convention, see
+    :mod:`src.timezone_utils`).
+    """
     path = ensure_live_bets_table(db_path)
     ref = now or datetime.now(VN_TZ)
     if ref.tzinfo is None:
-        ref = ref.replace(tzinfo=VN_TZ)
+        ref = ref.replace(tzinfo=timezone.utc).astimezone(VN_TZ)
     else:
         ref = ref.astimezone(VN_TZ)
     day = ref.strftime("%Y-%m-%d")
@@ -693,7 +894,7 @@ def load_live_bets(
 ) -> pd.DataFrame:
     """Load journal rows, optionally filtered by ``status``."""
     path = ensure_live_bets_table(db_path)
-    with sqlite3.connect(path) as conn:
+    with _connect(path) as conn:
         if status:
             df = pd.read_sql(
                 f"SELECT * FROM {LIVE_BETS_TABLE} WHERE status = ? ORDER BY id DESC",
@@ -756,6 +957,11 @@ def settle_live_bet(
         When ``None``, derived alongside PnL.
     closing_odds / odds_close:
         Optional closing price (aliases). Sets ``clv_pct`` when provided.
+
+    Returns the realised PnL written by *this* call. The UPDATE is guarded by
+    ``status = 'PENDING'``; when another process settled the bet first
+    (rowcount 0), ``RuntimeError`` is raised and nothing is overwritten, so a
+    successful return always means this call performed the settlement.
     """
     from src.services.settlement_service import payout_from_outcome
 
@@ -767,7 +973,7 @@ def settle_live_bet(
             f"status must be WIN/LOSS/PUSH/HALF_WIN/HALF_LOSS/VOID, got {status!r}"
         )
     path = ensure_live_bets_table(db_path)
-    with sqlite3.connect(path) as conn:
+    with _connect(path) as conn:
         row = conn.execute(
             f"SELECT odds, stake_amount, status FROM {LIVE_BETS_TABLE} WHERE id = ?",
             (int(bet_id),),
@@ -786,14 +992,26 @@ def settle_live_bet(
             paid = float(payout) if payout is not None else derived_pay
 
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        conn.execute(
+        # Compare-and-set: only the caller that flips PENDING wins; a racing
+        # settler (scheduler + UI, two workers) sees rowcount 0 and backs off.
+        cur = conn.execute(
             f"""
             UPDATE {LIVE_BETS_TABLE}
             SET status = ?, pnl = ?, payout = ?, settled_at = ?
-            WHERE id = ?
+            WHERE id = ? AND status = 'PENDING'
             """,
             (raw, float(realised), float(paid), now, int(bet_id)),
         )
+        if cur.rowcount != 1:
+            conn.rollback()
+            latest = conn.execute(
+                f"SELECT status FROM {LIVE_BETS_TABLE} WHERE id = ?",
+                (int(bet_id),),
+            ).fetchone()
+            raise RuntimeError(
+                f"Bet #{bet_id} already settled as "
+                f"{latest[0] if latest else 'UNKNOWN'} (concurrent settle)"
+            )
         conn.commit()
 
     close_price = closing_odds if closing_odds is not None else odds_close
@@ -808,7 +1026,7 @@ def settle_live_bet(
 def delete_live_bet(bet_id: int, db_path: Path | str = DEFAULT_DB_PATH) -> None:
     """Remove a journal row (any status)."""
     path = ensure_live_bets_table(db_path)
-    with sqlite3.connect(path) as conn:
+    with _connect(path) as conn:
         conn.execute(f"DELETE FROM {LIVE_BETS_TABLE} WHERE id = ?", (int(bet_id),))
         conn.commit()
 
@@ -977,8 +1195,16 @@ def find_match_result(
     home_team: str,
     away_team: str,
     match_date: Any = None,
+    max_day_diff: int = 1,
 ) -> pd.Series | None:
-    """Locate a finished match row by (day, home, away)."""
+    """Locate a finished match row by (day, home, away).
+
+    Only rows whose date is within ``max_day_diff`` calendar days of the bet's
+    ``match_date`` are accepted (±1 day absorbs VN/UTC date shifts). Rows of
+    the same pairing from other dates (e.g. last season's fixture) are never
+    used. Without a parseable ``match_date`` no row is returned, because the
+    fixture cannot be identified safely.
+    """
     if results is None or results.empty:
         return None
     df = results
@@ -988,22 +1214,33 @@ def find_match_result(
         df = df.copy()
         df["_day"] = pd.to_datetime(df["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
 
+    day = _match_day_key(match_date)
+    if not day:
+        return None
+    target = pd.to_datetime(day, errors="coerce")
+    if pd.isna(target):
+        return None
+
     home = str(home_team).strip()
     away = str(away_team).strip()
-    day = _match_day_key(match_date)
     hit = df.loc[
         (df["HomeTeam"].astype(str).str.strip() == home)
         & (df["AwayTeam"].astype(str).str.strip() == away)
     ]
-    if day:
-        day_hit = hit.loc[hit["_day"] == day]
-        if not day_hit.empty:
-            hit = day_hit
     if hit.empty:
         return None
-    # Prefer rows that already have an FTR / goals.
+    row_days = pd.to_datetime(hit["_day"], errors="coerce")
+    diff = (row_days - target).abs().dt.days
+    keep = diff.notna() & (diff <= int(max_day_diff))
+    if not keep.any():
+        return None
+    hit = hit.loc[keep].assign(_day_diff=diff.loc[keep])
+    # Prefer rows that already have an FTR / goals, closest date first.
     scored = hit.loc[hit["FTR"].notna()] if "FTR" in hit.columns else hit
-    row = scored.iloc[-1] if not scored.empty else hit.iloc[-1]
+    pool = scored if not scored.empty else hit
+    row = pool.sort_values("_day_diff", kind="mergesort").iloc[0].drop(
+        labels=["_day_diff"]
+    )
     if "FTR" in row.index and (pd.isna(row["FTR"]) or str(row["FTR"]).strip() == ""):
         return None
     return row
@@ -1064,10 +1301,16 @@ def compute_settled_brier(
     if "p_model" not in settled.columns:
         return float("nan")
 
+    # Accept settlement_v2 labels (WON/LOST) alongside journal WIN/LOSS.
+    settled = settled.copy()
+    settled["status"] = (
+        settled["status"]
+        .astype(str)
+        .str.upper()
+        .replace({"WON": "WIN", "LOST": "LOSS", "HALF_WON": "HALF_WIN", "HALF_LOST": "HALF_LOSS"})
+    )
     rows = settled.loc[
-        settled["status"].astype(str).str.upper().isin(
-            ["WIN", "LOSS", "HALF_WIN", "HALF_LOSS"]
-        )
+        settled["status"].isin(["WIN", "LOSS", "HALF_WIN", "HALF_LOSS"])
     ].copy()
     p = pd.to_numeric(rows["p_model"], errors="coerce")
     mask = p.notna() & np.isfinite(p.to_numpy(dtype=float))

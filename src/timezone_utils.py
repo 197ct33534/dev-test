@@ -1,8 +1,17 @@
-"""Vietnam (Asia/Ho_Chi_Minh) kickoff window helpers for Top-20 scanning."""
+"""Vietnam (Asia/Ho_Chi_Minh) kickoff window helpers for Top-20 scanning.
+
+Naive-datetime convention
+-------------------------
+Every helper in this module treats a *naive* ``datetime`` / ``Timestamp`` as
+**UTC** — both fixture ``Kickoff`` values and reference ``now`` arguments.
+Pass a timezone-aware value (e.g. ``datetime(..., tzinfo=VN_TZ)``) to express
+Vietnam local time.
+"""
 
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -12,6 +21,16 @@ import pandas as pd
 
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 UTC = ZoneInfo("UTC")
+
+
+def _ref_now_utc(now: datetime | pd.Timestamp | None) -> pd.Timestamp:
+    """Reference instant as aware UTC (naive ``now`` is treated as UTC)."""
+    if now is None:
+        return pd.Timestamp.now(tz=UTC)
+    t = pd.Timestamp(now)
+    if t.tzinfo is None:
+        return t.tz_localize(UTC)
+    return t.tz_convert(UTC)
 
 
 def _to_naive_utc(ts: datetime | pd.Timestamp) -> pd.Timestamp:
@@ -44,7 +63,8 @@ def get_vn_today_tomorrow_window(
     ----------
     now:
         Reference instant (default: current time). Timezone-aware preferred;
-        naive values are interpreted as Vietnam local time.
+        naive values are interpreted as **UTC** (module-wide convention, same
+        as fixture ``Kickoff`` values).
     as_naive_utc:
         If True (default), convert bounds to naive UTC for comparison against
         fixture ``Kickoff`` columns stored as UTC-naive timestamps.
@@ -56,14 +76,7 @@ def get_vn_today_tomorrow_window(
     (today_start, window_end)
         Inclusive window endpoints.
     """
-    if now is None:
-        ref = datetime.now(VN_TZ)
-    else:
-        ref = pd.Timestamp(now).to_pydatetime()
-        if ref.tzinfo is None:
-            ref = ref.replace(tzinfo=VN_TZ)
-        else:
-            ref = ref.astimezone(VN_TZ)
+    ref = _ref_now_utc(now).tz_convert(VN_TZ).to_pydatetime()
 
     today = ref.date()
     tomorrow = today + timedelta(days=1)
@@ -107,12 +120,17 @@ def filter_matches_today_tomorrow(
     *,
     now: datetime | pd.Timestamp | None = None,
     horizon_hours: float = 48.0,
+    exclude_started: bool = False,
 ) -> pd.DataFrame:
     """Keep rows whose kickoff falls in the VN today→tomorrow / ~48h window.
 
     See :func:`get_vn_today_tomorrow_window`. ``Kickoff`` values are treated as
     naive UTC (project convention). Aware timestamps are converted to naive UTC
     before the window comparison.
+
+    ``exclude_started=True`` additionally drops rows with kickoff ``<= now``
+    (the window itself starts at VN midnight, so it includes matches that
+    already kicked off earlier today).
     """
     if df is None or df.empty:
         return df.copy() if df is not None else pd.DataFrame()
@@ -132,6 +150,9 @@ def filter_matches_today_tomorrow(
 
     ko_utc = ko.map(_norm)
     mask = ko_utc.notna() & (ko_utc >= start) & (ko_utc <= end)
+    if exclude_started:
+        ref = _ref_now_utc(now).tz_localize(None)
+        mask = mask & (ko_utc > ref)
     return out.loc[mask].reset_index(drop=True)
 
 
@@ -161,7 +182,7 @@ def get_today_tomorrow_matches(
         return pd.DataFrame()
 
     try:
-        with sqlite3.connect(path) as conn:
+        with closing(sqlite3.connect(path, timeout=30.0)) as conn:
             tables = {
                 r[0]
                 for r in conn.execute(

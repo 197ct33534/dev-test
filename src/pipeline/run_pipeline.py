@@ -6,6 +6,7 @@ and optionally persists ``pit_feature_snapshots`` / ``prediction_snapshots``.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -270,6 +271,14 @@ async def run_quant_pipeline(
                 "Failed to persist snapshots for match=%s; returning payloads only",
                 canonical_match_id,
             )
+            # A failed flush leaves the session in a "needs rollback" state;
+            # reset it so the caller can keep using it.
+            try:
+                rolled = session.rollback()
+                if inspect.isawaitable(rolled):
+                    await rolled
+            except Exception:  # noqa: BLE001
+                logger.exception("Session rollback after persist failure also failed")
 
     # 5) Return summary
     return {

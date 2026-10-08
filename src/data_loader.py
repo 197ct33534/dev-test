@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import socket
 import sqlite3
 import time
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from io import StringIO
@@ -44,7 +47,11 @@ FOTMOB_UWCL_URL = "https://www.fotmob.com/api/data/leagues?id=9375"
 FOTMOB_LEAGUE_URL = "https://www.fotmob.com/api/data/leagues?id={league_id}"
 # Flashscore Odds tab (same feed as flashscore.com/.../odds/...) — GraphQL, no API key.
 FLASHSCORE_ODDS_URL = "https://global.ds.lsapp.eu/odds/pq_graphql"
-FLASHSCORE_FSIGN = "SW9D1eZo"
+_FLASHSCORE_FSIGN_DEFAULT = "SW9D1eZo"
+# Overridable via env when Flashscore rotates the x-fsign header value.
+FLASHSCORE_FSIGN = (
+    os.environ.get("FLASHSCORE_FSIGN", "").strip() or _FLASHSCORE_FSIGN_DEFAULT
+)
 # Prefer bet365 as shown on Flashscore GB odds comparison.
 FLASHSCORE_BOOKMAKER_PREFER: tuple[str, ...] = (
     "16",  # bet365
@@ -322,17 +329,94 @@ def default_season_starts(n_seasons: int = DEFAULT_N_SEASONS) -> list[int]:
 # ---------------------------------------------------------------------------
 
 
-def _fetch_csv_text(url: str, timeout: float = 30.0) -> str:
+class DataFetchError(RuntimeError):
+    """Network / decode failure from an HTTP helper (subclass of RuntimeError)."""
+
+
+class DataFetchJSONError(DataFetchError, ValueError):
+    """Payload was fetched but is not valid JSON."""
+
+
+# Bounded retry policy for HTTP helpers (timeouts, 429, 5xx).
+HTTP_RETRY_BACKOFF_S: tuple[float, ...] = (0.5, 1.0, 2.0)
+HTTP_DEFAULT_RETRIES = 3
+_RETRYABLE_HTTP_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+def _is_timeout_reason(reason: object) -> bool:
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return True
+    return "timed out" in str(reason).lower()
+
+
+def _http_get_text(
+    request: Request,
+    *,
+    url: str,
+    timeout: float,
+    retries: int = HTTP_DEFAULT_RETRIES,
+) -> str:
+    """GET ``request`` and decode the body, retrying transient failures.
+
+    Retries (bounded, exponential-ish backoff from :data:`HTTP_RETRY_BACKOFF_S`)
+    on timeouts, HTTP 429 and 5xx. Every failure is raised as
+    :class:`DataFetchError` (a ``RuntimeError``) so callers catching
+    ``RuntimeError`` keep working.
+    """
+    attempts = max(1, int(retries))
+    last_msg = ""
+    last_exc: BaseException | None = None
+    for attempt in range(attempts):
+        retryable = False
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                charset = response.headers.get_content_charset() or "utf-8"
+                return response.read().decode(charset, errors="replace")
+        except HTTPError as exc:
+            last_exc = exc
+            last_msg = f"HTTP {exc.code} when fetching {url}"
+            retryable = int(exc.code) in _RETRYABLE_HTTP_CODES or int(exc.code) >= 500
+        except URLError as exc:
+            last_exc = exc
+            last_msg = f"Network error fetching {url}: {exc.reason}"
+            retryable = _is_timeout_reason(exc.reason) or isinstance(
+                exc.reason, ConnectionError
+            )
+        except (TimeoutError, socket.timeout) as exc:
+            last_exc = exc
+            last_msg = f"Timeout fetching {url}: {exc}"
+            retryable = True
+        except ConnectionError as exc:
+            last_exc = exc
+            last_msg = f"Connection error fetching {url}: {exc}"
+            retryable = True
+        except OSError as exc:  # other socket-level failures
+            last_exc = exc
+            last_msg = f"Network error fetching {url}: {exc}"
+            retryable = False
+        if not retryable or attempt + 1 >= attempts:
+            break
+        delay = HTTP_RETRY_BACKOFF_S[min(attempt, len(HTTP_RETRY_BACKOFF_S) - 1)]
+        logger.info(
+            "Transient fetch failure (%s); retry %d/%d in %.1fs",
+            last_msg,
+            attempt + 1,
+            attempts - 1,
+            delay,
+        )
+        time.sleep(delay)
+    raise DataFetchError(last_msg or f"Failed to fetch {url}") from last_exc
+
+
+def _fetch_csv_text(
+    url: str,
+    timeout: float = 30.0,
+    *,
+    retries: int = HTTP_DEFAULT_RETRIES,
+) -> str:
     """Download raw CSV text from ``url`` with a polite User-Agent."""
     request = Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            charset = response.headers.get_content_charset() or "utf-8"
-            return response.read().decode(charset, errors="replace")
-    except HTTPError as exc:
-        raise RuntimeError(f"HTTP {exc.code} when fetching {url}") from exc
-    except URLError as exc:
-        raise RuntimeError(f"Network error fetching {url}: {exc.reason}") from exc
+    return _http_get_text(request, url=url, timeout=timeout, retries=retries)
 
 
 def _fetch_json(
@@ -341,6 +425,7 @@ def _fetch_json(
     timeout: float = 30.0,
     referer: str | None = None,
     extra_headers: dict[str, str] | None = None,
+    retries: int = HTTP_DEFAULT_RETRIES,
 ) -> dict:
     """Download a JSON payload (used for Fotmob / ESPN / Flashscore endpoints)."""
     headers = {
@@ -352,16 +437,11 @@ def _fetch_json(
     if extra_headers:
         headers.update(extra_headers)
     request = Request(url, headers=headers)
+    text = _http_get_text(request, url=url, timeout=timeout, retries=retries)
     try:
-        with urlopen(request, timeout=timeout) as response:
-            charset = response.headers.get_content_charset() or "utf-8"
-            text = response.read().decode(charset, errors="replace")
-    except HTTPError as exc:
-        raise RuntimeError(f"HTTP {exc.code} when fetching {url}") from exc
-    except URLError as exc:
-        raise RuntimeError(f"Network error fetching {url}: {exc.reason}") from exc
-
-    return json.loads(text)
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise DataFetchJSONError(f"Invalid JSON from {url}: {exc}") from exc
 
 
 def _fetch_text(
@@ -370,6 +450,7 @@ def _fetch_text(
     timeout: float = 45.0,
     referer: str | None = None,
     extra_headers: dict[str, str] | None = None,
+    retries: int = HTTP_DEFAULT_RETRIES,
 ) -> str:
     """Download raw text (HTML / Flashscore delimited feeds)."""
     headers = {
@@ -381,14 +462,7 @@ def _fetch_text(
     if extra_headers:
         headers.update(extra_headers)
     request = Request(url, headers=headers)
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            charset = response.headers.get_content_charset() or "utf-8"
-            return response.read().decode(charset, errors="replace")
-    except HTTPError as exc:
-        raise RuntimeError(f"HTTP {exc.code} when fetching {url}") from exc
-    except URLError as exc:
-        raise RuntimeError(f"Network error fetching {url}: {exc.reason}") from exc
+    return _http_get_text(request, url=url, timeout=timeout, retries=retries)
 
 
 def download_season(season_start: int) -> pd.DataFrame:
@@ -533,6 +607,67 @@ def _ensure_data_dir(db_path: Path | str = DEFAULT_DB_PATH) -> Path:
     return path
 
 
+SQLITE_BUSY_TIMEOUT_MS = 30_000
+
+
+def _connect_sqlite(path: Path | str, *, wal: bool = False) -> sqlite3.Connection:
+    """Open a SQLite connection with ``busy_timeout`` (+ optional WAL).
+
+    The returned connection is in autocommit mode (``isolation_level=None``);
+    callers that write must issue ``BEGIN IMMEDIATE`` / ``COMMIT`` themselves.
+    Always close it (e.g. ``with closing(_connect_sqlite(p)) as conn``).
+    """
+    conn = sqlite3.connect(
+        str(path), timeout=SQLITE_BUSY_TIMEOUT_MS / 1000.0, isolation_level=None
+    )
+    try:
+        conn.execute(f"PRAGMA busy_timeout = {int(SQLITE_BUSY_TIMEOUT_MS)}")
+        if wal:
+            try:
+                conn.execute("PRAGMA journal_mode = WAL")
+            except sqlite3.Error as exc:  # read-only / network FS
+                logger.debug("WAL not enabled for %s: %s", path, exc)
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+def _quote_ident(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _sqlite_type_for(series: pd.Series) -> str:
+    if pd.api.types.is_bool_dtype(series) or pd.api.types.is_integer_dtype(series):
+        return "INTEGER"
+    if pd.api.types.is_float_dtype(series):
+        return "REAL"
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return "TIMESTAMP"
+    return "TEXT"
+
+
+def _sqlite_value(value: Any) -> Any:
+    """Convert a pandas / numpy cell into a sqlite3-bindable Python value."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.isoformat(sep=" ")
+    if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+        try:
+            return value.item()
+        except (ValueError, AttributeError):
+            pass
+    if isinstance(value, (str, int, float, bytes)):
+        return value
+    return str(value)
+
+
 def build_match_id(df: pd.DataFrame) -> pd.Series:
     """Primary key: ``YYYY-MM-DD|HomeTeam|AwayTeam``."""
     dates = pd.to_datetime(df["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
@@ -545,7 +680,7 @@ def db_has_matches(db_path: Path | str = DEFAULT_DB_PATH) -> bool:
     if not path.is_file():
         return False
     try:
-        with sqlite3.connect(path) as conn:
+        with closing(_connect_sqlite(path)) as conn:
             row = conn.execute(
                 f"SELECT COUNT(*) FROM {MATCHES_TABLE}"
             ).fetchone()
@@ -594,8 +729,12 @@ def read_matches_prefer_global(
                     df.attrs["data_source"] = "sqlite_global"
                     df.attrs["db_path"] = str(GLOBAL_DB_PATH)
                     return df
-        except Exception:  # noqa: BLE001 — fall through to league DB
-            pass
+        except Exception as exc:  # noqa: BLE001 — fall through to league DB
+            logger.warning(
+                "global DB read failed for %s; falling back to league DB: %s",
+                code,
+                exc,
+            )
 
     path = league_db_path(code)
     return read_matches_from_db(path, seasons=seasons, n_seasons=n_seasons)
@@ -616,7 +755,7 @@ def read_matches_from_db(
     if not path.is_file():
         return pd.DataFrame()
 
-    with sqlite3.connect(path) as conn:
+    with closing(_connect_sqlite(path)) as conn:
         try:
             df = pd.read_sql(f"SELECT * FROM {MATCHES_TABLE}", conn)
         except (sqlite3.Error, pd.errors.DatabaseError):
@@ -666,54 +805,112 @@ def save_matches_to_db(
     df: pd.DataFrame,
     db_path: Path | str = DEFAULT_DB_PATH,
 ) -> int:
-    """Upsert match rows into SQLite (PK = Match_ID).
+    """Upsert match rows into SQLite (natural key = ``Match_ID``).
+
+    Rows are written with ``INSERT ... ON CONFLICT(Match_ID) DO UPDATE`` inside
+    a single ``BEGIN IMMEDIATE`` transaction, so concurrent writers never drop
+    each other's rows and existing column types are preserved. New columns in
+    ``df`` are added with ``ALTER TABLE ... ADD COLUMN``.
 
     Returns
     -------
     int
         Total row count stored in ``matches`` after the write.
     """
-    if df.empty:
+    if df is None or df.empty:
         return 0
 
     path = _ensure_data_dir(db_path)
-    incoming = df.copy()
-    if "Match_ID" not in incoming.columns:
-        incoming["Match_ID"] = build_match_id(incoming)
+    to_write = df.copy()
+    # Drop duplicated column labels (keep last) - SQLite needs unique names.
+    to_write = to_write.loc[:, ~to_write.columns.duplicated(keep="last")]
+    built_ids = build_match_id(to_write)
+    if "Match_ID" not in to_write.columns:
+        to_write["Match_ID"] = built_ids
+    else:
+        mid = to_write["Match_ID"]
+        blank = mid.isna() | (mid.astype(str).str.strip() == "")
+        to_write["Match_ID"] = mid.where(~blank, built_ids)
+    to_write = to_write.loc[to_write["Match_ID"].notna()].copy()
+    to_write["Match_ID"] = to_write["Match_ID"].astype(str)
+    to_write = to_write.drop_duplicates(subset=["Match_ID"], keep="last")
+    if to_write.empty:
+        return 0
 
     # Store dates as ISO strings for portable SQLite reads
-    to_write = incoming.copy()
     if "Date" in to_write.columns:
         to_write["Date"] = pd.to_datetime(to_write["Date"], errors="coerce").dt.strftime(
             "%Y-%m-%d"
         )
 
-    with sqlite3.connect(path) as conn:
+    columns = [str(c) for c in to_write.columns]
+    table = _quote_ident(MATCHES_TABLE)
+
+    with closing(_connect_sqlite(path, wal=True)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
         try:
-            existing = pd.read_sql(f"SELECT * FROM {MATCHES_TABLE}", conn)
-        except (sqlite3.Error, pd.errors.DatabaseError):
-            existing = pd.DataFrame()
+            existing_cols = [
+                str(r[1])
+                for r in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            ]
+            if not existing_cols:
+                col_defs = ", ".join(
+                    f"{_quote_ident(c)} "
+                    + (
+                        "TEXT"
+                        if c in ("Match_ID", "Date")
+                        else _sqlite_type_for(to_write[c])
+                    )
+                    for c in columns
+                )
+                conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ({col_defs})")
+            else:
+                for c in columns:
+                    if c not in existing_cols:
+                        conn.execute(
+                            f"ALTER TABLE {table} ADD COLUMN {_quote_ident(c)} "
+                            f"{_sqlite_type_for(to_write[c])}"
+                        )
 
-        if not existing.empty and "Match_ID" in existing.columns:
-            combined = pd.concat([existing, to_write], ignore_index=True)
-            combined = combined.drop_duplicates(subset=["Match_ID"], keep="last")
-        else:
-            combined = to_write
+            has_pk_index = any(
+                str(r[1]) == "idx_matches_pk"
+                for r in conn.execute(f"PRAGMA index_list({table})").fetchall()
+            )
+            if not has_pk_index:
+                # Legacy tables written via to_sql(replace) may hold duplicate
+                # keys; keep the newest physical row so the index can be built.
+                conn.execute(
+                    f"DELETE FROM {table} WHERE rowid NOT IN "
+                    f'(SELECT MAX(rowid) FROM {table} GROUP BY "Match_ID")'
+                )
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_matches_pk "
+                    f'ON {table} ("Match_ID")'
+                )
 
-        combined = combined.sort_values(
-            ["Date", "HomeTeam", "AwayTeam"], kind="mergesort"
-        ).reset_index(drop=True)
-        combined.to_sql(MATCHES_TABLE, conn, if_exists="replace", index=False)
-
-        # Enforce PK for future tooling / integrity
-        conn.execute(
-            f"""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_matches_pk
-            ON {MATCHES_TABLE} (Match_ID)
-            """
-        )
-        conn.commit()
-        return len(combined)
+            col_sql = ", ".join(_quote_ident(c) for c in columns)
+            placeholders = ", ".join("?" for _ in columns)
+            updates = ", ".join(
+                f"{_quote_ident(c)} = excluded.{_quote_ident(c)}"
+                for c in columns
+                if c != "Match_ID"
+            )
+            conflict = f"DO UPDATE SET {updates}" if updates else "DO NOTHING"
+            sql = (
+                f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders}) "
+                f'ON CONFLICT("Match_ID") {conflict}'
+            )
+            rows = [
+                tuple(_sqlite_value(v) for v in rec)
+                for rec in to_write.itertuples(index=False, name=None)
+            ]
+            conn.executemany(sql, rows)
+            total = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return total
 
 
 def _download_epl_seasons(
@@ -962,8 +1159,8 @@ def load_league_data(
                 conn.commit()
             finally:
                 conn.close()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("global DB persist failed for %s: %s", code, exc)
 
     # Prefer global_matches.db when present (multi-comp), else league DB.
     # Explicit ``db_path`` skips global so callers can force a legacy file.
@@ -1652,31 +1849,207 @@ def _fs_handicap_value(item: dict) -> float:
 def _fs_pick_bookmaker(
     markets: list[dict], prefer: Sequence[str] = FLASHSCORE_BOOKMAKER_PREFER
 ) -> tuple[str | None, dict | None, str | None]:
-    by_bk: dict[str, dict] = {}
-    for m in markets:
-        by_bk[str(m.get("bookmakerId"))] = m
-    for pid in prefer:
-        if pid in by_bk:
-            return pid, by_bk[pid], None
-    if by_bk:
-        pid = next(iter(by_bk))
-        return pid, by_bk[pid], None
+    ordered = _fs_ordered_markets(markets, prefer)
+    if ordered:
+        pid, market = ordered[0]
+        return pid, market, None
     return None, None, None
 
 
-def _fs_parse_1x2(market: dict) -> tuple[float, float, float]:
-    """HOME_DRAW_AWAY selections → (home, draw, away) decimal odds."""
-    sels = market.get("odds") or []
-    if len(sels) < 3:
-        return float("nan"), float("nan"), float("nan")
-    # Flashscore order: home participant, away participant, draw (null id)
+def _fs_ordered_markets(
+    markets: list[dict], prefer: Sequence[str] = FLASHSCORE_BOOKMAKER_PREFER
+) -> list[tuple[str, dict]]:
+    """Bookmaker markets ordered by ``prefer`` first, then feed order."""
+    by_bk: dict[str, dict] = {}
+    for m in markets:
+        by_bk[str(m.get("bookmakerId"))] = m
+    out: list[tuple[str, dict]] = [(pid, by_bk[pid]) for pid in prefer if pid in by_bk]
+    seen = {pid for pid, _ in out}
+    out.extend((pid, m) for pid, m in by_bk.items() if pid not in seen)
+    return out
+
+
+# Sanity bounds for a bookmaker 1X2 triple (sum of implied probabilities).
+FS_1X2_OVERROUND_MIN = 1.0
+FS_1X2_OVERROUND_MAX = 1.25
+BET365_FLASHSCORE_ID = "16"
+
+_FS_SIDE_KEYS = ("type", "side", "role", "participantType", "homeAway")
+
+
+def _fs_event_participant_ids(event: dict) -> tuple[str | None, str | None]:
+    """Best-effort ``(home_pid, away_pid)`` from an odds event payload.
+
+    Looks for a participants list (``eventParticipants`` / ``participants``)
+    whose entries carry an ``id`` plus a HOME/AWAY marker (``type``, ``side``,
+    ``isHome`` ...). Returns ``(None, None)`` when the payload has no such info.
+    """
+    home: str | None = None
+    away: str | None = None
+    for key in ("eventParticipants", "participants"):
+        parts = event.get(key)
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            pid = part.get("id", part.get("eventParticipantId"))
+            if pid is None:
+                continue
+            side = ""
+            for sk in _FS_SIDE_KEYS:
+                val = part.get(sk)
+                if isinstance(val, dict):
+                    val = val.get("name") or val.get("side")
+                if val:
+                    side = str(val).strip().upper()
+                    break
+            if not side and "isHome" in part:
+                side = "HOME" if part.get("isHome") else "AWAY"
+            if side in {"HOME", "H", "1"}:
+                home = str(pid)
+            elif side in {"AWAY", "A", "2"}:
+                away = str(pid)
+        if home and away:
+            break
+    return home, away
+
+
+def _fs_1x2_participants(
+    market: dict,
+    *,
+    home_pid: str | None = None,
+    away_pid: str | None = None,
+) -> tuple[dict | None, dict | None, dict | None, str | None, str | None]:
+    """Locate ``(home_sel, draw_sel, away_sel, home_pid, away_pid)`` in a 1X2 market.
+
+    Mapping order:
+
+    1. ``eventParticipantId`` against the event's known home/away participant ids;
+    2. explicit ``selection`` labels (``HOME`` / ``DRAW`` / ``AWAY``);
+    3. positional fallback (non-null participant ids in feed order = home, away)
+       — logged, since Flashscore does not guarantee selection order.
+
+    The draw is always the selection whose ``eventParticipantId`` is null.
+    """
+    sels = [s for s in (market.get("odds") or []) if isinstance(s, dict)]
+    draw = next(
+        (
+            s
+            for s in sels
+            if s.get("eventParticipantId") is None
+            or str(s.get("selection") or "").upper() == "DRAW"
+        ),
+        None,
+    )
+    sided = [s for s in sels if s is not draw and s.get("eventParticipantId") is not None]
+
+    hp = str(home_pid) if home_pid else None
+    ap = str(away_pid) if away_pid else None
+    if hp and ap:
+        home = next((s for s in sided if str(s["eventParticipantId"]) == hp), None)
+        away = next((s for s in sided if str(s["eventParticipantId"]) == ap), None)
+        if home is not None and away is not None:
+            return home, draw, away, hp, ap
+        logger.warning(
+            "1X2 participant ids %s/%s not found in market (bookmaker=%s); "
+            "falling back",
+            hp,
+            ap,
+            market.get("bookmakerId"),
+        )
+
+    by_label = {str(s.get("selection") or "").upper(): s for s in sels}
+    if "HOME" in by_label and "AWAY" in by_label:
+        home, away = by_label["HOME"], by_label["AWAY"]
+        draw = by_label.get("DRAW", draw)
+        h_id = home.get("eventParticipantId")
+        a_id = away.get("eventParticipantId")
+        return (
+            home,
+            draw,
+            away,
+            str(h_id) if h_id is not None else None,
+            str(a_id) if a_id is not None else None,
+        )
+
+    if len(sided) >= 2:
+        logger.info(
+            "1X2 home/away mapped positionally (no participant ids; bookmaker=%s)",
+            market.get("bookmakerId"),
+        )
+        home, away = sided[0], sided[1]
+        return (
+            home,
+            draw,
+            away,
+            str(home["eventParticipantId"]),
+            str(away["eventParticipantId"]),
+        )
+    return None, draw, None, None, None
+
+
+def _fs_1x2_triple_ok(home: float, draw: float, away: float) -> bool:
+    """True when all prices > 1 and overround is within sanity bounds."""
     try:
-        home = float(sels[0]["value"])
-        away = float(sels[1]["value"])
-        draw = float(sels[2]["value"])
-        return home, draw, away
+        vals = (float(home), float(draw), float(away))
+    except (TypeError, ValueError):
+        return False
+    if any(pd.isna(v) or v <= 1.0 for v in vals):
+        return False
+    overround = sum(1.0 / v for v in vals)
+    return FS_1X2_OVERROUND_MIN <= overround <= FS_1X2_OVERROUND_MAX
+
+
+def _fs_parse_1x2_with_ids(
+    market: dict,
+    *,
+    home_pid: str | None = None,
+    away_pid: str | None = None,
+) -> tuple[float, float, float, str | None, str | None]:
+    """Like :func:`_fs_parse_1x2` but also returns the resolved home/away ids."""
+    nan = float("nan")
+    home_s, draw_s, away_s, hp, ap = _fs_1x2_participants(
+        market, home_pid=home_pid, away_pid=away_pid
+    )
+    if home_s is None or draw_s is None or away_s is None:
+        return nan, nan, nan, hp, ap
+    try:
+        home = float(home_s["value"])
+        draw = float(draw_s["value"])
+        away = float(away_s["value"])
     except (TypeError, ValueError, KeyError):
-        return float("nan"), float("nan"), float("nan")
+        return nan, nan, nan, hp, ap
+    if not _fs_1x2_triple_ok(home, draw, away):
+        logger.warning(
+            "Rejecting 1X2 triple %s/%s/%s (bookmaker=%s): overround out of "
+            "[%.2f, %.2f]",
+            home,
+            draw,
+            away,
+            market.get("bookmakerId"),
+            FS_1X2_OVERROUND_MIN,
+            FS_1X2_OVERROUND_MAX,
+        )
+        return nan, nan, nan, hp, ap
+    return home, draw, away, hp, ap
+
+
+def _fs_parse_1x2(
+    market: dict,
+    *,
+    home_pid: str | None = None,
+    away_pid: str | None = None,
+) -> tuple[float, float, float]:
+    """HOME_DRAW_AWAY selections -> (home, draw, away) decimal odds.
+
+    Maps selections by ``eventParticipantId`` (draw = null id) when the event's
+    home/away participant ids are supplied; otherwise falls back to labels or
+    feed order (logged). Triples failing the overround sanity check
+    (``[1.0, 1.25]``) are rejected as NaN.
+    """
+    h, d, a, _, _ = _fs_parse_1x2_with_ids(market, home_pid=home_pid, away_pid=away_pid)
+    return h, d, a
 
 
 def _fs_parse_ou(market: dict) -> tuple[float, float, float]:
@@ -1773,8 +2146,15 @@ def fetch_flashscore_match_odds(
     geo_sub: str = "GBENG",
     project_id: str = "2",
     bookmaker_names: dict[str, str] | None = None,
+    home_participant_id: str | None = None,
+    away_participant_id: str | None = None,
 ) -> dict[str, float | str]:
     """Fetch Flashscore Odds-tab prices for one event (``mid`` / ``eventId``).
+
+    1X2 prices are written to the generic ``OddsH/OddsD/OddsA`` columns and the
+    source book to ``OddsBookmaker`` / ``OddsBookmakerId``. ``B365H/D/A`` are
+    still filled for backward compatibility; ``OddsIsBet365`` tells whether
+    they really are bet365 prices.
 
     Endpoint mirrors the browser tab, e.g.
     https://www.flashscore.com/match/football/.../odds/over-under/full-time/?mid=xtmHKGT0
@@ -1814,34 +2194,43 @@ def fetch_flashscore_match_odds(
     ou = [o for o in ft if o.get("bettingType") == "OVER_UNDER"]
     ah = [o for o in ft if o.get("bettingType") == "ASIAN_HANDICAP"]
 
-    _, hda_m, _ = _fs_pick_bookmaker(hda)
     _, ou_m, _ = _fs_pick_bookmaker(ou)
     _, ah_m, _ = _fs_pick_bookmaker(ah)
 
     out: dict[str, float | str] = {"FlashscoreEventId": event_id}
     provider_bits: list[str] = []
 
-    home_pid = away_pid = None
-    if hda_m:
-        h, d, a = _fs_parse_1x2(hda_m)
+    ev_home, ev_away = _fs_event_participant_ids(event)
+    home_pid = str(home_participant_id) if home_participant_id else ev_home
+    away_pid = str(away_participant_id) if away_participant_id else ev_away
+
+    # Walk bookmakers in preference order until one yields a sane 1X2 triple.
+    for bk_id, market in _fs_ordered_markets(hda):
+        h, d, a, m_home, m_away = _fs_parse_1x2_with_ids(
+            market, home_pid=home_pid, away_pid=away_pid
+        )
+        if pd.isna(h) or pd.isna(d) or pd.isna(a):
+            continue
+        bk_name = bk_map.get(str(bk_id), "book")
+        out["OddsH"], out["OddsD"], out["OddsA"] = h, d, a
         out["B365H"], out["B365D"], out["B365A"] = h, d, a
-        provider_bits.append(bk_map.get(str(hda_m.get("bookmakerId")), "book"))
-        sels = hda_m.get("odds") or []
-        if len(sels) >= 2:
-            home_pid = sels[0].get("eventParticipantId")
-            away_pid = sels[1].get("eventParticipantId")
-            if home_pid is not None:
-                home_pid = str(home_pid)
-            if away_pid is not None:
-                away_pid = str(away_pid)
+        out["OddsBookmaker"] = bk_name
+        out["OddsBookmakerId"] = str(bk_id)
+        out["OddsIsBet365"] = str(bk_id) == BET365_FLASHSCORE_ID
+        provider_bits.append(bk_name)
+        if not (home_pid and away_pid):
+            home_pid, away_pid = m_home, m_away
+        break
     if ou_m:
         line, over, under = _fs_parse_ou(ou_m)
         out["OU_Line"], out["OddsOver"], out["OddsUnder"] = line, over, under
+        out["OUBookmaker"] = bk_map.get(str(ou_m.get("bookmakerId")), "book")
         if pd.notna(line) and abs(float(line) - 2.5) < 1e-9:
             out["B365_O25"], out["B365_U25"] = over, under
     if ah_m:
         ahh, oh, oa = _fs_parse_ah(ah_m, home_pid=home_pid, away_pid=away_pid)
         out["AHh"], out["B365AHH"], out["B365AHA"] = ahh, oh, oa
+        out["AHBookmaker"] = bk_map.get(str(ah_m.get("bookmakerId")), "book")
 
     label = provider_bits[0] if provider_bits else "Flashscore"
     out["OddsProvider"] = f"Flashscore/{label}"
@@ -1912,6 +2301,10 @@ def fetch_flashscore_odds(
         "B365H",
         "B365D",
         "B365A",
+        "OddsH",
+        "OddsD",
+        "OddsA",
+        "OddsBookmaker",
         "B365_O25",
         "B365_U25",
         "OU_Line",
@@ -2052,6 +2445,10 @@ def fetch_espn_epl_odds(
         "B365H",
         "B365D",
         "B365A",
+        "OddsH",
+        "OddsD",
+        "OddsA",
+        "OddsBookmaker",
         "B365_O25",
         "B365_U25",
         "OU_Line",
@@ -2161,6 +2558,11 @@ def fetch_espn_epl_odds(
                 "AHh": ah_home,
                 "B365AHH": odds_ahh,
                 "B365AHA": odds_aha,
+                "OddsH": odds_h,
+                "OddsD": odds_d,
+                "OddsA": odds_a,
+                "OddsBookmaker": str(provider),
+                "OddsIsBet365": "bet365" in str(provider).lower(),
                 "OddsProvider": f"ESPN/{provider}",
                 "EspnEventId": str(ev.get("id", "")),
                 "B365_O25": float("nan"),
@@ -2287,6 +2689,27 @@ def _merge_odds_onto_fixtures(
     return out.drop(columns=["_pair", "_pair_exact", "_kick"], errors="ignore")
 
 
+def _label_fd_bookmaker(fixtures: pd.DataFrame) -> None:
+    """Rows priced by football-data.co.uk carry genuine bet365 1X2 columns."""
+    if "OddsBookmaker" not in fixtures.columns:
+        fixtures["OddsBookmaker"] = pd.Series(pd.NA, index=fixtures.index, dtype=object)
+    else:
+        fixtures["OddsBookmaker"] = fixtures["OddsBookmaker"].astype(object)
+    mask = (
+        fixtures["OddsProvider"].astype(str).eq("football-data")
+        & fixtures["OddsBookmaker"].isna()
+        & fixtures["B365H"].notna()
+    )
+    if not mask.any():
+        return
+    fixtures.loc[mask, "OddsBookmaker"] = "bet365"
+    for side in ("H", "D", "A"):
+        col = f"Odds{side}"
+        if col not in fixtures.columns:
+            fixtures[col] = float("nan")
+        fixtures.loc[mask, col] = fixtures.loc[mask, f"B365{side}"]
+
+
 def load_upcoming_fixtures(
     *,
     league: str = "EPL",
@@ -2353,8 +2776,8 @@ def load_upcoming_fixtures(
                 upcoming.attrs["league"] = code
                 upcoming.attrs["as_of"] = ref_ts
                 return upcoming
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Flashscore upcoming fetch failed for %s: %s", code, exc)
 
     if fotmob_raw is None:
         empty = pd.DataFrame()
@@ -2457,6 +2880,8 @@ def load_upcoming_fixtures(
                     fixtures.loc[fixtures["B365H"].notna(), "OddsProvider"] = (
                         "football-data"
                     )
+                if "OddsProvider" in fixtures.columns and "B365H" in fixtures.columns:
+                    _label_fd_bookmaker(fixtures)
 
     if fixtures.empty:
         fixtures.attrs["source_url"] = fs_url

@@ -18,10 +18,12 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Engine
@@ -125,6 +127,18 @@ class TeamAlias(Base):
             "source_team_id",
             "source_name",
             name="uq_team_alias_source",
+        ),
+        # NULLs are distinct in the constraint above, so id-less aliases (the
+        # common football-data case) would never dedup. This partial unique
+        # index covers them. Created by ``create_all`` for new databases only;
+        # existing stores rely on the resolver's check-before-insert.
+        Index(
+            "uq_team_alias_source_name_null_id",
+            "source_type",
+            "source_name",
+            unique=True,
+            sqlite_where=text("source_team_id IS NULL"),
+            postgresql_where=text("source_team_id IS NULL"),
         ),
     )
 

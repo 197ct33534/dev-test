@@ -36,6 +36,8 @@ import json
 import logging
 import re
 import sqlite3
+import threading
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -185,6 +187,7 @@ CREATE TABLE IF NOT EXISTS matches (
     AvgAHH REAL,
     AvgAHA REAL,
     fotmob_match_id TEXT,
+    flashscore_event_id TEXT,
     round TEXT,
     FOREIGN KEY (comp_id) REFERENCES competitions(comp_id),
     FOREIGN KEY (home_team_id) REFERENCES teams(team_id),
@@ -346,13 +349,27 @@ def save_upcoming_to_db(
     *,
     db_path: Path | str = GLOBAL_DB_PATH,
     updated_at: datetime | None = None,
+    allow_empty: bool = False,
 ) -> int:
     """Replace cached upcoming fixtures+odds for ``comp_id``.
 
-    Returns number of rows written. Empty ``df`` clears the competition cache.
+    Returns number of rows written.
+
+    An empty / ``None`` ``df`` is treated as a failed fetch: the existing cache
+    is left untouched (no DELETE, no fresh ``updated_at`` stamp) and 0 is
+    returned with a warning. Pass ``allow_empty=True`` to deliberately clear
+    the competition cache.
     """
     code = str(comp_id or "").strip().upper()
     if not code:
+        return 0
+
+    if (df is None or getattr(df, "empty", True)) and not allow_empty:
+        logger.warning(
+            "save_upcoming_to_db(%s): empty frame — keeping existing cache "
+            "(pass allow_empty=True to clear)",
+            code,
+        )
         return 0
 
     ts = updated_at or datetime.now(timezone.utc)
@@ -431,6 +448,7 @@ def load_upcoming_from_db(
     db_path: Path | str = GLOBAL_DB_PATH,
     max_age_minutes: float | None = None,
     now: datetime | None = None,
+    future_only: bool = False,
 ) -> tuple[pd.DataFrame, float | None]:
     """Load cached upcoming fixtures+odds from ``global_matches.db``.
 
@@ -440,9 +458,15 @@ def load_upcoming_from_db(
         Competition code (``EPL``, ``UWCL``, …).
     max_age_minutes:
         When set, return an empty frame if the cache is older than this
-        (``last_updated_ts`` is still returned when known).
+        (``last_updated_ts`` is still returned when known). A cache with no
+        known timestamp is also treated as stale when this is set.
+        Recommended for any betting path (e.g. ``max_age_minutes=30``).
     now:
-        Reference time for age checks (default: UTC now).
+        Reference time for age checks and ``future_only`` (default: UTC now;
+        naive values are treated as UTC).
+    future_only:
+        When True, drop rows whose kickoff (``Kickoff``, else ``Date``; naive
+        UTC) is ``<= now`` or unknown — i.e. already started / finished.
 
     Returns
     -------
@@ -491,7 +515,9 @@ def load_upcoming_from_db(
                 except (TypeError, ValueError):
                     last_ts = None
 
-            if max_age_minutes is not None and last_ts is not None:
+            if max_age_minutes is not None:
+                if last_ts is None:
+                    return empty, None
                 age_min = (ref.timestamp() - last_ts) / 60.0
                 if age_min > float(max_age_minutes):
                     return empty, last_ts
@@ -528,6 +554,10 @@ def load_upcoming_from_db(
     for col in ("Kickoff", "Date"):
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
+    if future_only:
+        df = _filter_future_kickoffs(df, ref)
+        if df.empty:
+            return pd.DataFrame(), last_ts
     for col in (
         "B365H",
         "B365D",
@@ -557,6 +587,23 @@ def load_upcoming_from_db(
     if last_ts is not None:
         df.attrs["db_updated_at"] = last_ts
     return df.reset_index(drop=True), last_ts
+
+
+def _filter_future_kickoffs(df: pd.DataFrame, ref: datetime) -> pd.DataFrame:
+    """Keep rows whose kickoff (naive UTC) is strictly after ``ref``."""
+    ko: pd.Series | None = None
+    for col in ("Kickoff", "Date"):
+        if col not in df.columns:
+            continue
+        cur = pd.to_datetime(df[col], errors="coerce", utc=True)
+        ko = cur if ko is None else ko.fillna(cur)
+    if ko is None:
+        return df.iloc[0:0]
+    ref_ts = pd.Timestamp(ref)
+    if ref_ts.tzinfo is None:
+        ref_ts = ref_ts.tz_localize("UTC")
+    mask = ko.notna() & (ko > ref_ts)
+    return df.loc[mask.to_numpy()].reset_index(drop=True)
 
 
 def upcoming_cache_age_minutes(
@@ -644,21 +691,113 @@ def make_team_key(name: str, gender: str | None = GENDER_MEN) -> str:
     return f"{slug}_{normalize_gender(gender)}"
 
 
+SQLITE_TIMEOUT_S = 30.0
+SQLITE_BUSY_TIMEOUT_MS = 30000
+
+# DB paths whose schema was initialised by this process (see connect_global_db).
+_SCHEMA_READY: set[str] = set()
+_SCHEMA_LOCK = threading.Lock()
+
+
+class _ClosingConnection(sqlite3.Connection):
+    """``sqlite3.Connection`` whose ``with`` block also closes the handle.
+
+    Stock connections only commit/rollback on ``__exit__`` and leak the file
+    handle; every ``with connect_global_db(...) as conn:`` now closes it.
+    Explicit ``conn.close()`` callers are unaffected.
+    """
+
+    def __exit__(self, exc_type, exc, tb):  # type: ignore[override]
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+
+
+def _schema_key(db_path: Path | str) -> str:
+    try:
+        return str(Path(db_path).resolve())
+    except OSError:
+        return str(db_path)
+
+
+def _open_sqlite(
+    db_path: Path | str,
+    *,
+    closing_ctx: bool = True,
+) -> sqlite3.Connection:
+    """Open SQLite with a 30 s busy timeout (and the closing ``with`` semantics)."""
+    kwargs: dict[str, Any] = {"timeout": SQLITE_TIMEOUT_S}
+    if closing_ctx:
+        kwargs["factory"] = _ClosingConnection
+    conn = sqlite3.connect(db_path, **kwargs)
+    try:
+        conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    except sqlite3.Error:  # pragma: no cover - best effort
+        pass
+    return conn
+
+
+def _enable_wal(conn: sqlite3.Connection) -> None:
+    """Switch the DB file to WAL (persistent; readers no longer block writers)."""
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.Error as exc:
+        logger.warning("global_matches.db: could not enable WAL: %s", exc)
+
+
+def _schema_is_current(conn: sqlite3.Connection) -> bool:
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = ?", ("schema_version",)
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    if row is None:
+        return False
+    try:
+        return int(row[0]) == GLOBAL_DB_VERSION
+    except (TypeError, ValueError):
+        return False
+
+
 def connect_global_db(
     db_path: Path | str = GLOBAL_DB_PATH,
     *,
     init: bool = True,
 ) -> sqlite3.Connection:
-    """Open ``global_matches.db``, optionally creating schema + seed comps."""
+    """Open ``global_matches.db``, optionally creating schema + seed comps.
+
+    ``init=True`` guarantees the schema exists, but the (write-heavy)
+    :func:`init_schema` runs only once per process per DB path; later calls
+    just verify ``meta.schema_version`` with a cheap read. Connections use a
+    30 s busy timeout, the file is switched to WAL on first init, and
+    ``with connect_global_db(...) as conn:`` closes the connection on exit.
+    """
     if str(db_path) == ":memory:":
-        conn = sqlite3.connect(":memory:")
-    else:
-        path = ensure_data_dir(db_path)
-        conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    if init:
-        init_schema(conn)
+        conn = _open_sqlite(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        if init:
+            init_schema(conn)
+        return conn
+
+    path = ensure_data_dir(db_path)
+    conn = _open_sqlite(path)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        if init:
+            key = _schema_key(path)
+            if key not in _SCHEMA_READY or not _schema_is_current(conn):
+                with _SCHEMA_LOCK:
+                    if key not in _SCHEMA_READY or not _schema_is_current(conn):
+                        _enable_wal(conn)
+                        init_schema(conn)
+                        _SCHEMA_READY.add(key)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
@@ -715,6 +854,10 @@ def _ensure_flashscore_team_columns(conn: sqlite3.Connection) -> None:
     for col, typ in alters:
         if col not in cols:
             conn.execute(f"ALTER TABLE teams ADD COLUMN {col} {typ}")
+    if "matches" in tables and "flashscore_event_id" not in _table_columns(
+        conn, "matches"
+    ):
+        conn.execute("ALTER TABLE matches ADD COLUMN flashscore_event_id TEXT")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS team_rest_cache (
@@ -787,10 +930,18 @@ def _ensure_team_profile_indexes(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_schema_if_needed(conn: sqlite3.Connection) -> None:
-    """Rebuild teams/matches when pre-v2 schema lacks gender-scoped keys.
+    """Move aside teams/matches only when the pre-v2 schema is positively detected.
 
-    League SQLite files remain the source of truth; callers re-sync after.
-    v2→v3 is additive (see :func:`_ensure_flashscore_team_columns`).
+    * ``teams`` missing → fresh DB, nothing to do.
+    * ``teams`` has ``team_key`` → already v2+; never rebuild, regardless of
+      what ``meta.schema_version`` says (it may be missing or unreadable).
+      :func:`init_schema` stamps the current version afterwards.
+    * ``teams`` exists but its columns cannot be read → refuse to touch it.
+    * ``teams`` exists without ``team_key`` (legacy v1) → rename ``matches``,
+      ``team_rest_cache`` and ``teams`` to ``*_legacy_v1_<ts>`` backups (no
+      rows are deleted) so :data:`SCHEMA_SQL` can recreate them. League SQLite
+      files remain the source of truth; callers re-sync after.
+    v2→v3+ is additive (see :func:`_ensure_flashscore_team_columns`).
     """
     tables = {
         str(r[0])
@@ -800,23 +951,50 @@ def _migrate_schema_if_needed(conn: sqlite3.Connection) -> None:
     }
     if "teams" not in tables:
         return
-    ver = _read_schema_version(conn)
-    # Pre-v2 rebuild only — do not drop on v2→v3 (flashscore columns).
-    if ver >= 2 and _teams_has_team_key(conn):
+    cols = _table_columns(conn, "teams")
+    if not cols:
+        logger.error(
+            "global_matches.db: cannot read teams columns; skipping schema "
+            "migration (no tables modified)"
+        )
         return
-    logger.warning(
-        "global_matches.db schema v%s → v%s (gender team_key); rebuilding tables",
-        ver,
-        GLOBAL_DB_VERSION,
+    if "team_key" in cols:
+        ver = _read_schema_version(conn)
+        if ver < 2:
+            logger.warning(
+                "global_matches.db: teams already has team_key but "
+                "schema_version=%s; stamping v%s without rebuild",
+                ver,
+                GLOBAL_DB_VERSION,
+            )
+        return
+
+    suffix = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    logger.error(
+        "global_matches.db: legacy pre-v2 schema detected (teams without "
+        "team_key). Moving teams/matches/team_rest_cache aside to "
+        "*_legacy_v1_%s and rebuilding — re-sync from league DBs required.",
+        suffix,
     )
+    conn.commit()
     conn.execute("PRAGMA foreign_keys = OFF")
-    conn.executescript(
-        """
-        DROP TABLE IF EXISTS matches;
-        DROP TABLE IF EXISTS teams;
-        """
-    )
-    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        for table in ("matches", "team_rest_cache", "teams"):
+            if table not in tables:
+                continue
+            backup = f"{table}_legacy_v1_{suffix}"
+            # Free index names so SCHEMA_SQL can recreate them on new tables.
+            idx_rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND tbl_name=? AND sql IS NOT NULL",
+                (table,),
+            ).fetchall()
+            for (idx_name,) in idx_rows:
+                conn.execute(f'DROP INDEX IF EXISTS "{idx_name}"')
+            conn.execute(f'ALTER TABLE "{table}" RENAME TO "{backup}"')
+        conn.commit()
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
@@ -1425,6 +1603,8 @@ def upsert_match(
         "season": "season",
         "season_start": "season_start",
         "fotmob_match_id": "fotmob_match_id",
+        "FlashscoreEventId": "flashscore_event_id",
+        "flashscore_event_id": "flashscore_event_id",
         "round": "round",
     }
 
@@ -1547,7 +1727,7 @@ def global_db_has_matches(
     if not path.is_file():
         return False
     try:
-        with sqlite3.connect(path) as conn:
+        with closing(_open_sqlite(path, closing_ctx=False)) as conn:
             if comp_id:
                 row = conn.execute(
                     "SELECT COUNT(*) FROM matches WHERE comp_id = ?",
@@ -1614,7 +1794,7 @@ def read_matches_as_legacy(
         sql += " WHERE m.comp_id = ?"
         params.append(str(comp_id).strip().upper())
 
-    with sqlite3.connect(path) as conn:
+    with closing(_open_sqlite(path, closing_ctx=False)) as conn:
         try:
             df = pd.read_sql(sql, conn, params=params or None)
         except (sqlite3.Error, pd.errors.DatabaseError):

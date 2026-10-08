@@ -129,14 +129,23 @@ def load_japan_upcoming(
     *,
     db_path: Any = GLOBAL_DB_PATH,
     comp_ids: Sequence[str] = JP_COMP_IDS,
+    include_started: bool = False,
+    now: Any = None,
 ) -> pd.DataFrame:
     """Combine cached upcoming fixtures for Japan cup competitions.
 
-    Adds ``comp_id`` when missing and sorts by kickoff ascending.
+    Adds ``comp_id`` when missing and sorts by kickoff ascending. Fixtures whose
+    kickoff is ``<= now`` (default: UTC now; naive = UTC) or unknown are
+    dropped unless ``include_started=True``.
     """
     frames: list[pd.DataFrame] = []
     for code in comp_ids:
-        df, _ts = load_upcoming_from_db(str(code), db_path=db_path)
+        df, _ts = load_upcoming_from_db(
+            str(code),
+            db_path=db_path,
+            now=now,
+            future_only=not include_started,
+        )
         if df is None or df.empty:
             continue
         out = df.copy()

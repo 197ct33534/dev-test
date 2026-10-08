@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Callable
 
@@ -41,6 +42,7 @@ def _load_legacy_pipeline() -> Any:
 
 
 _legacy = _load_legacy_pipeline()
+_REFRESH_LOCK = threading.RLock()
 
 if _legacy is not None:
     sync_to_global_db: Callable[..., Any] = _legacy.sync_to_global_db
@@ -55,9 +57,12 @@ if _legacy is not None:
         # Late import avoids circular binding during package init.
         import src.pipeline as pkg
 
-        _legacy.load_league_data = pkg.load_league_data
-        _legacy.sync_to_global_db = pkg.sync_to_global_db
-        return _legacy.refresh_data(*args, **kwargs)
+        # The legacy module's globals are rebound per call; serialize so two
+        # threads never interleave the rebinding with another call's run.
+        with _REFRESH_LOCK:
+            _legacy.load_league_data = pkg.load_league_data
+            _legacy.sync_to_global_db = pkg.sync_to_global_db
+            return _legacy.refresh_data(*args, **kwargs)
 
 else:  # pragma: no cover — legacy file always present in this repo
 

@@ -12,7 +12,9 @@ Quant Engine path.
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from functools import lru_cache
+from pathlib import Path
 from typing import AsyncIterator, Optional
 
 from sqlalchemy.ext.asyncio import (
@@ -22,7 +24,11 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-DEFAULT_SQLITE_URL = "sqlite+aiosqlite:///./data/quant_engine_v2.db"
+# Resolve the default SQLite file against the project root (not the CWD), so
+# scripts / workers launched from other directories hit the same database.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_SQLITE_PATH = PROJECT_ROOT / "data" / "quant_engine_v2.db"
+DEFAULT_SQLITE_URL = f"sqlite+aiosqlite:///{DEFAULT_SQLITE_PATH.as_posix()}"
 
 
 def get_database_url(explicit: Optional[str] = None) -> str:
@@ -74,10 +80,15 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return async_session_factory()
 
 
+@asynccontextmanager
 async def session_scope(
     factory: Optional[async_sessionmaker[AsyncSession]] = None,
 ) -> AsyncIterator[AsyncSession]:
-    """Async context helper yielding a session that commits on success."""
+    """Async context manager yielding a session that commits on success::
+
+        async with session_scope() as session:
+            ...
+    """
     maker = factory or get_session_factory()
     async with maker() as session:
         try:

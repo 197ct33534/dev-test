@@ -17,6 +17,7 @@ import logging
 import re
 import time
 import warnings
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -323,6 +324,7 @@ def _fetch_text_retry(
             return _fetch_text(
                 url,
                 timeout=timeout,
+                retries=1,  # this wrapper owns the retry loop
                 referer="https://www.flashscore.com/",
                 extra_headers={
                     "Accept": "text/html,*/*",
@@ -804,6 +806,27 @@ def fetch_league_history(
     return combined
 
 
+@dataclass
+class UpcomingFetchResult:
+    """Outcome of :func:`fetch_league_upcoming_result`.
+
+    ``ok`` is False when the schedule source could not be fetched (network /
+    config error). Persist only when :attr:`persistable` is True, otherwise a
+    failure would overwrite the cached fixtures with nothing.
+    """
+
+    frame: pd.DataFrame
+    ok: bool
+    league: str | None = None
+    error: str | None = None
+    warnings: list[str] = field(default_factory=list)
+    odds_ok: bool | None = None
+
+    @property
+    def persistable(self) -> bool:
+        return bool(self.ok) and self.frame is not None and not self.frame.empty
+
+
 def fetch_league_upcoming(
     league_key: str,
     *,
@@ -813,15 +836,65 @@ def fetch_league_upcoming(
     request_delay_s: float = 0.25,
     now: datetime | None = None,
 ) -> pd.DataFrame:
-    """Upcoming fixtures within ``within_hours`` (+ Flashscore odds when possible)."""
+    """Upcoming fixtures within ``within_hours`` (+ Flashscore odds when possible).
+
+    Back-compat wrapper returning only the frame. Callers that persist the
+    result should use :func:`fetch_league_upcoming_result` and pass its
+    ``ok`` flag to :func:`persist_league_upcoming` so a failed fetch never
+    wipes the cached fixtures.
+    """
+    return fetch_league_upcoming_result(
+        league_key,
+        within_hours=within_hours,
+        include_odds=include_odds,
+        max_events=max_events,
+        request_delay_s=request_delay_s,
+        now=now,
+    ).frame
+
+
+def fetch_league_upcoming_result(
+    league_key: str,
+    *,
+    within_hours: float = DEFAULT_UPCOMING_HOURS,
+    include_odds: bool = True,
+    max_events: int = 24,
+    request_delay_s: float = 0.25,
+    now: datetime | None = None,
+) -> UpcomingFetchResult:
+    """Like :func:`fetch_league_upcoming` but with an explicit success status."""
     warnings_list: list[str] = []
+    code: str | None = None
+
+    def _result(
+        frame: pd.DataFrame,
+        *,
+        ok: bool,
+        error: str | None = None,
+        odds_ok: bool | None = None,
+    ) -> UpcomingFetchResult:
+        frame.attrs["download_warnings"] = list(warnings_list)
+        frame.attrs["fetch_ok"] = bool(ok)
+        if code:
+            frame.attrs["league"] = code
+        if not ok:
+            logger.warning(
+                "upcoming fetch failed for %s: %s", code or league_key, error
+            )
+        return UpcomingFetchResult(
+            frame=frame,
+            ok=bool(ok),
+            league=code,
+            error=error,
+            warnings=list(warnings_list),
+            odds_ok=odds_ok,
+        )
+
     try:
         code, cfg = resolve_league_config(league_key)
     except ValueError as exc:
         warnings_list.append(str(exc))
-        out = _empty_upcoming_frame()
-        out.attrs["download_warnings"] = warnings_list
-        return out
+        return _result(_empty_upcoming_frame(), ok=False, error=str(exc))
 
     register_league_aliases_globally(code)
     entry = get_league_entry(code) or {}
@@ -830,10 +903,9 @@ def fetch_league_upcoming(
     if not fixtures_url and path:
         fixtures_url = _flashscore_url(path, page="fixtures")
     if not fixtures_url:
-        warnings_list.append(f"No flashscore fixtures URL for {code}")
-        out = _empty_upcoming_frame()
-        out.attrs["download_warnings"] = warnings_list
-        return out
+        msg = f"No flashscore fixtures URL for {code}"
+        warnings_list.append(msg)
+        return _result(_empty_upcoming_frame(), ok=False, error=msg)
 
     try:
         events = fetch_flashscore_fixture_events(
@@ -842,16 +914,13 @@ def fetch_league_upcoming(
             normalize_women=(code == "UWCL"),
         )
     except Exception as exc:  # noqa: BLE001
-        warnings_list.append(f"fixtures fetch failed: {exc}")
-        logger.warning("fixtures fetch failed for %s: %s", code, exc)
-        out = _empty_upcoming_frame()
-        out.attrs["download_warnings"] = warnings_list
-        return out
+        msg = f"fixtures fetch failed: {exc}"
+        warnings_list.append(msg)
+        return _result(_empty_upcoming_frame(), ok=False, error=msg)
 
     if events.empty:
-        out = _empty_upcoming_frame()
-        out.attrs["download_warnings"] = warnings_list + ["no upcoming fixtures"]
-        return out
+        warnings_list.append("no upcoming fixtures")
+        return _result(_empty_upcoming_frame(), ok=True)
 
     events = apply_league_team_aliases(events, code)
     events["league_id"] = code
@@ -895,15 +964,12 @@ def fetch_league_upcoming(
     mask = (kick >= ref_ts) & (kick <= horizon)
     events = events.loc[mask].copy()
     if events.empty:
-        out = _empty_upcoming_frame()
-        out.attrs["download_warnings"] = warnings_list + [
-            f"no fixtures within {within_hours}h"
-        ]
-        out.attrs["league"] = code
-        return out
+        warnings_list.append(f"no fixtures within {within_hours}h")
+        return _result(_empty_upcoming_frame(), ok=True)
 
     events = events.head(int(max_events)).reset_index(drop=True)
 
+    odds_ok: bool | None = None
     if include_odds and "FlashscoreEventId" in events.columns:
         odds_rows: list[dict[str, Any]] = []
         event_ids = [str(x) for x in events["FlashscoreEventId"].tolist()]
@@ -932,14 +998,15 @@ def fetch_league_upcoming(
             if not odds:
                 continue
             odds_rows.append({"FlashscoreEventId": eid, **odds})
+        odds_ok = bool(odds_rows)
         if odds_rows:
             odds_df = pd.DataFrame(odds_rows)
             events = events.merge(odds_df, on="FlashscoreEventId", how="left")
+        else:
+            warnings_list.append("no odds fetched for any upcoming event")
 
-    events.attrs["download_warnings"] = warnings_list
-    events.attrs["league"] = code
     events.attrs["data_source"] = "flashscore"
-    return events
+    return _result(events, ok=True, odds_ok=odds_ok)
 
 
 def persist_league_matches(
@@ -995,8 +1062,17 @@ def persist_league_matches(
 def persist_league_upcoming(
     league_key: str,
     upcoming: pd.DataFrame,
+    *,
+    fetch_ok: bool | None = None,
+    allow_empty: bool = False,
 ) -> dict[str, Any]:
-    """Write upcoming fixtures (+ odds) into ``global_matches.upcoming_fixtures``."""
+    """Write upcoming fixtures (+ odds) into ``global_matches.upcoming_fixtures``.
+
+    ``save_upcoming_to_db`` replaces the whole competition cache, so this
+    refuses to write when ``fetch_ok is False`` (the fetch failed) or when
+    ``upcoming`` is empty (unless ``allow_empty=True``). In both cases the
+    existing cache is left untouched and ``stats["skipped"]`` explains why.
+    """
     from src.global_db import (
         GLOBAL_DB_PATH,
         connect_global_db,
@@ -1010,6 +1086,22 @@ def persist_league_upcoming(
     name = str(cfg.get("label") or code)
 
     stats: dict[str, Any] = {"comp_id": code, "upcoming_rows": 0}
+    if fetch_ok is False:
+        stats["skipped"] = True
+        stats["reason"] = "fetch_failed"
+        logger.warning(
+            "persist_league_upcoming(%s): fetch failed; keeping cached fixtures", code
+        )
+        return stats
+    if (upcoming is None or upcoming.empty) and not allow_empty:
+        stats["skipped"] = True
+        stats["reason"] = "empty"
+        logger.info(
+            "persist_league_upcoming(%s): no fixtures fetched; keeping cached fixtures",
+            code,
+        )
+        return stats
+
     work = upcoming
     if work is not None and not work.empty:
         work = apply_league_team_aliases(work, code)
@@ -1042,13 +1134,15 @@ def fetch_and_persist_league(
     (+ LightGBM when sample allows) via :func:`src.models.fit_league_models`.
     """
     history = fetch_league_history(league_key, n_seasons=n_seasons)
-    upcoming = fetch_league_upcoming(league_key, within_hours=upcoming_hours)
+    upcoming_res = fetch_league_upcoming_result(league_key, within_hours=upcoming_hours)
+    upcoming = upcoming_res.frame
     result: dict[str, Any] = {
         "league": str(league_key).upper(),
         "history_rows": int(len(history)),
         "upcoming_rows": int(len(upcoming)),
         "warnings": list(history.attrs.get("download_warnings") or [])
-        + list(upcoming.attrs.get("download_warnings") or []),
+        + list(upcoming_res.warnings),
+        "upcoming_fetch_ok": bool(upcoming_res.ok),
         "dry_run": dry_run,
     }
     if dry_run:
@@ -1073,7 +1167,9 @@ def fetch_and_persist_league(
         return result
 
     result["persist"] = persist_league_matches(league_key, history)
-    result["persist_upcoming"] = persist_league_upcoming(league_key, upcoming)
+    result["persist_upcoming"] = persist_league_upcoming(
+        league_key, upcoming, fetch_ok=upcoming_res.ok
+    )
 
     if fit_models and not history.empty:
         try:

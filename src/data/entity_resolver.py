@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import re
+import unicodedata
 import uuid
 from typing import Optional, Union
 
@@ -20,6 +22,28 @@ logger = logging.getLogger(__name__)
 
 UNMAPPED = "UNMAPPED"
 MAPPED = "MAPPED"
+
+# Generic club-form tokens dropped when comparing team names.
+_TEAM_NOISE_TOKENS: frozenset[str] = frozenset({"fc", "cf", "sc"})
+_NON_ALNUM_RE = re.compile(r"[^0-9a-z]+")
+
+
+def normalize_team_key(name: Optional[str]) -> str:
+    """Comparison key for team names.
+
+    Casefolds, strips accents, replaces punctuation with spaces and drops the
+    generic ``FC`` / ``CF`` / ``SC`` tokens, e.g. ``"Atlético Madrid CF"`` and
+    ``"atletico-madrid"`` both map to ``"atletico madrid"``. If dropping the
+    tokens would leave nothing (a club literally named ``"FC"``), they are kept.
+    """
+    if not name:
+        return ""
+    text = unicodedata.normalize("NFKD", str(name))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.casefold().replace("&", " and ")
+    tokens = [t for t in _NON_ALNUM_RE.split(text) if t]
+    kept = [t for t in tokens if t not in _TEAM_NOISE_TOKENS]
+    return " ".join(kept or tokens)
 
 try:
     from src.monitoring.data_monitor import DataMonitor, default_monitor
@@ -94,6 +118,27 @@ class EntityResolver:
         )
         if existing is not None:
             return existing.canonical_team_id
+
+        matched = await self._find_team_by_normalized_name(sess, name)
+        if matched is not None:
+            canonical_id, status = matched
+            sess.add(
+                TeamAlias(
+                    canonical_team_id=canonical_id,
+                    source_type=stype,
+                    source_team_id=sid,
+                    source_name=name.strip(),
+                    mapping_status=status or UNMAPPED,
+                )
+            )
+            await sess.flush()
+            logger.info(
+                "Team %s/%r matched existing canonical %s by normalized name",
+                stype,
+                name,
+                canonical_id,
+            )
+            return canonical_id
 
         team = CanonicalTeam(
             name=name.strip(),
@@ -290,6 +335,50 @@ class EntityResolver:
             row = result.scalar_one_or_none()
             if row is not None:
                 return row
+        return None
+
+    async def _find_team_by_normalized_name(
+        self,
+        session: AsyncSession,
+        name: str,
+    ) -> Optional[tuple[uuid.UUID, str]]:
+        """Unique canonical team whose name/alias normalizes like ``name``.
+
+        Returns ``(canonical_team_id, mapping_status)`` or ``None`` when there is
+        no match or the normalized key is ambiguous (several canonical teams).
+        """
+        key = normalize_team_key(name)
+        if not key:
+            return None
+        hits: dict[uuid.UUID, str] = {}
+        teams = (
+            await session.execute(
+                select(CanonicalTeam.id, CanonicalTeam.name, CanonicalTeam.mapping_status)
+            )
+        ).all()
+        status_by_id: dict[uuid.UUID, str] = {}
+        for tid, tname, tstatus in teams:
+            status_by_id[tid] = tstatus
+            if normalize_team_key(tname) == key:
+                hits[tid] = tstatus
+        aliases = (
+            await session.execute(
+                select(TeamAlias.canonical_team_id, TeamAlias.source_name)
+            )
+        ).all()
+        for tid, alias_name in aliases:
+            if normalize_team_key(alias_name) == key:
+                hits.setdefault(tid, status_by_id.get(tid, UNMAPPED))
+        if len(hits) == 1:
+            tid, status = next(iter(hits.items()))
+            return tid, status
+        if len(hits) > 1:
+            logger.warning(
+                "Ambiguous normalized team name %r (%d canonical teams); "
+                "creating a new UNMAPPED team",
+                name,
+                len(hits),
+            )
         return None
 
     async def _find_competition_alias(
