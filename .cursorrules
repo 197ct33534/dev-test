@@ -1,26 +1,36 @@
-# EPL Value Betting & Corner Recommender System
+# Football Value Betting — Multi-League Quant Stack
 
 ## Project Overview
-This project predicts Premier League match outcomes, goal distributions, and corner counts using statistical models (Dixon-Coles Poisson model) and identifies Value Bets by comparing model probabilities against bookmaker odds.
+Predicts match outcomes, goal distributions and corner counts for several
+competitions (EPL, LaLiga, UWCL, J.League Cup, Emperor's Cup — registry in
+`config/leagues.json`) using Dixon–Coles + LightGBM (ensemble on 1X2), and
+identifies Value Bets by comparing model probabilities with bookmaker odds.
+Data is consolidated in `data/global_matches.db`.
 
 ## Tech Stack
-- **Language**: Python 3.10+
-- **Data & Math**: Pandas, NumPy, SciPy (`scipy.optimize.minimize`), Statsmodels
-- **UI Framework**: Streamlit
-- **Data Source**: Direct CSV download from `football-data.co.uk`
+- **Language**: Python 3.10+ (dev machine runs 3.14)
+- **Data & Math**: Pandas, NumPy, SciPy (`scipy.optimize.minimize`), Statsmodels, LightGBM, scikit-learn
+- **UI**: Streamlit (`app.py`); React + Vite prototype in `dashboard/` (mock data only)
+- **API / bots**: FastAPI (`run_api.py`, `/api/v1`, `/api/v2`), Telegram bot + WebApp, background workers (`src/workers/`)
+- **Data Sources**: football-data.co.uk, Flashscore (fixtures + odds), Fotmob
 
 ## Core Domain Logic
 1. **Dixon-Coles Model**:
-   - Predicts goals for Home (\(X\)) and Away (\(Y\)) teams using attack/defense strengths and home advantage (\(\gamma\)).
+   - Predicts goals for Home (\(X\)) and Away (\(Y\)) teams using attack/defense strengths and home advantage (\(\gamma\)), time decay \(\xi\).
    - Uses tau adjustment \(\tau(x, y)\) for low scores (0-0, 1-0, 0-1, 1-1) with parameter \(\rho\).
-2. **Value Betting Engine**:
+   - Thin-history / cup competitions use weak-tier priors and league weights.
+2. **Value Betting Engine** (all constants in `src/config.py` — never hard-code them):
    - Fair Odds = \(1 / P_{\text{model}}\)
    - Expected Value (\(\text{EV}\)) = \((P_{\text{model}} \times \text{Odds}_{\text{bookmaker}}) - 1\)
-   - Recommend bet ONLY when \(\text{EV} \ge 0.05\) (\(5\%\)).
+   - Recommend bet ONLY when \(\text{EV} \ge 0.05\) (\(5\%\), `DEFAULT_MIN_EV`).
+   - Stake = fractional Kelly **0.10** (`DEFAULT_KELLY_FRACTION`, not Quarter Kelly), capped at **1% of bankroll** (`MAX_STAKE_PCT`); max 5 bets/day, one per match.
+   - Never price a recommendation or alert on assumed/default odds — skip the leg when real odds are missing.
 3. **Corner Prediction**:
-   - Poisson regression based on 3-season home/away corner stats (`HC`, `AC`).
+   - `CornerPredictor` (Poisson / GBM) on home/away corner stats (`HC`, `AC`).
 
 ## Coding Conventions
 - Use clean, modular Python functions with Type Hints.
 - Document functions using Docstrings describing math parameters (e.g., \(\lambda\), \(\mu\), \(\rho\)).
 - Keep Streamlit UI logic (`app.py`) separate from statistical calculation modules (`src/`).
+- Streamlit caches: never put refresh flags in cache keys; clear specific entries with `fn.clear(args)`; process-wide state goes through `st.cache_resource`.
+- Tests live in `tests/` (`python -m pytest`); manual smoke scripts live in `scripts/`.

@@ -28,3 +28,12 @@ credentials*.json
 .idea/
 .vscode/
 Thumbs.db
+
+# Trained model artifacts (regenerated locally / by workers)
+models/*
+!models/.gitkeep
+
+# Dashboard (Vite) build output & deps
+dashboard/node_modules/
+dashboard/dist/
+*.tsbuildinfo

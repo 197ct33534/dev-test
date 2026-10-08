@@ -3,7 +3,7 @@
 
 Usage
 -----
-python scripts/test_telegram.py
+python scripts/check_telegram.py
 
 Prints a masked preview of TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID, then POSTs
 a test message. On failure prints HTTP status + Telegram API description.

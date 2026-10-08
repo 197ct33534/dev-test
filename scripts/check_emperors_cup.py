@@ -2,9 +2,15 @@
 
 Examples
 --------
-    python scripts/test_emperors_cup.py
-    python scripts/test_emperors_cup.py --dry-run
-    python scripts/test_emperors_cup.py --hours 168 --seasons 2 --fit-models
+    python scripts/check_emperors_cup.py                      # fetch only (no writes)
+    python scripts/check_emperors_cup.py --db /tmp/global.db  # write to a scratch DB
+    python scripts/check_emperors_cup.py --write              # write production data/ DBs
+    python scripts/check_emperors_cup.py --hours 168 --seasons 2 --fit-models
+
+Nothing under ``data/`` is touched unless ``--write`` is given. ``--db PATH``
+writes the global DB to PATH only (the legacy league DB is skipped).
+
+Exit codes: 0 OK, 1 hard failure, 2 config/alias failure, 3 network failure.
 """
 
 from __future__ import annotations
@@ -23,8 +29,11 @@ if str(ROOT) not in sys.path:
 LEAGUE = "EMPERORS_CUP"
 
 
+EXIT_NETWORK_FAIL = 3
+
+
 def _soft_network_fail(exc: BaseException) -> bool:
-    """True when failure looks like network / remote timeout (exit 0 with message)."""
+    """True when failure looks like network / remote timeout (exit 3 with message)."""
     name = type(exc).__name__
     msg = str(exc).lower()
     needles = (
@@ -99,7 +108,18 @@ def main() -> int:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Fetch only; do not write SQLite",
+        help="Fetch only; do not write SQLite (default unless --db/--write)",
+    )
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=None,
+        help="Write fetched rows to this global_matches.db path (not data/)",
+    )
+    parser.add_argument(
+        "--write",
+        action="store_true",
+        help="Write to the production data/ DBs (global + legacy league DB)",
     )
     parser.add_argument("--seasons", type=int, default=2, help="History seasons")
     parser.add_argument(
@@ -119,6 +139,13 @@ def main() -> int:
         help="Skip bookmaker odds fetch (faster)",
     )
     args = parser.parse_args()
+    if args.db is not None and args.write:
+        parser.error("use either --db PATH or --write, not both")
+    if args.db is None and not args.write:
+        args.dry_run = True
+    if args.dry_run:
+        args.db = None
+        args.write = False
 
     # Windows consoles often default to cp1252 — keep JSON printable.
     try:
@@ -198,11 +225,11 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         if _soft_network_fail(exc):
             print(
-                f"SOFT FAIL (network): {type(exc).__name__}: {exc}\n"
+                f"NETWORK FAIL: {type(exc).__name__}: {exc}\n"
                 "Registry + JP_* aliases OK; retry when Flashscore is reachable.",
                 file=sys.stderr,
             )
-            return 0
+            return EXIT_NETWORK_FAIL
         print(f"HARD FAIL during fetch: {exc}", file=sys.stderr)
         traceback.print_exc()
         return 1
@@ -218,11 +245,11 @@ def main() -> int:
             for n in ("failed to fetch", "timeout", "403", "429", "connection")
         ):
             print(
-                "SOFT FAIL (network): empty history+upcoming with fetch warnings:\n"
+                "NETWORK FAIL: empty history+upcoming with fetch warnings:\n"
                 + "\n".join(hist_warn + up_warn),
                 file=sys.stderr,
             )
-            return 0
+            return EXIT_NETWORK_FAIL
 
     teams: set[str] = set()
     if history is not None and not history.empty:
@@ -252,6 +279,11 @@ def main() -> int:
         "history_warnings": hist_warn,
         "upcoming_warnings": up_warn,
         "dry_run": bool(args.dry_run),
+        "target_db": (
+            str(args.db)
+            if args.db is not None
+            else ("data/ (production)" if args.write else None)
+        ),
     }
 
     if upcoming is not None and not upcoming.empty:
@@ -278,10 +310,23 @@ def main() -> int:
 
     if not args.dry_run:
         try:
-            if history is not None and not history.empty:
-                summary["persist_history"] = persist_league_matches(LEAGUE, history)
-            if upcoming is not None:
-                summary["persist_upcoming"] = persist_league_upcoming(LEAGUE, upcoming)
+            import src.global_db as gdb
+
+            original_global = gdb.GLOBAL_DB_PATH
+            if args.db is not None:
+                # persist_* resolve GLOBAL_DB_PATH from src.global_db at call time.
+                gdb.GLOBAL_DB_PATH = Path(args.db)
+            try:
+                if history is not None and not history.empty:
+                    summary["persist_history"] = persist_league_matches(
+                        LEAGUE, history, also_legacy=bool(args.write)
+                    )
+                if upcoming is not None and not upcoming.empty:
+                    summary["persist_upcoming"] = persist_league_upcoming(
+                        LEAGUE, upcoming
+                    )
+            finally:
+                gdb.GLOBAL_DB_PATH = original_global
         except Exception as exc:  # noqa: BLE001
             print(f"HARD FAIL during persist: {exc}", file=sys.stderr)
             traceback.print_exc()

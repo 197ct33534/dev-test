@@ -8,10 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 import re
 import sys
 import threading
+import time
 from typing import Any, Mapping, Sequence
+
+_LOG = logging.getLogger("app")
 
 # Windows + asyncio Proactor: remote host đóng socket (Flashscore/Streamlit)
 # hay ném ConnectionResetError trong callback — nhiễu, không làm sập app.
@@ -69,6 +74,7 @@ from src.dixon_coles import (
     WEAK_TIER_NEW_TEAM_DEFENCE,
 )
 from src.models import (
+    NEW_TEAM_KELLY_CAP,
     ensemble_weight_for_sample,
     maybe_wrap_with_league_weights,
     resolve_fixture_teams,
@@ -87,6 +93,7 @@ from src.journal import (
     update_closing_odds,
 )
 from src.ml_model import EPLMachineLearningModel
+from src.league_registry import is_cup_competition
 from src.backtester import (
     BacktestConfig,
     format_backtest_report,
@@ -423,7 +430,7 @@ def _plotly(fig: go.Figure, *, height: int | None = None) -> None:
         fig.update_layout(height=int(height))
     st.plotly_chart(
         fig,
-        use_container_width=True,
+        width="stretch",
         config={
             "responsive": True,
             "displayModeBar": False,
@@ -622,7 +629,7 @@ def _render_flashscore_match_link_analyzer(
     if not st.button(
         "🔍 Phân Tích Trận Này",
         key=f"{key_prefix}_analyze_btn",
-        use_container_width=True,
+        width="stretch",
         type="primary",
     ):
         return
@@ -843,7 +850,7 @@ def _render_lite_bet_card(
             if st.button(
                 "🔍 Xem Chi Tiết",
                 key=f"{key_prefix}_pro_{idx}_{mid}_{lg}",
-                use_container_width=True,
+                width="stretch",
             ):
                 _open_pro_match_detail(
                     match_id=mid,
@@ -987,7 +994,7 @@ def _render_team_profile_buttons(
         if st.button(
             f"📊 {label_h}",
             key=home_key,
-            use_container_width=True,
+            width="stretch",
             help="Hồ sơ & lịch thi đấu đội chủ",
         ):
             show_team_profile(home)
@@ -996,7 +1003,7 @@ def _render_team_profile_buttons(
         if st.button(
             f"📊 {label_a}",
             key=away_key,
-            use_container_width=True,
+            width="stretch",
             help="Hồ sơ & lịch thi đấu đội khách",
         ):
             show_team_profile(away)
@@ -1118,7 +1125,7 @@ def _render_manual_team_import_ui(
             if st.button(
                 "📥 Bóc Tách & Nạp Data",
                 key=btn_key,
-                use_container_width=True,
+                width="stretch",
             ):
                 url_val = str(st.session_state.get(widget_key) or "").strip()
                 if not url_val:
@@ -1574,28 +1581,54 @@ def _odds_families_available(df: pd.DataFrame) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-@st.cache_data(show_spinner="Đang tải kết quả giải đấu…")
+# Cache lifetimes / bounds. Raw results change at most a few times per day;
+# models are retrained when their (league, n_seasons, n_train[, xi]) key changes
+# or after the TTL so long-running servers pick up fresh history.
+_RAW_DATA_TTL_S = 6 * 3600
+_MODEL_TTL_S = 6 * 3600
+_MODEL_CACHE_MAX_ENTRIES = 4
+# Dixon–Coles is fitted for the sidebar league + alt league + 2 Japan cups.
+_DC_CACHE_MAX_ENTRIES = 8
+
+
+@st.cache_data(
+    ttl=_RAW_DATA_TTL_S,
+    max_entries=16,
+    show_spinner="Đang tải kết quả giải đấu…",
+)
 def _load_raw_data(
-    league: str, n_seasons: int, force_refresh: bool = False, _cache_ver: int = 4
+    league: str,
+    n_seasons: int,
+    cache_ver: int = 5,
+    _force_refresh: bool = False,
 ) -> pd.DataFrame:
-    # ``db_path=None`` prefers global_matches.db (multi-league), then legacy.
+    """Load league results (``db_path=None`` prefers global_matches.db).
+
+    ``_force_refresh`` is *excluded* from the cache key (leading underscore).
+    The refresh button clears this entry (``_load_raw_data.clear(league, n)``)
+    and then calls once with ``_force_refresh=True`` so the fresh download
+    lands under the normal key — later renders hit it without retraining twice.
+    """
     return load_league_data(
         league=league,
         n_seasons=n_seasons,
-        force_refresh=force_refresh,
+        force_refresh=bool(_force_refresh),
         db_path=None,
     )
 
 
-@st.cache_data(show_spinner="Đang cắt mẫu huấn luyện…")
+@st.cache_data(
+    ttl=_RAW_DATA_TTL_S,
+    max_entries=32,
+    show_spinner="Đang cắt mẫu huấn luyện…",
+)
 def _train_slice(
     league: str,
     n_seasons: int,
     n_train: int,
-    force_refresh: bool = False,
-    _cache_ver: int = 3,
+    cache_ver: int = 4,
 ) -> pd.DataFrame:
-    raw = _load_raw_data(league, n_seasons, force_refresh=force_refresh)
+    raw = _load_raw_data(league, n_seasons)
     if raw.empty:
         return raw
     ordered = raw.sort_values("Date")
@@ -1607,16 +1640,17 @@ def _train_slice(
     return out
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=300, max_entries=16, show_spinner=False)
 def _fetch_fixtures_and_odds(
-    league: str, n_seasons: int, force_refresh: bool = False, _cache_ver: int = 4
+    league: str, n_seasons: int, cache_ver: int = 5
 ) -> pd.DataFrame:
     """Network fetch of fixtures+odds; persists to ``global_matches.db``.
 
     Cached 5 minutes so tab switches / widget interactions do not re-hit
-    Flashscore. Hashable args only (league key, ints, bool).
+    Flashscore. Hashable args only (league key, ints). A failed DB save is
+    logged and surfaced via ``attrs["db_save_error"]`` (shown by the caller).
     """
-    results = _load_raw_data(league, n_seasons, force_refresh=force_refresh)
+    results = _load_raw_data(league, n_seasons)
     fx = load_upcoming_fixtures(
         league=league,
         results=results,
@@ -1625,22 +1659,68 @@ def _fetch_fixtures_and_odds(
     )
     try:
         save_upcoming_to_db(league, fx)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        _LOG.warning("save_upcoming_to_db(%s) failed: %s", league, exc)
+        try:
+            fx.attrs["db_save_error"] = str(exc)[:200]
+        except Exception:  # noqa: BLE001
+            pass
     return fx
 
 
 # Stale DB cache → background refresh threshold (minutes).
 _FIXTURES_STALE_MINUTES = 15
-_FX_BG_LOCK = threading.Lock()
-_FX_BG_RUNNING: set[str] = set()
+# After a failed background refresh, do not respawn for this many seconds.
+_BG_FAILURE_BACKOFF_S = 300.0
 
 
-def _bg_refresh_fixtures(league: str, n_seasons: int) -> None:
-    """Fetch fixtures+odds off the UI thread; write DB + bump sentinel."""
+@st.cache_resource(show_spinner=False)
+def _bg_guard_state() -> dict[str, Any]:
+    """Process-wide guard for background scrape threads.
+
+    Module globals in the Streamlit main script are recreated on every rerun,
+    so they cannot de-duplicate threads. ``st.cache_resource`` returns the same
+    dict for every session/rerun in this server process.
+
+    Keys: ``lock`` (threading.Lock), ``running`` (set of job keys),
+    ``last_failure`` (job key → ``time.monotonic()`` of last failure).
+    """
+    return {"lock": threading.Lock(), "running": set(), "last_failure": {}}
+
+
+def _bg_try_acquire(guard: dict[str, Any], job: str) -> bool:
+    """Mark ``job`` running unless already running or inside failure backoff."""
+    now = time.monotonic()
+    with guard["lock"]:
+        if job in guard["running"]:
+            return False
+        last_fail = guard["last_failure"].get(job)
+        if last_fail is not None and (now - float(last_fail)) < _BG_FAILURE_BACKOFF_S:
+            return False
+        guard["running"].add(job)
+        return True
+
+
+def _bg_release(guard: dict[str, Any], job: str, *, failed: bool) -> None:
+    with guard["lock"]:
+        guard["running"].discard(job)
+        if failed:
+            guard["last_failure"][job] = time.monotonic()
+        else:
+            guard["last_failure"].pop(job, None)
+
+
+def _bg_refresh_fixtures(
+    league: str, n_seasons: int, guard: dict[str, Any], job: str
+) -> None:
+    """Fetch fixtures+odds off the UI thread; write DB + bump sentinel.
+
+    ``guard`` is resolved on the main thread and passed in (no Streamlit cache
+    API calls from the worker thread).
+    """
     code = normalize_league(league)
+    failed = False
     try:
-        # Avoid Streamlit cache APIs from a worker thread — call loaders directly.
         results = load_league_data(
             league=code,
             n_seasons=int(n_seasons),
@@ -1657,79 +1737,107 @@ def _bg_refresh_fixtures(league: str, n_seasons: int) -> None:
         try:
             bump = GLOBAL_DB_PATH.parent / f".fx_cache_bump_{code}"
             bump.write_text("1", encoding="utf-8")
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            _LOG.debug("fx bump write failed (%s): %s", code, exc)
     except Exception as exc:  # noqa: BLE001
+        failed = True
+        _LOG.warning("Background fixture refresh failed (%s): %s", code, exc)
         try:
             err_path = GLOBAL_DB_PATH.parent / f".fx_refresh_err_{code}.txt"
             err_path.write_text(str(exc)[:500], encoding="utf-8")
         except Exception:  # noqa: BLE001
             pass
     finally:
-        with _FX_BG_LOCK:
-            _FX_BG_RUNNING.discard(code)
+        _bg_release(guard, job, failed=failed)
 
 
 def _maybe_spawn_fixture_refresh(league: str, n_seasons: int) -> bool:
-    """Start at most one background refresh per league. Returns True if spawned."""
+    """Start at most one background refresh per league (process-wide).
+
+    Returns True if a thread was spawned. Skips while one is running or within
+    :data:`_BG_FAILURE_BACKOFF_S` of the last failure.
+    """
     code = normalize_league(league)
-    with _FX_BG_LOCK:
-        if code in _FX_BG_RUNNING:
-            return False
-        _FX_BG_RUNNING.add(code)
-    thread = threading.Thread(
-        target=_bg_refresh_fixtures,
-        args=(code, int(n_seasons)),
-        name=f"fx-refresh-{code}",
-        daemon=True,
-    )
-    thread.start()
+    guard = _bg_guard_state()
+    job = f"fx:{code}"
+    if not _bg_try_acquire(guard, job):
+        return False
+    try:
+        thread = threading.Thread(
+            target=_bg_refresh_fixtures,
+            args=(code, int(n_seasons), guard, job),
+            name=f"fx-refresh-{code}",
+            daemon=True,
+        )
+        thread.start()
+    except Exception as exc:  # noqa: BLE001
+        _LOG.warning("Could not start fixture refresh thread (%s): %s", code, exc)
+        _bg_release(guard, job, failed=True)
+        return False
     return True
 
 
-def _consume_fixture_cache_bump(league: str) -> None:
-    """If a BG refresh finished, clear the 5-min network cache (main thread)."""
+def _consume_fixture_cache_bump(league: str, n_seasons: int) -> None:
+    """If a BG refresh finished, clear this league's 5-min network cache entry."""
     code = normalize_league(league)
     bump = GLOBAL_DB_PATH.parent / f".fx_cache_bump_{code}"
     if not bump.is_file():
         return
     try:
         bump.unlink(missing_ok=True)
-        _fetch_fixtures_and_odds.clear()
+        _fetch_fixtures_and_odds.clear(code, int(n_seasons))
+    except Exception as exc:  # noqa: BLE001
+        _LOG.debug("fx bump consume failed (%s): %s", code, exc)
+
+
+def _warn_fixture_save_error(fx: pd.DataFrame | None, code: str) -> None:
+    msg = None
+    try:
+        msg = (fx.attrs or {}).get("db_save_error") if fx is not None else None
     except Exception:  # noqa: BLE001
-        pass
+        msg = None
+    if msg and not st.session_state.get(f"_fx_save_err_shown_{code}"):
+        st.session_state[f"_fx_save_err_shown_{code}"] = True
+        st.warning(
+            f"Không lưu được lịch/odds {code} vào DB (vẫn hiển thị dữ liệu mạng): "
+            f"{str(msg)[:120]}"
+        )
 
 
 def _load_fixtures(
-    league: str, n_seasons: int, force_refresh: bool = False, _cache_ver: int = 4
+    league: str, n_seasons: int, force_refresh: bool = False
 ) -> pd.DataFrame:
     """DB-first fixtures+odds for the UI (instant), with optional BG refresh.
 
     1. Prefer ``upcoming_fixtures`` in ``global_matches.db`` (<0.2s).
     2. If cache older than 15 minutes → toast + background network refresh.
-    3. Cold start / force_refresh → network via ``_fetch_fixtures_and_odds``.
+    3. Cold start / force_refresh → network via ``_fetch_fixtures_and_odds``
+       (force_refresh clears that league's cache entry first; it is never part
+       of the cache key).
     """
     code = normalize_league(league)
-    _consume_fixture_cache_bump(code)
+    n_seasons = int(n_seasons)
+    _consume_fixture_cache_bump(code, n_seasons)
 
     if force_refresh:
-        return _fetch_fixtures_and_odds(
-            code, n_seasons, force_refresh=True, _cache_ver=_cache_ver
-        )
+        _fetch_fixtures_and_odds.clear(code, n_seasons)
+        fx_net = _fetch_fixtures_and_odds(code, n_seasons)
+        _warn_fixture_save_error(fx_net, code)
+        return fx_net
 
     db_df, last_ts = load_upcoming_from_db(code)
     age = upcoming_cache_age_minutes(last_ts)
 
     if db_df is not None and not db_df.empty:
         if age is None or age > _FIXTURES_STALE_MINUTES:
+            spawned = _maybe_spawn_fixture_refresh(code, n_seasons)
             toast_key = f"_fx_stale_toast_{code}"
-            if not st.session_state.get(toast_key):
+            if spawned and not st.session_state.get(toast_key):
                 st.session_state[toast_key] = True
                 try:
                     st.toast("🔄 Đang cập nhật odds mới ngầm...")
                 except Exception:  # noqa: BLE001
                     pass
-            _maybe_spawn_fixture_refresh(code, n_seasons)
             # Surface prior BG failure once (non-blocking).
             err_path = GLOBAL_DB_PATH.parent / f".fx_refresh_err_{code}.txt"
             if err_path.is_file():
@@ -1751,22 +1859,25 @@ def _load_fixtures(
 
     # Cold start: block once, then DB + 5-min cache keep later renders instant.
     with st.spinner("Đang tải lịch + odds…"):
-        return _fetch_fixtures_and_odds(
-            code, n_seasons, force_refresh=False, _cache_ver=_cache_ver
-        )
+        fx_net = _fetch_fixtures_and_odds(code, n_seasons)
+    _warn_fixture_save_error(fx_net, code)
+    return fx_net
 
 
-@st.cache_resource(show_spinner="Đang huấn luyện Dixon–Coles…")
+@st.cache_resource(
+    show_spinner="Đang huấn luyện Dixon–Coles…",
+    max_entries=_DC_CACHE_MAX_ENTRIES,
+    ttl=_MODEL_TTL_S,
+)
 def _fit_dixon_coles(
     league: str,
     n_seasons: int,
     n_train: int,
     xi: float,
-    force_refresh: bool = False,
-    _cache_ver: int = 4,
+    cache_ver: int = 5,
 ) -> DixonColesModel:
     code = normalize_league(league)
-    train = _train_slice(league, n_seasons, n_train, force_refresh=force_refresh)
+    train = _train_slice(league, n_seasons, n_train)
     use_weak = code == "UWCL" or int(len(train)) < 100
     return DixonColesModel(
         xi=xi,
@@ -1777,34 +1888,73 @@ def _fit_dixon_coles(
     ).fit(train)
 
 
-@st.cache_resource(show_spinner="Đang huấn luyện mô hình phạt góc…")
+@st.cache_resource(
+    show_spinner="Đang huấn luyện mô hình phạt góc…",
+    max_entries=_MODEL_CACHE_MAX_ENTRIES,
+    ttl=_MODEL_TTL_S,
+)
 def _fit_corners(
     league: str,
     n_seasons: int,
     n_train: int,
-    force_refresh: bool = False,
-    _cache_ver: int = 3,
+    cache_ver: int = 4,
 ) -> CornerPredictor:
     backend = "poisson" if normalize_league(league) == "UWCL" else "auto"
     return CornerPredictor(backend=backend).fit(
-        _train_slice(league, n_seasons, n_train, force_refresh=force_refresh)
+        _train_slice(league, n_seasons, n_train)
     )
 
 
-@st.cache_resource(show_spinner="Đang huấn luyện LightGBM…")
+@st.cache_resource(
+    show_spinner="Đang huấn luyện LightGBM…",
+    max_entries=_MODEL_CACHE_MAX_ENTRIES,
+    ttl=_MODEL_TTL_S,
+)
 def _fit_ml_model(
     league: str,
     n_seasons: int,
     n_train: int,
-    force_refresh: bool = False,
-    _cache_ver: int = 4,
+    cache_ver: int = 5,
 ) -> EPLMachineLearningModel:
-    return EPLMachineLearningModel().fit(
-        _train_slice(league, n_seasons, n_train, force_refresh=force_refresh)
+    return EPLMachineLearningModel().fit(_train_slice(league, n_seasons, n_train))
+
+
+def _scan_league_models(
+    league: str,
+    n_seasons: int,
+    n_train: int,
+    xi: float,
+    *,
+    use_ml: bool,
+    w_ml: float,
+) -> tuple[Any, Any | None, float, list[str]]:
+    """Shared model setup for every EV scan (Top-20, multi-league, Telegram).
+
+    Returns ``(dc_with_league_weights, ml_or_None, effective_w_ml, warnings)``.
+    DC fit errors propagate; an ML fit failure is logged, reported in
+    ``warnings`` and forces ``effective_w_ml = 0`` (DC-only).
+    """
+    warnings: list[str] = []
+    dc = maybe_wrap_with_league_weights(
+        _fit_dixon_coles(league, int(n_seasons), int(n_train), float(xi)),
+        league,
     )
+    ml = None
+    if use_ml and float(w_ml) > 0:
+        try:
+            ml = _fit_ml_model(league, int(n_seasons), int(n_train))
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning("LightGBM fit failed for %s: %s", league, exc)
+            warnings.append(
+                f"{league_label(str(league))}: LightGBM lỗi ({str(exc)[:100]}) "
+                "— dùng Dixon–Coles (w_ML=0)."
+            )
+            ml = None
+    w_eff = float(w_ml) if ml is not None else 0.0
+    return dc, ml, w_eff, warnings
 
 
-@st.cache_data(ttl=300, show_spinner="Đang quét Top 20 kèo hời (VN)…")
+@st.cache_data(ttl=300, max_entries=32, show_spinner="Đang quét Top 20 kèo hời (VN)…")
 def _cached_top20_scan(
     fixtures: pd.DataFrame,
     league: str,
@@ -1817,29 +1967,20 @@ def _cached_top20_scan(
     markets: tuple,
     bankroll: float,
     use_ml: bool,
-    force_refresh: bool = False,
-    _cache_ver: int = 4,
+    cache_ver: int = 5,
 ) -> dict:
-    """Scan today/tomorrow fixtures; models come from ``@st.cache_resource``."""
-    dc = maybe_wrap_with_league_weights(
-        _fit_dixon_coles(
-            league, n_seasons, n_train, float(xi), force_refresh=force_refresh
-        ),
-        league,
+    """Scan today/tomorrow fixtures; models come from ``@st.cache_resource``.
+
+    Extra keys: ``warnings`` (list[str]) and ``w_ml_effective`` (float).
+    """
+    dc, ml, w_eff, warns = _scan_league_models(
+        league, n_seasons, n_train, xi, use_ml=use_ml, w_ml=w_ml
     )
-    ml = None
-    if use_ml and float(w_ml) > 0:
-        try:
-            ml = _fit_ml_model(
-                league, n_seasons, n_train, force_refresh=force_refresh
-            )
-        except Exception:  # noqa: BLE001
-            ml = None
     result = scan_top_value_bets(
         fixtures,
         dc,
         ml,
-        w_ml=float(w_ml) if ml is not None else 0.0,
+        w_ml=w_eff,
         min_ev=float(min_ev),
         kelly_fraction=float(kelly_fraction),
         max_stake_pct=MAX_STAKE_PCT,
@@ -1849,7 +1990,10 @@ def _cached_top20_scan(
         league=str(league),
         filter_vn_window=True,
     )
-    return result.to_dict()
+    out = result.to_dict()
+    out["warnings"] = warns
+    out["w_ml_effective"] = w_eff
+    return out
 
 
 # Per-league train defaults when the landing scans the *other* competition.
@@ -1858,9 +2002,29 @@ _TOP20_LEAGUE_DEFAULTS: dict[str, dict[str, int]] = {
     "UWCL": {"n_seasons": 5, "n_train": 200},
     "LALIGA": {"n_seasons": 3, "n_train": 800},
 }
+_TOP20_FALLBACK_DEFAULTS: dict[str, int] = {"n_seasons": 3, "n_train": 800}
 
 
-@st.cache_data(ttl=300, show_spinner="Đang quét Top 20 EPL + UWCL (VN)…")
+def _top20_defaults(league_code: str) -> dict[str, int]:
+    """Train defaults for a secondary league (fallback for unlisted codes)."""
+    return _TOP20_LEAGUE_DEFAULTS.get(
+        str(league_code).upper(), _TOP20_FALLBACK_DEFAULTS
+    )
+
+
+def _scope_label(*codes: str | None) -> str:
+    """Human label for the leagues covered by a scan, e.g. ``EPL + UWCL``."""
+    seen: list[str] = []
+    for c in codes:
+        if not c:
+            continue
+        lbl = league_label(str(c))
+        if lbl not in seen:
+            seen.append(lbl)
+    return " + ".join(seen) or "—"
+
+
+@st.cache_data(ttl=300, max_entries=32, show_spinner="Đang quét Top 20 kèo hời (VN)…")
 def _cached_top20_scan_multi(
     fixtures_primary: pd.DataFrame,
     fixtures_other: pd.DataFrame,
@@ -1877,11 +2041,17 @@ def _cached_top20_scan_multi(
     markets: tuple,
     bankroll: float,
     use_ml: bool,
-    force_refresh: bool = False,
-    _cache_ver: int = 3,
+    cache_ver: int = 4,
 ) -> dict:
-    """Scan both leagues with league-specific models; merge Top-20 by EV%."""
+    """Scan both leagues with league-specific models; merge Top-20 by EV%.
+
+    Per-league model failures are logged and returned in ``warnings`` instead
+    of being silently dropped.
+    """
+    allowed = tuple(markets) or ("1X2",)
     results = []
+    warns: list[str] = []
+    w_effs: list[float] = []
     for lg, fx, n_seas, n_tr in (
         (league_primary, fixtures_primary, n_seasons_primary, n_train_primary),
         (league_other, fixtures_other, n_seasons_other, n_train_other),
@@ -1889,32 +2059,28 @@ def _cached_top20_scan_multi(
         if fx is None or getattr(fx, "empty", True):
             continue
         try:
-            dc = maybe_wrap_with_league_weights(
-                _fit_dixon_coles(
-                    lg, int(n_seas), int(n_tr), float(xi), force_refresh=force_refresh
-                ),
-                lg,
+            dc, ml, w_eff, lg_warns = _scan_league_models(
+                lg, n_seas, n_tr, xi, use_ml=use_ml, w_ml=w_ml
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning("Dixon–Coles fit failed for %s: %s", lg, exc)
+            warns.append(
+                f"{league_label(str(lg))}: không huấn luyện được Dixon–Coles "
+                f"({str(exc)[:100]}) — bỏ qua giải này trong Top 20."
+            )
             continue
-        ml = None
-        if use_ml and float(w_ml) > 0:
-            try:
-                ml = _fit_ml_model(
-                    lg, int(n_seas), int(n_tr), force_refresh=force_refresh
-                )
-            except Exception:  # noqa: BLE001
-                ml = None
+        warns.extend(lg_warns)
+        w_effs.append(w_eff)
         results.append(
             scan_top_value_bets(
                 fx,
                 dc,
                 ml,
-                w_ml=float(w_ml) if ml is not None else 0.0,
+                w_ml=w_eff,
                 min_ev=float(min_ev),
                 kelly_fraction=float(kelly_fraction),
                 max_stake_pct=MAX_STAKE_PCT,
-                allowed_markets=tuple(markets) or ("1X2",),
+                allowed_markets=allowed,
                 top_n=_TOP20_DISPLAY_N,
                 bankroll=float(bankroll),
                 league=str(lg),
@@ -1922,41 +2088,67 @@ def _cached_top20_scan_multi(
             )
         )
     if not results:
-        return scan_top_value_bets(
-            fixtures_primary if fixtures_primary is not None else pd.DataFrame(),
-            maybe_wrap_with_league_weights(
-                _fit_dixon_coles(
-                    league_primary,
-                    n_seasons_primary,
-                    n_train_primary,
-                    float(xi),
-                    force_refresh=force_refresh,
-                ),
+        try:
+            dc0, _ml0, _w0, _ = _scan_league_models(
                 league_primary,
-            ),
-            None,
-            w_ml=0.0,
-            min_ev=float(min_ev),
-            top_n=_TOP20_DISPLAY_N,
-            bankroll=float(bankroll),
-            league=str(league_primary),
-        ).to_dict()
+                n_seasons_primary,
+                n_train_primary,
+                xi,
+                use_ml=False,
+                w_ml=0.0,
+            )
+            out = scan_top_value_bets(
+                fixtures_primary if fixtures_primary is not None else pd.DataFrame(),
+                dc0,
+                None,
+                w_ml=0.0,
+                min_ev=float(min_ev),
+                kelly_fraction=float(kelly_fraction),
+                max_stake_pct=MAX_STAKE_PCT,
+                allowed_markets=allowed,
+                top_n=_TOP20_DISPLAY_N,
+                bankroll=float(bankroll),
+                league=str(league_primary),
+                filter_vn_window=True,
+            ).to_dict()
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning("Fallback scan failed for %s: %s", league_primary, exc)
+            out = scan_top_value_bets(
+                pd.DataFrame(), None, None, min_ev=float(min_ev)  # type: ignore[arg-type]
+            ).to_dict()
+        out["warnings"] = warns
+        out["w_ml_effective"] = 0.0
+        return out
     if len(results) == 1:
-        return results[0].to_dict()
-    return merge_top_scan_results(
-        results, top_n=_TOP20_DISPLAY_N, min_ev=float(min_ev)
-    ).to_dict()
+        out = results[0].to_dict()
+    else:
+        out = merge_top_scan_results(
+            results, top_n=_TOP20_DISPLAY_N, min_ev=float(min_ev)
+        ).to_dict()
+    out["warnings"] = warns
+    out["w_ml_effective"] = min(w_effs) if w_effs else 0.0
+    return out
+
+
+def _show_scan_warnings(scan_out: Mapping[str, Any] | None, *, sidebar: bool = False) -> None:
+    """Surface model-fit problems recorded by the cached scans."""
+    if not scan_out:
+        return
+    target = st.sidebar if sidebar else st
+    for msg in list(scan_out.get("warnings") or [])[:3]:
+        target.warning(str(msg))
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _cached_global_matches_legacy(_cache_ver: int = 1) -> pd.DataFrame:
+def _cached_global_matches_legacy(cache_ver: int = 2) -> pd.DataFrame:
     """Load multi-comp history for Lite fatigue labels (empty if unavailable)."""
     try:
         ensure_global_db_from_legacy(GLOBAL_DB_PATH)
         if not global_db_has_matches(GLOBAL_DB_PATH):
             return pd.DataFrame()
         return read_matches_as_legacy(GLOBAL_DB_PATH)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _LOG.warning("global matches load failed: %s", exc)
         return pd.DataFrame()
 
 
@@ -1979,58 +2171,102 @@ def _enrich_lite_display_bets(display: pd.DataFrame | None) -> pd.DataFrame:
     return enriched
 
 
-_TEAM_FEED_BG_LOCK = threading.Lock()
-_TEAM_FEED_BG_RUNNING = False
+_TEAM_FEED_JOB = "team_feed_sync"
 
 
-def _bg_sync_team_feeds(display_records: list[dict[str, Any]]) -> None:
-    global _TEAM_FEED_BG_RUNNING
+def _bg_sync_team_feeds(
+    display_records: list[dict[str, Any]], guard: dict[str, Any]
+) -> None:
+    failed = False
     try:
         from src.fetchers.flashscore_team import sync_upcoming_teams_fast
 
         sync_upcoming_teams_fast(display_records, max_teams=10)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        failed = True
+        _LOG.warning("Background team-feed sync failed: %s", exc)
     finally:
-        with _TEAM_FEED_BG_LOCK:
-            _TEAM_FEED_BG_RUNNING = False
+        _bg_release(guard, _TEAM_FEED_JOB, failed=failed)
 
 
 def _maybe_spawn_team_feed_sync(display: pd.DataFrame) -> bool:
-    """Daemon-thread lazy Team Feed sync for Top-20 sides (at most one at a time)."""
-    global _TEAM_FEED_BG_RUNNING
+    """Daemon-thread lazy Team Feed sync for Top-20 sides (one per process).
+
+    Uses the process-wide :func:`_bg_guard_state` (not module globals, which
+    Streamlit recreates on each rerun) plus a failure backoff.
+    """
     if display is None or getattr(display, "empty", True):
         return False
-    with _TEAM_FEED_BG_LOCK:
-        if _TEAM_FEED_BG_RUNNING:
-            return False
-        _TEAM_FEED_BG_RUNNING = True
     try:
         records = display.head(10).to_dict(orient="records")
     except Exception:  # noqa: BLE001
-        with _TEAM_FEED_BG_LOCK:
-            _TEAM_FEED_BG_RUNNING = False
         return False
-    thread = threading.Thread(
-        target=_bg_sync_team_feeds,
-        args=(records,),
-        name="team-feed-sync-fast",
-        daemon=True,
-    )
-    thread.start()
+    guard = _bg_guard_state()
+    if not _bg_try_acquire(guard, _TEAM_FEED_JOB):
+        return False
+    try:
+        thread = threading.Thread(
+            target=_bg_sync_team_feeds,
+            args=(records, guard),
+            name="team-feed-sync-fast",
+            daemon=True,
+        )
+        thread.start()
+    except Exception as exc:  # noqa: BLE001
+        _LOG.warning("Could not start team-feed thread: %s", exc)
+        _bg_release(guard, _TEAM_FEED_JOB, failed=True)
+        return False
     return True
 
 
-def _clear_caches() -> None:
-    _load_raw_data.clear()
-    _train_slice.clear()
-    _fetch_fixtures_and_odds.clear()
-    _fit_dixon_coles.clear()
-    _fit_corners.clear()
-    _fit_ml_model.clear()
+def _refresh_league_caches(
+    league: str, n_seasons: int, n_train: int, xi: float
+) -> None:
+    """Invalidate only the cache entries for the league being refreshed.
+
+    Entries for other leagues / sessions are left intact (the old version
+    called ``.clear()`` on every cached function, wiping all sessions). The
+    multi-league scans are keyed by fixture DataFrames, so they are cleared
+    wholesale (cheap: TTL 5 min, models stay cached).
+    """
+    codes = {str(league), normalize_league(str(league))}
+    n_seasons, n_train, xi = int(n_seasons), int(n_train), float(xi)
+    for code in codes:
+        _load_raw_data.clear(code, n_seasons)
+        _train_slice.clear(code, n_seasons, n_train)
+        _fetch_fixtures_and_odds.clear(code, n_seasons)
+        _fit_dixon_coles.clear(code, n_seasons, n_train, xi)
+        _fit_corners.clear(code, n_seasons, n_train)
+        _fit_ml_model.clear(code, n_seasons, n_train)
     _cached_top20_scan.clear()
     _cached_top20_scan_multi.clear()
     _cached_global_matches_legacy.clear()
+
+
+def _ml_context(league_code: str | None) -> dict[str, Any]:
+    """Competition kwargs for ``EPLMachineLearningModel.predict_proba``."""
+    code = str(league_code or "").strip().upper() or None
+    if code is None:
+        return {}
+    out: dict[str, Any] = {"competition": code}
+    try:
+        out["is_cup"] = bool(is_cup_competition(code))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _settle_bet_safely(bet_id: int, result: str, db_path: Any) -> float | None:
+    """Settle a journal bet; None (with an info note) if already settled.
+
+    ``settle_live_bet`` raises RuntimeError on double-click / concurrent settle.
+    """
+    try:
+        return settle_live_bet(bet_id, result, db_path)
+    except RuntimeError as exc:
+        _LOG.info("settle_live_bet(%s, %s) skipped: %s", bet_id, result, exc)
+        st.info("Kèo đã được tất toán")
+        return None
 
 
 def _format_data_source_status(df: pd.DataFrame) -> str:
@@ -2054,6 +2290,11 @@ def _format_data_source_status(df: pd.DataFrame) -> str:
 # ---------------------------------------------------------------------------
 
 st.sidebar.title("⚽ Value Betting")
+
+# Persisted Telegram toggle (widget keys are cleaned up while in Lite mode).
+_TG_ENABLED_SAVED = "tg_enabled_saved"
+if _TG_ENABLED_SAVED not in st.session_state:
+    st.session_state[_TG_ENABLED_SAVED] = bool(st.session_state.get("tg_enabled", False))
 
 # View mode: apply pending BEFORE the radio widget (same pattern as league).
 _pending_vm = st.session_state.pop("_pending_view_mode", None)
@@ -2129,13 +2370,16 @@ if is_lite:
     # Lite: scan all goal markets so Best Value Pick can be AH/OU when 1X2
     # odds are missing (same pool as Pro Mode Chi tiết).
     scan_markets = ["1X2", "OU", "AH"]
-    tg_enabled = bool(st.session_state.get("tg_enabled", False))
+    # Widget keys are dropped when the Pro toggle is not rendered — read the
+    # persisted (non-widget) copy so Lite does not silently reset it.
+    tg_enabled = bool(st.session_state.get(_TG_ENABLED_SAVED, False))
 
     st.sidebar.divider()
     if st.sidebar.button(
-        "🔄 Làm mới dữ liệu", type="primary", use_container_width=True
+        "🔄 Làm mới dữ liệu", type="primary", width="stretch"
     ):
-        _clear_caches()
+        # Per-league cache invalidation happens in the main flow (needs
+        # N_SEASONS_BUFFER); force_refresh is never part of a cache key.
         st.session_state["_force_refresh"] = True
         st.session_state["_retrain_ok"] = True
         st.rerun()
@@ -2224,9 +2468,8 @@ else:
 
     st.sidebar.divider()
     if st.sidebar.button(
-        "Tải dữ liệu & huấn luyện lại", type="primary", use_container_width=True
+        "Tải dữ liệu & huấn luyện lại", type="primary", width="stretch"
     ):
-        _clear_caches()
         st.session_state["_force_refresh"] = True
         st.session_state["_retrain_ok"] = True
         st.session_state["_sync_global_after_refresh"] = True
@@ -2237,10 +2480,11 @@ else:
     st.sidebar.markdown("**Telegram Alert**")
     tg_enabled = st.sidebar.toggle(
         "Bật thông báo Telegram",
-        value=bool(st.session_state.get("tg_enabled", False)),
-        key="tg_enabled",
-        help="Gửi Value Bet 1X2 (EV ≥ ngưỡng) tới chat Telegram của bạn.",
+        value=bool(st.session_state.get(_TG_ENABLED_SAVED, False)),
+        key="_tg_enabled_widget",
+        help="Gửi Value Bet (EV ≥ ngưỡng) tới chat Telegram của bạn.",
     )
+    st.session_state[_TG_ENABLED_SAVED] = bool(tg_enabled)
     if "tg_token" not in st.session_state:
         st.session_state["tg_token"] = ""
     if "tg_chat_id" not in st.session_state:
@@ -2262,7 +2506,7 @@ else:
         )
         tg_c1, tg_c2 = st.sidebar.columns(2)
         with tg_c1:
-            if st.button("Gửi thử", use_container_width=True, key="tg_test_btn"):
+            if st.button("Gửi thử", width="stretch", key="tg_test_btn"):
                 try:
                     send_telegram_message(
                         st.session_state["tg_token"],
@@ -2273,7 +2517,7 @@ else:
                 except Exception as exc:  # noqa: BLE001
                     st.sidebar.error(f"Lỗi: {exc}")
         with tg_c2:
-            if st.button("Quét & gửi VB", use_container_width=True, key="tg_scan_btn"):
+            if st.button("Quét & gửi VB", width="stretch", key="tg_scan_btn"):
                 st.session_state["_tg_scan_send"] = True
     else:
         st.sidebar.caption("Bật toggle để cấu hình Bot token / Chat ID.")
@@ -2286,11 +2530,15 @@ _sync_global = bool(st.session_state.pop("_sync_global_after_refresh", False))
 N_SEASONS_BUFFER = 5 if league == "UWCL" else 3
 
 try:
-    data = _train_slice(league, N_SEASONS_BUFFER, n_train, force_refresh=force_refresh)
+    if force_refresh:
+        # Drop only this league's entries, then re-download once under the
+        # normal cache key (``_force_refresh`` is not hashed) so the model is
+        # trained exactly once on the fresh data.
+        _refresh_league_caches(league, N_SEASONS_BUFFER, n_train, float(xi))
+        _load_raw_data(league, N_SEASONS_BUFFER, _force_refresh=True)
+    data = _train_slice(league, N_SEASONS_BUFFER, n_train)
     fixtures = _load_fixtures(league, N_SEASONS_BUFFER, force_refresh=force_refresh)
-    dc_model = _fit_dixon_coles(
-        league, N_SEASONS_BUFFER, n_train, float(xi), force_refresh=force_refresh
-    )
+    dc_model = _fit_dixon_coles(league, N_SEASONS_BUFFER, n_train, float(xi))
 except Exception as exc:  # noqa: BLE001
     st.error(f"Không tải được dữ liệu / huấn luyện mô hình: {exc}")
     st.stop()
@@ -2318,9 +2566,7 @@ if force_refresh or _sync_global:
 corner_model: CornerPredictor | None = None
 corner_error: str | None = None
 try:
-    corner_model = _fit_corners(
-        league, N_SEASONS_BUFFER, n_train, force_refresh=force_refresh
-    )
+    corner_model = _fit_corners(league, N_SEASONS_BUFFER, n_train)
 except Exception as exc:  # noqa: BLE001
     corner_error = str(exc)
     if not is_lite:
@@ -2343,11 +2589,14 @@ if w_ml_warn:
 ml_model: EPLMachineLearningModel | None = None
 ml_error: str | None = None
 try:
-    ml_model = _fit_ml_model(
-        league, N_SEASONS_BUFFER, n_train, force_refresh=force_refresh
-    )
+    ml_model = _fit_ml_model(league, N_SEASONS_BUFFER, n_train)
 except Exception as exc:  # noqa: BLE001
     ml_error = str(exc)
+    _LOG.warning("LightGBM fit failed for %s: %s", league, exc)
+    # Effective blend is DC-only — keep displayed / scanned w_ML honest.
+    w_ml = 0.0
+    if is_lite:
+        st.sidebar.warning("LightGBM lỗi — đang dùng Dixon–Coles (w_ML=0).")
 
 teams = [t for t in list_teams(data) if t in dc_model.teams]
 odds_families = _odds_families_available(data)
@@ -2364,7 +2613,9 @@ if not is_lite:
             f"LightGBM sẵn sàng · {ml_model.train_rows_:,} mẫu feature · {ens_note}"
         )
     elif ml_error:
-        st.sidebar.warning(f"LightGBM chưa sẵn sàng: {ml_error}")
+        st.sidebar.warning(
+            f"LightGBM chưa sẵn sàng: {ml_error} — Ensemble tắt (w_ML hiệu lực = 0%)."
+        )
 
 if st.session_state.pop("_retrain_ok", False):
     src = data.attrs.get("data_source")
@@ -2389,9 +2640,7 @@ else:
 # Prefetch another league's fixtures so cross-league links resolve.
 _alt_candidates = [r["code"] for r in _available if r["code"] != league]
 _alt_league = "EPL" if "EPL" in _alt_candidates else (_alt_candidates[0] if _alt_candidates else "EPL")
-_alt_defaults = _TOP20_LEAGUE_DEFAULTS.get(
-    _alt_league, {"n_seasons": 3, "n_train": 800}
-)
+_alt_defaults = _top20_defaults(_alt_league)
 _alt_fixtures: pd.DataFrame | None = None
 try:
     _alt_fixtures = _load_fixtures(
@@ -2399,7 +2648,8 @@ try:
         int(_alt_defaults["n_seasons"]),
         force_refresh=False,
     )
-except Exception:  # noqa: BLE001
+except Exception as _alt_exc:  # noqa: BLE001
+    _LOG.warning("Alt-league fixtures (%s) failed: %s", _alt_league, _alt_exc)
     _alt_fixtures = None
 
 _jp_extra: list[tuple[str, pd.DataFrame]] = []
@@ -2425,33 +2675,84 @@ if is_lite and st.session_state.get("_goto_detail_tab"):
     st.session_state["_pending_view_mode"] = _VIEW_PRO
     st.rerun()
 
-# Sidebar "Quét & gửi VB" → scan fixtures for selected markets and push Telegram
+# Sidebar "Quét & gửi VB" → same scan path as the Top-20 tab, then Telegram.
+_CORNER_LINE_COLS = ("OddsCornerLine", "CornerLine")
+
+
+def _real_corner_odds(fx: pd.Series) -> tuple[float, float, float] | None:
+    """Return ``(over, under, line)`` only when the feed supplies all three.
+
+    Never substitute assumed prices / lines: alerts must be priced on real
+    bookmaker odds. Returns None when anything is missing or invalid.
+    """
+    try:
+        over = fx.get("OddsCornerOver") if "OddsCornerOver" in fx.index else None
+        under = fx.get("OddsCornerUnder") if "OddsCornerUnder" in fx.index else None
+        line = None
+        for col in _CORNER_LINE_COLS:
+            if col in fx.index and pd.notna(fx.get(col)):
+                line = fx.get(col)
+                break
+        if over is None or under is None or line is None:
+            return None
+        if pd.isna(over) or pd.isna(under):
+            return None
+        o, u, ln = float(over), float(under), float(line)
+    except (TypeError, ValueError):
+        return None
+    if o <= 1.0 or u <= 1.0:
+        return None
+    return o, u, ln
+
+
 if st.session_state.pop("_tg_scan_send", False):
     if fixtures.empty:
         st.sidebar.warning("Chưa có fixtures để quét.")
     else:
         try:
             mkts = tuple(m for m in scan_markets if m != "Corners") or ("1X2",)
+            bank_tg = float(st.session_state["bankroll"])
             with st.spinner(f"Quét Value Bet {','.join(scan_markets)} & gửi Telegram…"):
-                scan_df = recommend_upcoming(
-                    dc_model,
-                    fixtures.head(40),
-                    odds_family="B365",
-                    min_ev=min_ev,
-                    kelly_fraction=kelly_frac,
-                    only_value=True,
-                    include_ou="OU" in mkts,
-                    include_ah="AH" in mkts,
+                # Same models / settings as the Top-20 tab: league-weighted DC,
+                # LightGBM blend (when Ensemble on), capped Kelly, VN window.
+                _tg_dc, _tg_ml, _tg_w, _tg_warns = _scan_league_models(
+                    league,
+                    N_SEASONS_BUFFER,
+                    n_train,
+                    float(xi),
+                    use_ml=bool(use_ensemble),
+                    w_ml=float(w_ml) if use_ensemble else 0.0,
                 )
-                if not scan_df.empty:
-                    scan_df = scan_df.loc[scan_df["market"].isin(list(mkts))].copy()
-                    scan_df["stake"] = (
-                        scan_df["kelly_fraction"] * float(st.session_state["bankroll"])
-                    )
-                # Optional corner EV alerts (manual default odds if feed lacks them)
+                for _w in _tg_warns:
+                    st.sidebar.warning(_w)
+                _tg_res = scan_top_value_bets(
+                    fixtures,
+                    _tg_dc,
+                    _tg_ml,
+                    w_ml=_tg_w,
+                    min_ev=float(min_ev),
+                    kelly_fraction=float(kelly_frac),
+                    max_stake_pct=MAX_STAKE_PCT,
+                    allowed_markets=mkts,
+                    top_n=max(_TOP20_DISPLAY_N, 40),
+                    bankroll=bank_tg,
+                    league=str(league),
+                    filter_vn_window=True,
+                )
+                scan_df = _tg_res.value_bets
+                if scan_df is not None and not scan_df.empty:
+                    scan_df = scan_df.copy()
+                    scan_df["stake"] = scan_df["kelly_fraction"].astype(float) * bank_tg
+                # Corner alerts ONLY when the feed has real corner O/U odds + line.
                 corner_rows: list[dict] = []
+                n_corner_skipped = 0
                 if "Corners" in scan_markets and corner_model is not None:
                     for _, fx in fixtures.head(20).iterrows():
+                        real = _real_corner_odds(fx)
+                        if real is None:
+                            n_corner_skipped += 1
+                            continue
+                        c_over, c_under, c_line = real
                         h_t, a_t = resolve_fixture_teams(
                             str(fx["HomeTeam"]),
                             str(fx["AwayTeam"]),
@@ -2461,22 +2762,23 @@ if st.session_state.pop("_tg_scan_send", False):
                             legs = corner_model.predict_corner_ev(
                                 h_t,
                                 a_t,
-                                {
-                                    "over": float(fx["OddsCornerOver"])
-                                    if "OddsCornerOver" in fx.index
-                                    and pd.notna(fx.get("OddsCornerOver"))
-                                    else 1.90,
-                                    "under": float(fx["OddsCornerUnder"])
-                                    if "OddsCornerUnder" in fx.index
-                                    and pd.notna(fx.get("OddsCornerUnder"))
-                                    else 1.90,
-                                },
-                                line=10.5,
+                                {"over": c_over, "under": c_under},
+                                line=c_line,
                                 min_ev=min_ev,
                             )
-                        except Exception:
+                        except Exception as exc:  # noqa: BLE001
+                            _LOG.warning("Corner EV failed %s vs %s: %s", h_t, a_t, exc)
                             continue
                         for leg in legs:
+                            try:
+                                k_c = capped_kelly_fraction(
+                                    float(leg["p_model"]),
+                                    float(leg["odds"]),
+                                    kelly_fraction=float(kelly_frac),
+                                    max_stake_pct=MAX_STAKE_PCT,
+                                )
+                            except Exception:  # noqa: BLE001
+                                k_c = 0.0
                             corner_rows.append(
                                 {
                                     "home_team": h_t,
@@ -2486,10 +2788,17 @@ if st.session_state.pop("_tg_scan_send", False):
                                     "bookmaker_odds": leg["odds"],
                                     "ev": leg["ev"],
                                     "ev_pct": leg["ev_pct"],
-                                    "kelly_fraction": 0.0,
-                                    "stake": 0.0,
+                                    "p_model": leg.get("p_model"),
+                                    "kelly_fraction": float(k_c),
+                                    "stake": float(k_c) * bank_tg,
+                                    "kickoff": fx.get("Kickoff"),
                                 }
                             )
+                if n_corner_skipped:
+                    st.sidebar.info(
+                        f"Bỏ qua Phạt góc cho {n_corner_skipped} trận: feed chưa có "
+                        "odds phạt góc thật (không gửi odds giả định)."
+                    )
                 if corner_rows:
                     cdf = pd.DataFrame(corner_rows)
                     scan_df = (
@@ -2509,7 +2818,7 @@ if st.session_state.pop("_tg_scan_send", False):
                     scan_df,
                     st.session_state.get("tg_token", ""),
                     st.session_state.get("tg_chat_id", ""),
-                    bankroll=float(st.session_state["bankroll"]),
+                    bankroll=bank_tg,
                     min_ev=min_ev,
                     markets=tuple(scan_markets),
                     league=league,
@@ -2525,6 +2834,7 @@ if st.session_state.pop("_tg_scan_send", False):
             for err in result_tg.get("errors", [])[:3]:
                 st.sidebar.error(err)
         except Exception as exc:  # noqa: BLE001
+            _LOG.warning("Telegram scan failed: %s", exc)
             st.sidebar.error(f"Telegram scan lỗi: {exc}")
 
 # ---------------------------------------------------------------------------
@@ -2617,7 +2927,7 @@ if is_lite and main_nav == _NAV_LITE_TOP:
         f"Cửa sổ hôm nay & ngày mai · EV ≥ {min_ev:.0%} · "
         "Sắp xếp theo EV% giảm dần toàn bộ thị trường đã chọn"
     )
-    if st.button("🔄 Quét lại", key="lite_top_rescan", use_container_width=True):
+    if st.button("🔄 Quét lại", key="lite_top_rescan", width="stretch"):
         _cached_top20_scan.clear()
         _cached_top20_scan_multi.clear()
         _cached_global_matches_legacy.clear()
@@ -2634,7 +2944,7 @@ if is_lite and main_nav == _NAV_LITE_TOP:
         other_fx = (
             _alt_fixtures if _alt_fixtures is not None else pd.DataFrame()
         )
-        od = _TOP20_LEAGUE_DEFAULTS[_alt_league]
+        od = _top20_defaults(_alt_league)
         scan_out = _cached_top20_scan_multi(
             fixtures,
             other_fx,
@@ -2651,8 +2961,8 @@ if is_lite and main_nav == _NAV_LITE_TOP:
             tuple(m for m in scan_markets if m != "Corners") or ("1X2", "OU", "AH"),
             bank,
             True,
-            force_refresh=False,
         )
+        _show_scan_warnings(scan_out)
         display = _enrich_lite_display_bets(scan_out.get("display_bets"))
         if display is None or getattr(display, "empty", True):
             st.info(
@@ -2670,7 +2980,8 @@ if is_lite and main_nav == _NAV_LITE_TOP:
                 )
             else:
                 st.success(
-                    f"Tìm thấy **{n_val}** kèo hời (EV ≥ {min_ev:.0%}) · EPL + UWCL."
+                    f"Tìm thấy **{n_val}** kèo hời (EV ≥ {min_ev:.0%}) · "
+                    f"{_scope_label(league, _alt_league)}."
                 )
             for i, (_, row) in enumerate(display.iterrows()):
                 _render_lite_bet_card(
@@ -2741,7 +3052,7 @@ if is_lite and main_nav == _NAV_LITE_SEARCH:
         other_fx = (
             _alt_fixtures if _alt_fixtures is not None else pd.DataFrame()
         )
-        od = _TOP20_LEAGUE_DEFAULTS[_alt_league]
+        od = _top20_defaults(_alt_league)
         scan_out = _cached_top20_scan_multi(
             fixtures,
             other_fx,
@@ -2758,8 +3069,8 @@ if is_lite and main_nav == _NAV_LITE_SEARCH:
             tuple(m for m in scan_markets if m != "Corners") or ("1X2", "OU", "AH"),
             bank,
             True,
-            force_refresh=False,
         )
+        _show_scan_warnings(scan_out)
         display = _enrich_lite_display_bets(scan_out.get("display_bets"))
         card_row: dict | pd.Series | None = None
         if display is not None and not getattr(display, "empty", True):
@@ -2823,16 +3134,44 @@ if main_nav == _NAV_JP:
         "Kèo gợi ý = mọi market EV≥ngưỡng (1X2/OU/AH) · "
         "Chi tiết / Flashscore giữ nguyên"
     )
-    _jp_base = _share_base_url() or "http://localhost:8501"
+    # Public host from request headers → PUBLIC_BASE_URL env → relative link.
+    _jp_base = (
+        _share_base_url()
+        or (os.environ.get("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+        or ""
+    )
     _jp_fx = load_japan_upcoming()
-    _jp_records = japan_match_records(_jp_fx, base_url=_jp_base)
+    _jp_records = japan_match_records(_jp_fx, base_url=_jp_base or None)
+    _jp_n_seasons = 3
+    _jp_n_train = min(int(n_train), 400)
+
+    # Picks depend on thresholds, model params and the odds snapshot — the
+    # session cache is scoped to that context (not just match_id), so a new
+    # min_ev / ξ / n_train / odds refresh never shows stale picks.
+    _jp_odds_ts: list[Any] = []
+    for _jp_code_ts in JP_COMP_IDS:
+        try:
+            _jp_odds_ts.append(load_upcoming_from_db(str(_jp_code_ts))[1])
+        except Exception:  # noqa: BLE001
+            _jp_odds_ts.append(None)
+    _jp_ctx = (
+        round(float(min_ev), 6),
+        round(float(kelly_frac), 6),
+        round(float(xi), 8),
+        int(_jp_n_seasons),
+        int(_jp_n_train),
+        tuple(_jp_odds_ts),
+    )
+    if st.session_state.get("jp_picks_cache_ctx") != _jp_ctx:
+        st.session_state["jp_picks_cache_ctx"] = _jp_ctx
+        st.session_state["jp_picks_cache"] = {}
 
     _jp_c1, _jp_c2 = st.columns([1, 3])
     with _jp_c1:
         if st.button(
             "🔄 Tính lại kèo",
             key="jp_recalc_picks",
-            use_container_width=True,
+            width="stretch",
             help="Xóa cache session và chạy lại Dixon–Coles + EV cho từng trận.",
         ):
             st.session_state["jp_picks_cache"] = {}
@@ -2840,7 +3179,7 @@ if main_nav == _NAV_JP:
     with _jp_c2:
         st.caption(
             f"EV ≥ {min_ev:.0%} · markets 1X2 / Tài-Xỉu / Chấp Á · "
-            "cache theo match_id trong session"
+            "cache theo trận + EV/ξ/n_train/odds trong session"
         )
 
     if "jp_picks_cache" not in st.session_state:
@@ -2854,8 +3193,6 @@ if main_nav == _NAV_JP:
     else:
         # Fit (cached) Japan cup models — weak priors for thin cup history.
         _jp_models: dict[str, Any] = {}
-        _jp_n_seasons = 3
-        _jp_n_train = min(int(n_train), 400)
         for _jp_code in JP_COMP_IDS:
             try:
                 _jp_models[_jp_code] = maybe_wrap_with_league_weights(
@@ -2864,11 +3201,11 @@ if main_nav == _NAV_JP:
                         _jp_n_seasons,
                         _jp_n_train,
                         float(xi),
-                        force_refresh=False,
                     ),
                     _jp_code,
                 )
             except Exception as _jp_exc:  # noqa: BLE001
+                _LOG.warning("Japan DC fit failed (%s): %s", _jp_code, _jp_exc)
                 st.caption(f"Model {_jp_code}: {_jp_exc}")
 
         _jp_need = [
@@ -2921,7 +3258,7 @@ if main_nav == _NAV_JP:
             )
             st.dataframe(
                 _tbl,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 column_config={
                     "Giải": st.column_config.TextColumn("Giải", width="small"),
@@ -2963,20 +3300,22 @@ if (not is_lite) and main_nav == _NAV_TOP20:
 
     top_c1, top_c2, top_c3 = st.columns([1, 1, 2])
     with top_c1:
-        if st.button("🔄 Quét lại", key="top20_rescan", use_container_width=True):
+        if st.button("🔄 Quét lại", key="top20_rescan", width="stretch"):
             _cached_top20_scan.clear()
             _cached_top20_scan_multi.clear()
             st.rerun()
     with top_c2:
         scan_both = st.checkbox(
-            "EPL + UWCL",
+            _scope_label(league, _alt_league),
             value=True,
             key="top20_scan_both",
-            help="Quét cả hai giải trong cửa sổ VN, xếp theo EV% "
+            help="Quét giải đang chọn + giải phụ trong cửa sổ VN, xếp theo EV% "
             f"(tối đa {_TOP20_DISPLAY_N} kèo sau lọc).",
         )
     with top_c3:
-        scope_note = "EPL + UWCL" if scan_both else league_label(league)
+        scope_note = (
+            _scope_label(league, _alt_league) if scan_both else league_label(league)
+        )
         st.caption(f"Phạm vi: {scope_note} · markets: {', '.join(scan_markets)} · DB-first · network cache TTL 5 phút")
 
     if fixtures.empty and not (
@@ -2998,7 +3337,7 @@ if (not is_lite) and main_nav == _NAV_TOP20:
                 if _alt_fixtures is not None
                 else pd.DataFrame()
             )
-            od = _TOP20_LEAGUE_DEFAULTS[_alt_league]
+            od = _top20_defaults(_alt_league)
             scan_out = _cached_top20_scan_multi(
                 fixtures,
                 other_fx,
@@ -3015,7 +3354,6 @@ if (not is_lite) and main_nav == _NAV_TOP20:
                 mkts,
                 bank,
                 use_ml_flag,
-                force_refresh=False,
             )
         else:
             scan_out = _cached_top20_scan(
@@ -3030,8 +3368,8 @@ if (not is_lite) and main_nav == _NAV_TOP20:
                 mkts,
                 bank,
                 use_ml_flag,
-                force_refresh=False,
             )
+        _show_scan_warnings(scan_out)
         display = scan_out.get("display_bets")
         if display is None or getattr(display, "empty", True):
             n_upcoming = int(len(fixtures)) if fixtures is not None else 0
@@ -3065,7 +3403,11 @@ if (not is_lite) and main_nav == _NAV_TOP20:
                     "(xếp theo EV cao nhất, có thể dưới ngưỡng)."
                 )
             else:
-                scope_txt = "EPL + UWCL" if scan_both else league_label(league)
+                scope_txt = (
+                    _scope_label(league, _alt_league)
+                    if scan_both
+                    else league_label(league)
+                )
                 st.success(
                     f"Tìm thấy **{n_val}** kèo hời (EV ≥ {min_ev:.0%}) "
                     f"trong cửa sổ hôm nay & ngày mai (~48 giờ, giờ VN) · {scope_txt}."
@@ -3163,7 +3505,7 @@ if (not is_lite) and main_nav == _NAV_TOP20:
                         if st.button(
                             "🔍 Xem Chi Tiết",
                             key=f"top20_detail_{i}_{mid}_{lg}",
-                            use_container_width=True,
+                            width="stretch",
                         ):
                             # Cross-league card → queue league switch for next run
                             # (before selectbox); never write ``sidebar_league`` here.
@@ -3402,7 +3744,7 @@ if (not is_lite) and main_nav == _NAV_DETAIL:
             if st.button(
                 "✕ Bỏ chọn",
                 key="detail_clear_selection",
-                use_container_width=True,
+                width="stretch",
                 help="Xóa match_id trên URL và về tab Top 20",
             ):
                 for k in (
@@ -3578,10 +3920,15 @@ if (not is_lite) and main_nav == _NAV_DETAIL:
             missing = [
                 t for t in (home, away) if t not in dc_model.teams
             ]
+            try:
+                _pa, _pd = dc_model.new_team_priors()
+                _prior_txt = f"α={_pa:.2f}, δ={_pd:.2f}"
+            except Exception:  # noqa: BLE001
+                _prior_txt = "prior tương đối theo giải"
             st.warning(
                 f"⚠️ Đội mới chưa có trong lịch sử huấn luyện: {', '.join(missing)}. "
-                f"Dùng prior yếu (α={WEAK_TIER_NEW_TEAM_ATTACK}, "
-                f"δ={WEAK_TIER_NEW_TEAM_DEFENCE}); Kelly tối đa 1% bankroll."
+                f"Dùng prior yếu ({_prior_txt}); "
+                f"stake tối đa {NEW_TEAM_KELLY_CAP:.1%} bankroll."
             )
         try:
             lam, mu = dc_model.expected_goals(home, away)
@@ -3598,7 +3945,7 @@ if (not is_lite) and main_nav == _NAV_DETAIL:
             if ml_model is not None:
                 try:
                     probs_ml = ml_model.predict_proba(
-                        home, away, match_date=kick_ts
+                        home, away, match_date=kick_ts, **_ml_context(league)
                     )
                 except Exception:  # noqa: BLE001
                     probs_ml = None
@@ -3687,7 +4034,7 @@ if (not is_lite) and main_nav == _NAV_DETAIL:
                 show_p = pd.DataFrame(prob_rows)
                 for col in ("P(Chủ)", "P(Hòa)", "P(Khách)"):
                     show_p[col] = show_p[col].map(lambda x: f"{x:.1%}")
-                st.dataframe(show_p, use_container_width=True, hide_index=True)
+                st.dataframe(show_p, width="stretch", hide_index=True)
 
                 _plotly(
                     _1x2_models_chart(
@@ -3711,7 +4058,7 @@ if (not is_lite) and main_nav == _NAV_DETAIL:
                 show["EV %"] = show["EV %"].map(lambda x: f"{x:+.1f}%")
                 show["Kelly %"] = show["Kelly %"].map(lambda x: f"{x:.2f}%")
                 show["Value?"] = show["Value?"].map(lambda x: "✅" if x else "—")
-                st.dataframe(show, use_container_width=True, hide_index=True)
+                st.dataframe(show, width="stretch", hide_index=True)
 
                 # ----- 4) Value Bet -----
                 st.subheader("4. Đề xuất Value Bet")
@@ -3789,7 +4136,7 @@ if (not is_lite) and main_nav == _NAV_DETAIL:
                             if st.button(
                                 "➕ Đặt cược vào Journal",
                                 key=jkey,
-                                use_container_width=True,
+                                width="stretch",
                             ):
                                 try:
                                     jr = add_to_journal(
@@ -3929,7 +4276,7 @@ if (not is_lite) and main_nav == _NAV_DETAIL:
         ]
         st.dataframe(
             _rename_fixture_cols(preview, cols),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -4055,7 +4402,7 @@ if (not is_lite) and main_nav == _NAV_BUDGET:
                         "Kelly %",
                         "Tiền gợi ý",
                     ]
-                    st.dataframe(display, use_container_width=True, hide_index=True)
+                    st.dataframe(display, width="stretch", hide_index=True)
 
 # ===========================================================================
 # Tab 2b — 📈 Nhật Ký Cược & Bankroll (Paper Trading)
@@ -4065,7 +4412,7 @@ if (not is_lite) and main_nav == _NAV_JOURNAL:
     st.header("📈 Nhật Ký Cược & Bankroll")
     st.caption(
         "Paper trading: lệnh từ tab Chi tiết kèo · settle Thắng/Thua/Hòa · "
-        "bankroll, ROI, hit rate & CLV trên EPL + UWCL."
+        "bankroll, ROI, hit rate & CLV trên mọi giải đã ghi."
     )
 
     init_br = float(
@@ -4360,7 +4707,7 @@ if (not is_lite) and main_nav == _NAV_JOURNAL:
             display_h["pnl"] = display_h["pnl"].map(
                 lambda x: f"{float(x):+,.2f}" if pd.notna(x) else "—"
             )
-        st.dataframe(display_h, use_container_width=True, hide_index=True)
+        st.dataframe(display_h, width="stretch", hide_index=True)
 
         export_df = show_h.copy()
         if "clv_pct" in export_df.columns:
@@ -4372,7 +4719,7 @@ if (not is_lite) and main_nav == _NAV_JOURNAL:
             file_name="paper_bets_journal.csv",
             mime="text/csv",
             key="journal_export_csv",
-            use_container_width=True,
+            width="stretch",
         )
 
     # --- Pending settle (active sidebar league DB) ---
@@ -4396,38 +4743,40 @@ if (not is_lite) and main_nav == _NAV_JOURNAL:
                 settle_cols = st.columns(2)
                 with settle_cols[0]:
                     if st.button(
-                        "✅ Thắng", key=f"settle_win_{bid}", use_container_width=True
+                        "✅ Thắng", key=f"settle_win_{bid}", width="stretch"
                     ):
-                        pnl = settle_live_bet(bid, "WIN", active_db_path)
-                        st.session_state["bankroll"] = float(
-                            journal_bankroll_summary(
-                                float(st.session_state["bankroll_initial"]),
-                                active_db_path,
-                            )["current_bankroll"]
-                        )
-                        st.success(f"#{bid} WIN · PnL {pnl:+,.2f}")
-                        st.rerun()
+                        pnl = _settle_bet_safely(bid, "WIN", active_db_path)
+                        if pnl is not None:
+                            st.session_state["bankroll"] = float(
+                                journal_bankroll_summary(
+                                    float(st.session_state["bankroll_initial"]),
+                                    active_db_path,
+                                )["current_bankroll"]
+                            )
+                            st.success(f"#{bid} WIN · PnL {pnl:+,.2f}")
+                            st.rerun()
                     if st.button(
-                        "↩ Hòa (Push)", key=f"settle_push_{bid}", use_container_width=True
+                        "↩ Hòa (Push)", key=f"settle_push_{bid}", width="stretch"
                     ):
-                        settle_live_bet(bid, "PUSH", active_db_path)
-                        st.info(f"#{bid} PUSH · hoàn stake")
-                        st.rerun()
+                        if _settle_bet_safely(bid, "PUSH", active_db_path) is not None:
+                            st.info(f"#{bid} PUSH · hoàn stake")
+                            st.rerun()
                 with settle_cols[1]:
                     if st.button(
-                        "❌ Thua", key=f"settle_loss_{bid}", use_container_width=True
+                        "❌ Thua", key=f"settle_loss_{bid}", width="stretch"
                     ):
-                        pnl = settle_live_bet(bid, "LOSS", active_db_path)
-                        st.session_state["bankroll"] = float(
-                            journal_bankroll_summary(
-                                float(st.session_state["bankroll_initial"]),
-                                active_db_path,
-                            )["current_bankroll"]
-                        )
-                        st.warning(f"#{bid} LOSS · PnL {pnl:+,.2f}")
-                        st.rerun()
+                        pnl = _settle_bet_safely(bid, "LOSS", active_db_path)
+                        if pnl is not None:
+                            st.session_state["bankroll"] = float(
+                                journal_bankroll_summary(
+                                    float(st.session_state["bankroll_initial"]),
+                                    active_db_path,
+                                )["current_bankroll"]
+                            )
+                            st.warning(f"#{bid} LOSS · PnL {pnl:+,.2f}")
+                            st.rerun()
                     if st.button(
-                        "🗑 Xóa", key=f"del_bet_{bid}", use_container_width=True
+                        "🗑 Xóa", key=f"del_bet_{bid}", width="stretch"
                     ):
                         delete_live_bet(bid, active_db_path)
                         st.rerun()
@@ -4467,7 +4816,7 @@ if (not is_lite) and main_nav == _NAV_HIST:
         .reset_index()
         .rename(columns={"Season": "Mùa giải"})
     )
-    st.dataframe(by_season, use_container_width=True, hide_index=True)
+    st.dataframe(by_season, width="stretch", hide_index=True)
 
     n_hist = st.slider("Hiện N trận gần nhất", 10, 100, 30, 5, key="hist_n")
     hist = data.sort_values("Date", ascending=False).head(n_hist).copy()
@@ -4490,7 +4839,7 @@ if (not is_lite) and main_nav == _NAV_HIST:
                 "B365A": "Odds khách",
             }
         ),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
     st.caption("Walk-forward Backtest đầy đủ nằm ở tab **Backtest**.")
@@ -4797,11 +5146,11 @@ if (not is_lite) and main_nav == _NAV_BACKTEST:
         by_m_cal = cal.get("by_market")
         if isinstance(by_m_cal, pd.DataFrame) and not by_m_cal.empty:
             st.markdown("**Theo thị trường (1X2 / OU / AH)**")
-            st.dataframe(by_m_cal, use_container_width=True, hide_index=True)
+            st.dataframe(by_m_cal, width="stretch", hide_index=True)
         by_s_cal = cal.get("by_season")
         if isinstance(by_s_cal, pd.DataFrame) and not by_s_cal.empty:
             st.markdown("**Theo mùa**")
-            st.dataframe(by_s_cal, use_container_width=True, hide_index=True)
+            st.dataframe(by_s_cal, width="stretch", hide_index=True)
         rel = cal.get("reliability")
         if isinstance(rel, pd.DataFrame) and not rel.empty:
             rel_plot = rel.dropna(subset=["p_mean", "y_freq"])
@@ -4838,7 +5187,7 @@ if (not is_lite) and main_nav == _NAV_BACKTEST:
         abl = st.session_state.get("bt_last_ablation")
         if isinstance(abl, pd.DataFrame) and not abl.empty:
             st.subheader("Ablation: Dixon–Coles vs Ensemble")
-            st.dataframe(abl, use_container_width=True, hide_index=True)
+            st.dataframe(abl, width="stretch", hide_index=True)
             if "roi_pct" in abl.columns and "w_ml" in abl.columns:
                 fig_ab = px.line(
                     abl,
@@ -4884,7 +5233,7 @@ if (not is_lite) and main_nav == _NAV_BACKTEST:
                 "brier_score": "Brier",
             }
         )
-        st.dataframe(show_mb, use_container_width=True, hide_index=True)
+        st.dataframe(show_mb, width="stretch", hide_index=True)
 
         fig_roi = px.bar(
             mb,
@@ -4935,7 +5284,7 @@ if (not is_lite) and main_nav == _NAV_BACKTEST:
                 detail["ev"] = detail["ev"].map(lambda x: f"{x:+.1%}")
                 detail["stake_pct"] = detail["stake_pct"].map(lambda x: f"{x:.2%}")
                 detail["pnl"] = detail["pnl"].map(lambda x: f"{x:+.2f}")
-                st.dataframe(detail, use_container_width=True, hide_index=True)
+                st.dataframe(detail, width="stretch", hide_index=True)
     else:
         st.info("Chọn tham số rồi bấm **Chạy Walk-forward Backtest**.")
 
@@ -5011,7 +5360,7 @@ if (not is_lite) and main_nav == _NAV_CORNERS:
                     "expected_total": "E[Total]",
                 }
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -5108,7 +5457,7 @@ if (not is_lite) and main_nav == _NAV_CORNERS:
                         "ev_pct": "EV %",
                     }
                 ),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
             best = legs[0]
@@ -5136,7 +5485,7 @@ if (not is_lite) and main_nav == _NAV_COMPARE:
             "Net": "Điểm ròng",
         }
     )
-    st.dataframe(strengths.round(3), use_container_width=True, hide_index=True)
+    st.dataframe(strengths.round(3), width="stretch", hide_index=True)
 
     fig_s = px.scatter(
         strengths,
@@ -5169,7 +5518,8 @@ if (not is_lite) and main_nav == _NAV_COMPARE:
         p_ml = None
         if ml_model is not None:
             try:
-                p_ml = ml_model.predict_proba(h, a)
+                # No fixture here → match_date defaults to "now" in the model.
+                p_ml = ml_model.predict_proba(h, a, **_ml_context(league))
             except Exception:  # noqa: BLE001
                 p_ml = None
         p_ens = _blend_1x2(p_dc, p_ml, w_ml) if p_ml is not None else p_dc
@@ -5214,10 +5564,10 @@ if (not is_lite) and main_nav == _NAV_COMPARE:
                     },
                 ]
             )
-            st.dataframe(cmp_models, use_container_width=True, hide_index=True)
+            st.dataframe(cmp_models, width="stretch", hide_index=True)
             with st.expander("Feature importance LightGBM (top 10)"):
                 st.dataframe(
                     ml_model.feature_importance().head(10),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )

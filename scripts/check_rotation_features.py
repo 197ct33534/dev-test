@@ -2,8 +2,8 @@
 
 Examples
 --------
-    python scripts/test_rotation_features.py
-    python scripts/test_rotation_features.py --kickoff 2026-09-23 --no-network
+    python scripts/check_rotation_features.py
+    python scripts/check_rotation_features.py --kickoff 2026-09-23 --no-network
 """
 
 from __future__ import annotations

@@ -1,28 +1,63 @@
-"""Run safer walk-forward backtest — 1X2 market only (positive-edge focus)."""
+"""Smoke run: safer walk-forward backtest — 1X2 market only (EPL).
+
+Not a pytest test (formerly ``test_backtest.py`` at repo root).
+
+Usage::
+
+    python scripts/run_backtest_smoke.py            # bets -> temporary SQLite
+    python scripts/run_backtest_smoke.py --db PATH  # bets -> PATH (replaces bet_history!)
+
+By default simulated bets are written to a throw-away temp DB so the real
+``bet_history`` in ``DEFAULT_DB_PATH`` is never wiped by ``replace_history``.
+"""
 
 from __future__ import annotations
 
+import argparse
 import sys
+import tempfile
+from pathlib import Path
 
-import pandas as pd
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from src.backtester import (
+import pandas as pd  # noqa: E402
+
+from src.backtester import (  # noqa: E402
     BacktestConfig,
     format_backtest_report,
     get_backtest_summary,
     run_backtest,
 )
-from src.config import DEFAULT_KELLY_FRACTION, DEFAULT_W_ML, MAX_STAKE_PCT
-from src.data_loader import DEFAULT_DB_PATH, load_epl_data
+from src.config import DEFAULT_KELLY_FRACTION, DEFAULT_W_ML, MAX_STAKE_PCT  # noqa: E402
+from src.data_loader import DEFAULT_DB_PATH, load_epl_data  # noqa: E402
 
 
-def main() -> int:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=None,
+        help="SQLite file for bet_history (REPLACED). Default: temp DB.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    if args.db is not None:
+        bets_db = Path(args.db)
+        print(f"!! bet_history in {bets_db} will be REPLACED by this run")
+    else:
+        bets_db = Path(tempfile.mkdtemp(prefix="bt_smoke_")) / "backtest_smoke.db"
     print("=== Load EPL data (2 seasons -> SQLite) ===")
     data = load_epl_data(n_seasons=2, force_refresh=False)
     print(
         f"Loaded {len(data)} matches · "
         f"{data['Date'].min().date()} -> {data['Date'].max().date()} · "
-        f"DB={DEFAULT_DB_PATH}"
+        f"data DB={DEFAULT_DB_PATH} · bets DB={bets_db}"
     )
     if "Season" in data.columns:
         print("Seasons:", ", ".join(sorted(data["Season"].astype(str).unique())))
@@ -44,7 +79,7 @@ def main() -> int:
         min_ev_ah=0.05,
         persist=True,
         replace_history=True,
-        db_path=DEFAULT_DB_PATH,
+        db_path=bets_db,
         refit_every=7,
         calibration="isotonic",
         min_cal_samples=80,
@@ -86,7 +121,7 @@ def main() -> int:
         print("NOTE: Bankroll chua tang (van co the tot hon chay full 3 markets).")
 
     from_db = get_backtest_summary(
-        db_path=DEFAULT_DB_PATH, initial_bankroll=cfg.initial_bankroll
+        db_path=bets_db, initial_bankroll=cfg.initial_bankroll
     )
     print(f"\nPersisted bets in SQLite `bet_history`: {from_db['total_bets']}")
 

@@ -1,5 +1,9 @@
 r"""Dự đoán trận EPL sắp đá với odds nhà cái thực tế → Match Card.
 
+Lưu ý: script demo legacy, CHỈ hỗ trợ EPL (không dùng config/leagues.json,
+không Ensemble/LightGBM, không league weights). Luồng đa giải chính thức:
+Streamlit ``app.py``, FastAPI ``run_api.py`` và ``scripts/auto_scanner.py``.
+
 Chạy:
     python predict_next_game.py
 

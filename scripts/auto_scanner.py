@@ -271,18 +271,31 @@ def scan_value_bets(
             home, away = str(r["home_team"]), str(r["away_team"])
             try:
                 p_dc = dc.predict_match_probs(home, away)
-                p_ml = ml.predict_proba(home, away)
+                fx_date = r.get("match_date")
+                if fx_date is None or pd.isna(fx_date):
+                    fx_date = r.get("kickoff")
+                if fx_date is not None and pd.isna(fx_date):
+                    fx_date = None
+                p_ml = ml.predict_proba(
+                    home, away, match_date=fx_date, competition=code
+                )
                 p = _blend(p_dc, p_ml, w_ml)
                 key = {"Home": "H", "Draw": "D", "Away": "A"}.get(
                     str(r["selection"]), ""
                 )
                 if key and key in p:
-                    from src.recommender import expected_value, fractional_kelly
+                    from src.recommender import expected_value
+                    from src.strategy import capped_kelly_fraction
 
                     odds = float(r["bookmaker_odds"])
                     p_use = float(p[key])
                     ev = expected_value(p_use, odds)
-                    kelly_f = fractional_kelly(p_use, odds, kelly)
+                    kelly_f = capped_kelly_fraction(p_use, odds, kelly_fraction=kelly)
+                    detail = r.get("detail")
+                    prev_k = r.get("kelly_fraction")
+                    if isinstance(detail, dict) and detail.get("new_team_fallback"):
+                        # Keep the recommender's new-team stake cap.
+                        kelly_f = min(kelly_f, float(prev_k))
                     d = r.to_dict()
                     d["p_model"] = p_use
                     d["ev"] = ev
@@ -297,11 +310,12 @@ def scan_value_bets(
             rows.append(r.to_dict())
         recs = pd.DataFrame(rows)
 
-    # CornerPredictor legs (default book odds 1.90 when feed has no corner line)
+    # CornerPredictor legs — only when the feed has real corner odds (never
+    # price alerts against assumed odds).
     if "Corners" in markets and not fixtures.empty:
         try:
             from src.corner_model import CornerPredictor
-            from src.recommender import fractional_kelly
+            from src.strategy import capped_kelly_fraction
 
             print("      Fitting CornerPredictor…")
             cp_backend = "poisson" if code == "UWCL" else "auto"
@@ -310,17 +324,15 @@ def scan_value_bets(
             c_rows: list[dict] = []
             for _, fx in fixtures.iterrows():
                 home, away = str(fx["HomeTeam"]), str(fx["AwayTeam"])
-                odds_over = (
-                    float(fx["OddsCornerOver"])
-                    if "OddsCornerOver" in fx.index and pd.notna(fx.get("OddsCornerOver"))
-                    else 1.90
-                )
+                odds_over = fx.get("OddsCornerOver") if "OddsCornerOver" in fx.index else None
                 odds_under = (
-                    float(fx["OddsCornerUnder"])
-                    if "OddsCornerUnder" in fx.index
-                    and pd.notna(fx.get("OddsCornerUnder"))
-                    else 1.90
+                    fx.get("OddsCornerUnder") if "OddsCornerUnder" in fx.index else None
                 )
+                if odds_over is None or odds_under is None or pd.isna(odds_over) or pd.isna(
+                    odds_under
+                ):
+                    continue
+                odds_over, odds_under = float(odds_over), float(odds_under)
                 try:
                     legs = cp.predict_corner_ev(
                         home,
@@ -333,7 +345,9 @@ def scan_value_bets(
                     continue
                 kick = fx["Kickoff"] if "Kickoff" in fx.index else None
                 for leg in legs:
-                    kf = fractional_kelly(float(leg["p_model"]), float(leg["odds"]), kelly)
+                    kf = capped_kelly_fraction(
+                        float(leg["p_model"]), float(leg["odds"]), kelly_fraction=kelly
+                    )
                     c_rows.append(
                         {
                             "kickoff": kick,
@@ -515,7 +529,7 @@ def main(argv: list[str] | None = None) -> int:
     if not token or not chat:
         print(
             "WARNING: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing — Telegram skipped.\n"
-            "  → Điền vào .env rồi chạy: python scripts/test_telegram.py",
+            "  → Điền vào .env rồi chạy: python scripts/check_telegram.py",
             file=sys.stderr,
         )
         return 0

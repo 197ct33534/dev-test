@@ -2,6 +2,8 @@
 
 > **Project Portfolio & Technical Presentation**  
 > Hệ thống dự đoán xác suất bóng đá Ngoại hạng Anh, phát hiện Value Bet và quản trị vốn bằng toán thống kê.
+>
+> *Cập nhật:* hệ thống hiện đa giải (EPL, LaLiga, UWCL, J.League Cup, Emperor's Cup qua `config/leagues.json`) và dùng **10% Kelly, stake tối đa 1% bankroll** (`src/config.py`). Xem `README.md` và báo cáo `BAO_CAO_DU_AN.md`.
 
 ---
 
@@ -38,7 +40,7 @@ Dự án xây một **pipeline end-to-end** để:
 \text{EV} = (P_{\text{model}} \times \text{Odds}) - 1 \;\ge\; 0.05 \quad (5\%)
 \]
 
-4. **Quản trị vốn** bằng **Fractional Kelly (25% Kelly)** — quy đổi lợi thế thống kê thành mức stake kỷ luật, tránh all-in cảm xúc.
+4. **Quản trị vốn** bằng **Fractional Kelly (10% Kelly, stake ≤ 1% bankroll)** — quy đổi lợi thế thống kê thành mức stake kỷ luật, tránh all-in cảm xúc.
 5. **Bổ sung thị trường phạt góc** bằng Poisson GLM trên thống kê `HC` / `AC` nhiều mùa.
 
 ### Giá trị mang lại
@@ -181,7 +183,7 @@ P_model  ──►  Fair Odds = 1 / P_model
                 │
 Odds_book ──────┼──►  EV = P_model × Odds_book − 1
                 │
-                └──►  nếu EV ≥ 5%  →  Fractional Kelly (f = 0.25)
+                └──►  nếu EV ≥ 5%  →  Fractional Kelly (f = 0.10, cap 1%)
                                     stake* = f × EV / (Odds − 1) × Bankroll
 ```
 
@@ -190,7 +192,7 @@ Odds_book ──────┼──►  EV = P_model × Odds_book − 1
 | Fair Odds | \(1 / P_{\text{model}}\) |
 | Expected Value | \(\text{EV} = (P_{\text{model}} \times \text{Odds}) - 1\) |
 | Ngưỡng khuyến nghị | Chỉ đề xuất khi \(\text{EV} \ge 0.05\) |
-| Vốn | **Quarter Kelly** (\(f=0.25\)) — giảm biến động so với Full Kelly |
+| Vốn | **10% Kelly** (\(f=0.10\)), stake tối đa 1% bankroll — giảm biến động so với Full / Quarter Kelly |
 | So sánh ngầm định | \(P_{\text{implied}} = 1 / \text{Odds}\) (chưa bỏ overround từng cửa) |
 
 **ValueBet card** đóng gói: thị trường, lựa chọn, mốc, \(P_{\text{model}}\), fair odds, odds nhà cái, EV%, Kelly%, số tiền gợi ý theo bankroll.
@@ -262,7 +264,7 @@ Mở trình duyệt tại `http://localhost:8501`.
 
 | Bước demo gợi ý | Hành động |
 |-----------------|-----------|
-| 1 | Sidebar: chọn 3 mùa, chỉnh \(\xi\), EV min = 5%, Kelly = 25% |
+| 1 | Sidebar: chọn 3 mùa, chỉnh \(\xi\), EV min = 5%, Kelly = 10% |
 | 2 | Tab **Chi tiết kèo sắp tới** → chọn trận → kiểm tra nguồn odds API |
 | 3 | Đọc thẻ Value / biểu đồ Model vs Nhà cái |
 | 4 | Tab **Phạt góc** / **Sức mạnh đội** để bổ sung narrative |
@@ -285,10 +287,10 @@ Mỗi trận đóng góp log-likelihood của cặp \((x,y)\) dưới phân ph�
 ### Fractional Kelly
 
 \[
-f^{\star} = f_{\text{kelly}} \cdot \frac{\text{EV}}{\text{Odds}-1}, \quad f_{\text{kelly}} = 0.25
+f^{\star} = \min\!\left(f_{\text{kelly}} \cdot \frac{\text{EV}}{\text{Odds}-1},\ 0.01\right), \quad f_{\text{kelly}} = 0.10
 \]
 
-Stake gợi ý \(= f^{\star} \times \text{Bankroll}\) (cắt về \([0,1]\)).
+Stake gợi ý \(= f^{\star} \times \text{Bankroll}\) (tối đa 1% bankroll mỗi kèo).
 
 ### Quy tắc khuyến nghị (từ `.cursorrules`)
 

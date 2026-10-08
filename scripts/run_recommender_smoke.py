@@ -1,10 +1,21 @@
-"""Integration smoke test: data → Dixon–Coles fit → ValueBetRecommender."""
+"""Integration smoke run: data → Dixon–Coles fit → ValueBetRecommender (EPL).
+
+Not a pytest test (formerly ``test_recommender.py`` at repo root).
+Usage: ``python scripts/run_recommender_smoke.py``
+"""
 
 from __future__ import annotations
 
-from src.data_loader import load_epl_data
-from src.dixon_coles import DixonColesModel
-from src.recommender import ValueBetRecommender, format_recommendations
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.data_loader import load_epl_data  # noqa: E402
+from src.dixon_coles import DixonColesModel  # noqa: E402
+from src.recommender import ValueBetRecommender, format_recommendations  # noqa: E402
 
 
 def main() -> None:

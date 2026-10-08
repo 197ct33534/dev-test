@@ -2,9 +2,16 @@
 
 Examples
 --------
-    python scripts/test_team_rest_days.py
-    python scripts/test_team_rest_days.py --kickoff 2026-09-23 --n-matches 15
-    python scripts/test_team_rest_days.py --dry-run
+    python scripts/check_team_rest_days.py                     # fetch only (no writes)
+    python scripts/check_team_rest_days.py --kickoff 2026-09-23 --n-matches 15
+    python scripts/check_team_rest_days.py --db /tmp/global.db # persist to scratch DB
+    python scripts/check_team_rest_days.py --write             # persist to data/ DB
+
+Nothing under ``data/`` is written unless ``--write`` is given; ``--db PATH``
+persists to (and reads rest days from) PATH instead.
+
+Exit codes: 0 OK, 1 hard failure, 2 registry failure, 3 Machida assert /
+network failure (empty feeds or fetch error).
 """
 
 from __future__ import annotations
@@ -25,6 +32,9 @@ TEAMS = ("JP_VISSEL_KOBE", "JP_SAGAN_TOSU", "JP_MACHIDA", "JP_TOCHIGI_CITY")
 ASSERT_REST: dict[str, int] = {
     "JP_MACHIDA": 3,
 }
+
+
+EXIT_NETWORK_FAIL = 3
 
 
 def _soft_network_fail(exc: BaseException) -> bool:
@@ -67,7 +77,18 @@ def main() -> int:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Fetch + print only; do not write global_matches.db",
+        help="Fetch + print only; do not write (default unless --db/--write)",
+    )
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=None,
+        help="Persist feeds to / read rest days from this global DB path",
+    )
+    parser.add_argument(
+        "--write",
+        action="store_true",
+        help="Persist feeds to the production data/global_matches.db",
     )
     parser.add_argument(
         "--no-network",
@@ -80,6 +101,13 @@ def main() -> int:
         help="Exit non-zero if JP_MACHIDA rest_days != 3 for --kickoff",
     )
     args = parser.parse_args()
+    if args.db is not None and args.write:
+        parser.error("use either --db PATH or --write, not both")
+    if args.db is None and not args.write:
+        args.dry_run = True
+    if args.dry_run:
+        args.db = None
+        args.write = False
 
     teams = tuple(
         t.strip().upper() for t in str(args.teams).split(",") if t.strip()
@@ -112,6 +140,8 @@ def main() -> int:
         resolve_team_id,
     )
 
+    target_db = Path(args.db) if args.db is not None else GLOBAL_DB_PATH
+
     ensure_jp_aliases_registered()
     registry = team_hash_registry()
     print("=== Team hash registry ===")
@@ -142,10 +172,10 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             if _soft_network_fail(exc):
                 print(
-                    f"SOFT FAIL (network): {type(exc).__name__}: {exc}",
+                    f"NETWORK FAIL: {type(exc).__name__}: {exc}",
                     file=sys.stderr,
                 )
-                return 0
+                return EXIT_NETWORK_FAIL
             print(f"HARD FAIL during fetch: {exc}", file=sys.stderr)
             traceback.print_exc()
             return 1
@@ -176,7 +206,9 @@ def main() -> int:
 
     if not args.dry_run and all_rows:
         try:
-            persist_stats = persist_team_matches_to_global_db(all_rows)
+            persist_stats = persist_team_matches_to_global_db(
+                all_rows, db_path=target_db
+            )
             print("=== Persist ===")
             print(json.dumps(persist_stats, indent=2, ensure_ascii=False, default=str))
         except Exception as exc:  # noqa: BLE001
@@ -184,16 +216,20 @@ def main() -> int:
             traceback.print_exc()
             return 1
     elif args.dry_run:
-        print("=== Persist skipped (--dry-run) ===")
+        print("=== Persist skipped (dry run; pass --db PATH or --write) ===")
 
     # Rest days from global DB (or in-memory synthetic if dry-run with feeds).
     import pandas as pd
 
     kick = args.kickoff
     hist = None
-    if not args.dry_run:
+    # Dry runs may still *read* an existing DB (e.g. --no-network) — never write.
+    read_db = not args.dry_run or (args.no_network and target_db.is_file())
+    hist_from_db = False
+    if read_db:
         try:
-            hist = read_matches_as_legacy(GLOBAL_DB_PATH)
+            hist = read_matches_as_legacy(target_db)
+            hist_from_db = hist is not None and not hist.empty
         except Exception as exc:  # noqa: BLE001
             print(f"warn: could not read global DB: {exc}", file=sys.stderr)
 
@@ -219,8 +255,8 @@ def main() -> int:
     if hist is not None and not hist.empty:
         conn = None
         id_map: dict[str, int] = {}
-        if not args.dry_run:
-            conn = connect_global_db(GLOBAL_DB_PATH, init=True)
+        if hist_from_db:
+            conn = connect_global_db(target_db, init=not args.dry_run)
             try:
                 for tid in teams:
                     rid = resolve_team_id(conn, tid, comp_id="EMPERORS_CUP", create=False)
@@ -281,13 +317,13 @@ def main() -> int:
         if rest_out.get(key):
             print(f"\nLite label ({key}): {rest_out[key]}")
 
-    # Soft fail if all feeds empty after network attempt.
+    # Fail (non-zero) if all feeds empty after network attempt.
     if not args.no_network and not any(feeds.get(t) for t in teams):
         print(
-            "SOFT FAIL: empty feeds for all teams (network / parse).",
+            "NETWORK FAIL: empty feeds for all teams (network / parse).",
             file=sys.stderr,
         )
-        return 0
+        return EXIT_NETWORK_FAIL
 
     # Optional hard assert for Machida rest_days.
     if args.assert_machida or "JP_MACHIDA" in teams:
