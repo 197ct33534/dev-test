@@ -1,5 +1,4 @@
 import { RotateCcw, SlidersHorizontal, X } from "lucide-react";
-import { LEAGUE_OPTIONS } from "../data/mockMatches";
 import { cn } from "../lib/utils";
 import type { BetMarket, FilterState, ViewMode } from "../types";
 
@@ -10,6 +9,11 @@ const MARKET_OPTS: { id: BetMarket; label: string }[] = [
   { id: "Corners", label: "Phạt Góc" },
 ];
 
+export interface LeagueOption {
+  id: string;
+  label: string;
+}
+
 interface SidebarProps {
   filters: FilterState;
   draft: FilterState;
@@ -18,6 +22,11 @@ interface SidebarProps {
   onReset: () => void;
   mobileOpen: boolean;
   onCloseMobile: () => void;
+  /** From /api/v1/leagues (config/leagues.json). */
+  leagueOptions: LeagueOption[];
+  /** Policy ceilings from /api/v1/config, in percent. */
+  maxKellyPct: number;
+  maxStakePct: number;
 }
 
 function Toggle({
@@ -109,6 +118,9 @@ export function Sidebar({
   onReset,
   mobileOpen,
   onCloseMobile,
+  leagueOptions,
+  maxKellyPct,
+  maxStakePct,
 }: SidebarProps) {
   const patch = (partial: Partial<FilterState>) =>
     onDraftChange({ ...draft, ...partial });
@@ -159,7 +171,7 @@ export function Sidebar({
           Giải đấu
         </p>
         <div className="max-h-36 space-y-1.5 overflow-y-auto vb-scrollbar rounded-xl border border-slate-800 bg-slate-950/40 p-2">
-          {LEAGUE_OPTIONS.map((lg) => {
+          {leagueOptions.map((lg) => {
             const checked = draft.leagues.includes(lg.id);
             return (
               <label
@@ -197,15 +209,16 @@ export function Sidebar({
         <SliderField
           label="Tỷ lệ Kelly (fraction)"
           value={draft.kellyFractionPct}
-          min={5}
-          max={10}
+          min={Math.min(5, maxKellyPct)}
+          max={maxKellyPct}
           step={1}
           suffix="%"
           onChange={(kellyFractionPct) => patch({ kellyFractionPct })}
         />
         <p className="text-[10px] leading-snug text-ink-faint">
-          Stake = Kelly × fraction, tối đa 1% bankroll (như backend). Mô hình:
-          Ensemble Dixon–Coles + LightGBM.
+          Stake do backend tính: Kelly đúng theo bảng tất toán (push / thua
+          nửa) × fraction, tối đa {maxStakePct.toFixed(maxStakePct < 1 ? 1 : 0)}% bankroll
+          (đội ít dữ liệu: một nửa). Mô hình: Dixon–Coles (+ LightGBM khi có).
         </p>
       </section>
 

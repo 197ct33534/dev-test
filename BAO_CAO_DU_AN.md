@@ -339,5 +339,19 @@ Mục tiêu: không mất tiền vì tín hiệu sai, không lộ hệ thống.
 6. **Hạng mục kiến trúc trong mục 3 chưa làm:**
    - Chuyển sang Postgres.
    - Gộp hai backtester, hai ensemble, ba bản settlement.
-   - Nối dashboard với `/api/v2`.
+   - ~~Nối dashboard với API~~ — xong (mục 5.4).
    - Thêm lockfile cho dependency.
+
+### 5.4 Giai đoạn 4.2–4.4: dashboard nối API (cập nhật 2026-10-13)
+
+- **Backend:** thêm `GET /api/v1/leagues` (từ `config/leagues.json`) và `GET /api/v1/config` (chính sách stake từ `src/config.py`). `/api/v1/value-bets` nhận `leagues=` (nhiều giải, tối đa 8) và `kelly_fraction=` (≤ `MAX_KELLY_FRACTION`), trả thêm `generated_at`, `kelly_fraction`, `league_meta` (nguồn odds, tuổi odds, stale, số fixture, ML bật/tắt), và mỗi kèo có `home_display`/`away_display`, `new_team_fallback`, `ev_method`.
+- **Xác thực web:** `DASHBOARD_API_TOKENS` (Bearer, ≥ 16 ký tự, chỉ đọc; không gọi được endpoint ghi).
+- **Phục vụ:** FastAPI mount `dashboard/dist` tại `/dashboard`; Dockerfile có stage Node build dashboard.
+- **Dashboard:** bỏ mock (còn giữ qua `VITE_USE_MOCK=true`), client có type, React Query poll 60 s, Vite proxy `/api`, giải lấy từ API, EV/stake lấy nguyên từ backend, chip độ tin cậy trên card (odds cũ, tuổi odds, dưới ngưỡng, đội ít dữ liệu, prior đội mới, ML tắt), drawer tải phong độ/H2H từ team profile, màn nhập token khi 401.
+- **Ghi chú:** dashboard gọi `/api/v1` (đường scan live dùng chung với Telegram/WebApp), không phải `/api/v2`: v2 chạy pipeline canonical riêng và chưa có các thị trường AH/O-U, Kelly, line.
+
+**Phát hiện khi chạy thật (chưa sửa):**
+
+1. Scan Top-N trả **nhiều kèo trên cùng một trận** (ví dụ Yokohama FC vs Urawa có cả AH −0.5 và 1X2 Home) — mục 1.7 (kèo tương quan) chưa áp vào `scan_top_value_bets`.
+2. J.League Cup cho EV +25…+45% trên toàn bộ các trận đều có `new_team_fallback` — mô hình cold-fit thiếu dữ liệu, EV gần như chắc chắn phồng. Dashboard đã gắn nhãn "Prior đội mới", nhưng nên cân nhắc chặn hẳn ở backend.
+3. `ai_reasons` vẫn in mã đội (`JP_NAGOYA`) thay vì tên hiển thị; mọi đội đều "nghỉ 15 ngày" (nghi giá trị mặc định của rest days).

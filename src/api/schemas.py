@@ -75,6 +75,10 @@ class ValueBetOut(BaseModel):
     away: str | None = None
     home_team: str | None = None
     away_team: str | None = None
+    home_display: str | None = Field(
+        default=None, description="Friendly name (home/away stay stable team ids)"
+    )
+    away_display: str | None = None
     match_id: str | None = None
     league: str | None = None
     competition: str | None = None
@@ -89,6 +93,13 @@ class ValueBetOut(BaseModel):
     away_thin: bool | None = None
     thin_teams: list[str] = Field(default_factory=list)
     p_source: str | None = None
+    new_team_fallback: bool = Field(
+        default=False,
+        description="Model priced a side with the new-team prior (stake capped)",
+    )
+    ev_method: str | None = Field(
+        default=None, description='"settlement" for push-aware AH / O/U EV'
+    )
     # Model fair line vs bookie (line disparity)
     fair_total_goals: float | None = None
     fair_ou_line: float | None = None
@@ -109,6 +120,24 @@ class ValueBetOut(BaseModel):
     line_edge: str | None = Field(
         default=None,
         description='e.g. "+0.50 bàn"',
+    )
+
+
+class LeagueScanMetaOut(BaseModel):
+    """Per-league data-confidence for one scan (odds freshness, model)."""
+
+    league: str
+    label: str | None = None
+    fixtures_source: str = Field(
+        "empty", description="db_cache | network | empty"
+    )
+    stale: bool = False
+    odds_age_minutes: float | None = None
+    fixtures: int = 0
+    model_note: str | None = None
+    ml_enabled: bool = False
+    model_source: str | None = Field(
+        default=None, description="pickle | cold_fit | null (no model)"
     )
 
 
@@ -139,6 +168,14 @@ class ValueBetsResponse(BaseModel):
     )
     stale_leagues: list[str] = Field(default_factory=list)
     source: str = "scan"
+    generated_at: str | None = Field(
+        default=None, description="Server UTC time the scan was computed (ISO)"
+    )
+    kelly_fraction: float | None = Field(
+        default=None, description="Fractional-Kelly multiplier used for stakes"
+    )
+    leagues: list[str] = Field(default_factory=list)
+    league_meta: list[LeagueScanMetaOut] = Field(default_factory=list)
     notes: str | None = None
 
 
@@ -165,3 +202,40 @@ class PerformanceAnalyticsOut(BaseModel):
     league: str | None = None
     notes: str | None = None
 
+
+
+class LeagueOut(BaseModel):
+    """One league from ``config/leagues.json`` (∪ hardcoded fallback)."""
+
+    code: str
+    name: str
+    country: str | None = None
+    time_zone: str | None = None
+    league_weight: float = 1.0
+    is_cup: bool = False
+    default_scan: bool = Field(
+        False, description="Scanned when /value-bets is called without leagues"
+    )
+
+
+class LeaguesResponse(BaseModel):
+    leagues: list[LeagueOut]
+    count: int
+
+
+class StakePolicyOut(BaseModel):
+    """Stake / EV policy from ``src.config`` — every UI renders these values."""
+
+    min_ev_pct: float
+    kelly_fraction: float
+    max_kelly_fraction: float
+    max_stake_pct: float
+    new_team_max_stake_pct: float
+    max_bets_per_day: int
+
+
+class ApiConfigOut(BaseModel):
+    policy: StakePolicyOut
+    markets: list[str]
+    fixtures_max_age_minutes: float
+    server_time: str

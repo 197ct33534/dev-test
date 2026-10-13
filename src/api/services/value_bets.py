@@ -12,7 +12,13 @@ from typing import Any, Sequence
 
 import pandas as pd
 
-from src.config import DEFAULT_KELLY_FRACTION, DEFAULT_MIN_EV, DEFAULT_W_ML, MAX_STAKE_PCT
+from src.config import (
+    DEFAULT_KELLY_FRACTION,
+    DEFAULT_MIN_EV,
+    DEFAULT_W_ML,
+    MAX_KELLY_FRACTION,
+    MAX_STAKE_PCT,
+)
 from src.data_loader import PROJECT_ROOT, league_label, load_league_data, normalize_league
 from src.dixon_coles import DEFAULT_XI, DixonColesModel
 from src.features import attach_rest_days_from_db
@@ -432,6 +438,25 @@ def _load_fixtures(comp_id: str) -> tuple[pd.DataFrame, str]:
     return meta["df"], src
 
 
+def _display_name(raw: str | None) -> str | None:
+    """Friendly club name for stable codes (``JP_NAGOYA`` → ``Nagoya Grampus``)."""
+    if not raw:
+        return raw
+    try:
+        from src.japan_schedule import display_team_name
+
+        return display_team_name(raw) or raw
+    except Exception:  # noqa: BLE001
+        return raw
+
+
+def _league_label_safe(code: str) -> str:
+    try:
+        return str(league_label(code))
+    except Exception:  # noqa: BLE001
+        return str(code)
+
+
 def _row_to_bet(row: dict[str, Any] | pd.Series) -> dict[str, Any]:
     d = row.to_dict() if isinstance(row, pd.Series) else dict(row)
     home = _safe_str(d.get("home") or d.get("home_team"))
@@ -449,6 +474,7 @@ def _row_to_bet(row: dict[str, Any] | pd.Series) -> dict[str, Any]:
         if odds is not None:
             pick = f"{pick} @ {odds:.2f}"
 
+    detail = d.get("detail") if isinstance(d.get("detail"), dict) else {}
     insights = generate_match_insights(d)
     thin = d.get("thin_teams") or []
     if isinstance(thin, str):
@@ -492,6 +518,8 @@ def _row_to_bet(row: dict[str, Any] | pd.Series) -> dict[str, Any]:
         "away": away,
         "home_team": home,
         "away_team": away,
+        "home_display": _display_name(home),
+        "away_display": _display_name(away),
         "match_id": _safe_str(d.get("match_id")),
         "league": lg,
         "competition": competition,
@@ -506,6 +534,10 @@ def _row_to_bet(row: dict[str, Any] | pd.Series) -> dict[str, Any]:
         "away_thin": bool(d.get("away_thin")) if d.get("away_thin") is not None else None,
         "thin_teams": [str(t) for t in thin],
         "p_source": _safe_str(d.get("p_source")),
+        # Dixon–Coles used a new-team prior → stake capped (NEW_TEAM_KELLY_CAP);
+        # EV on these rows is the least reliable.
+        "new_team_fallback": bool(detail.get("new_team_fallback")),
+        "ev_method": _safe_str(detail.get("ev_method")),
         "fair_total_goals": _safe_float(d.get("fair_total_goals")),
         "fair_ou_line": _safe_float(d.get("fair_ou_line")),
         "fair_ah_line": _safe_float(d.get("fair_ah_line")),
@@ -520,6 +552,40 @@ def _row_to_bet(row: dict[str, Any] | pd.Series) -> dict[str, Any]:
     }
 
 
+DEFAULT_SCAN_LEAGUES: tuple[str, ...] = ("EPL", "UWCL")
+MAX_SCAN_LEAGUES = 8
+
+
+def parse_leagues(raw: str | Sequence[str] | None) -> list[str]:
+    """Comma-separated / list of league keys → canonical codes (deduped).
+
+    Raises ``ValueError`` for an unknown league (routes map it to HTTP 400).
+    """
+    if raw is None:
+        return []
+    items = [raw] if isinstance(raw, str) else list(raw)
+    out: list[str] = []
+    for item in items:
+        for part in str(item).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            code = normalize_league(part)
+            if code not in out:
+                out.append(code)
+    if len(out) > MAX_SCAN_LEAGUES:
+        raise ValueError(f"At most {MAX_SCAN_LEAGUES} leagues per scan")
+    return out
+
+
+def _model_flags(model_note: str | None) -> dict[str, Any]:
+    note = str(model_note or "")
+    return {
+        "ml_enabled": "lgbm" in note,
+        "model_source": "pickle" if "pickle" in note else ("cold_fit" if note else None),
+    }
+
+
 def scan_value_bets_api(
     *,
     min_ev_pct: float = 5.0,
@@ -527,6 +593,8 @@ def scan_value_bets_api(
     limit: int = 20,
     league: str | None = None,
     comp_id: str | None = None,
+    leagues: str | Sequence[str] | None = None,
+    kelly_fraction: float | None = None,
     bankroll: float = 1000.0,
 ) -> dict[str, Any]:
     """Scan Top-N value bets (mirrors Streamlit Top-20 path).
@@ -546,21 +614,45 @@ def scan_value_bets_api(
     if min_ev <= 0:
         min_ev = float(DEFAULT_MIN_EV)
 
+    generated_at = _utc_now().isoformat()
+    # Policy ceiling (src.config.MAX_KELLY_FRACTION) still applies downstream.
+    kf = float(DEFAULT_KELLY_FRACTION) if kelly_fraction is None else float(kelly_fraction)
+    kf = max(0.0, min(kf, float(MAX_KELLY_FRACTION)))
+
     scope = normalize_league(comp_id or league) if (comp_id or league) else None
-    leagues = [scope] if scope else ["EPL", "UWCL"]
+    multi = parse_leagues(leagues)
+    if multi:
+        scan_leagues = multi
+        if len(multi) == 1:
+            scope = multi[0]
+    else:
+        scan_leagues = [scope] if scope else list(DEFAULT_SCAN_LEAGUES)
 
     results = []
     source_bits: list[str] = []
     notes: list[str] = []
     stale_leagues: list[str] = []
+    league_meta: list[dict[str, Any]] = []
 
-    for lg in leagues:
+    for lg in scan_leagues:
         fx_meta = load_fixtures_with_meta(lg)
         fx = fx_meta["df"]
         fx_src = str(fx_meta["source"])
         if fx_meta.get("stale"):
             fx_src += ":stale"
         source_bits.append(f"{lg}:{fx_src}")
+        meta: dict[str, Any] = {
+            "league": str(lg),
+            "label": _league_label_safe(lg),
+            "fixtures_source": str(fx_meta["source"]),
+            "stale": bool(fx_meta.get("stale")),
+            "odds_age_minutes": _safe_float(fx_meta.get("age_minutes")),
+            "fixtures": 0 if fx is None else int(len(fx)),
+            "model_note": None,
+            "ml_enabled": False,
+            "model_source": None,
+        }
+        league_meta.append(meta)
         if fx is None or fx.empty:
             continue
         if fx_meta.get("stale"):
@@ -568,9 +660,12 @@ def scan_value_bets_api(
         try:
             dc, ml, w_ml, model_note = _resolve_models(lg)
             notes.append(f"{lg}:{model_note}")
+            meta["model_note"] = model_note
+            meta.update(_model_flags(model_note))
         except Exception:  # noqa: BLE001
             logger.exception("model resolve failed for %s", lg)
             notes.append(f"{lg}:model_error")
+            meta["model_note"] = "model_error"
             continue
         results.append(
             scan_top_value_bets(
@@ -579,7 +674,7 @@ def scan_value_bets_api(
                 ml,
                 w_ml=float(w_ml) if ml is not None else 0.0,
                 min_ev=float(min_ev),
-                kelly_fraction=float(DEFAULT_KELLY_FRACTION),
+                kelly_fraction=kf,
                 max_stake_pct=MAX_STAKE_PCT,
                 allowed_markets=goal_markets,
                 top_n=int(max(1, limit)),
@@ -603,6 +698,10 @@ def scan_value_bets_api(
             "stale": bool(stale_leagues),
             "stale_leagues": stale_leagues,
             "source": ",".join(source_bits) or "empty",
+            "generated_at": generated_at,
+            "kelly_fraction": kf,
+            "leagues": list(scan_leagues),
+            "league_meta": league_meta,
             "notes": (
                 "No cached fixtures and cold network/model path failed or empty. "
                 "Refresh fixtures via Streamlit or auto_scanner first."
@@ -658,5 +757,9 @@ def scan_value_bets_api(
         "stale": bool(stale_leagues),
         "stale_leagues": stale_leagues,
         "source": ",".join(source_bits),
+        "generated_at": generated_at,
+        "kelly_fraction": kf,
+        "leagues": list(scan_leagues),
+        "league_meta": league_meta,
         "notes": note_txt,
     }

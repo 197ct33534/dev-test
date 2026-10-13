@@ -1,4 +1,14 @@
 # Quant Engine — slim runtime for FastAPI + workers + Telegram bot
+
+# --- Stage 1: React dashboard (served by FastAPI at /dashboard) -------------
+FROM node:20-alpine AS dashboard
+WORKDIR /build
+COPY dashboard/package.json dashboard/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY dashboard/ ./
+RUN npm run build
+
+# --- Stage 2: Python runtime ------------------------------------------------
 FROM python:3.11-slim
 
 # LightGBM needs OpenMP; keep apt footprint minimal
@@ -19,6 +29,7 @@ RUN useradd --create-home --uid 1000 --shell /bin/bash appuser \
     && chown -R appuser:appuser /app
 
 COPY --chown=appuser:appuser . .
+COPY --from=dashboard --chown=appuser:appuser /build/dist /app/dashboard/dist
 
 USER appuser
 

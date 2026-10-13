@@ -5,10 +5,11 @@ import {
   TrendingUp,
 } from "lucide-react";
 import { cn, formatKickoff, formatPct, teamHue } from "../lib/utils";
-import type { MatchCardData } from "../types";
+import type { MatchCardData, MatchConfidence, ViewMode } from "../types";
 
 interface MatchCardProps {
   match: MatchCardData;
+  viewMode: ViewMode;
   onOpenDetail: (match: MatchCardData) => void;
   onToggleTrack: (id: string) => void;
 }
@@ -28,9 +29,51 @@ function TeamBadge({ abbr, name }: { abbr: string; name: string }) {
   );
 }
 
-export function MatchCard({ match, onOpenDetail, onToggleTrack }: MatchCardProps) {
-  const ouWarn = Math.abs(match.difference) >= 0.3;
+function formatAge(min: number): string {
+  if (min < 1) return "vừa xong";
+  if (min < 60) return `${Math.round(min)} phút`;
+  return `${(min / 60).toFixed(1)} giờ`;
+}
+
+/** Data-confidence chips: odds freshness, fallback, thin data, ML status. */
+function ConfidenceChips({ c, pro }: { c: MatchConfidence; pro: boolean }) {
+  const warn = "vb-chip border-amber-500/30 bg-amber-500/10 text-accent-warn";
+  const muted = "vb-chip text-ink-faint";
+  return (
+    <>
+      {c.belowThreshold ? <span className={warn}>Dưới ngưỡng EV</span> : null}
+      {c.stale ? <span className={warn}>Odds cũ</span> : null}
+      {c.thinTeams.length ? (
+        <span className={warn} title={c.thinTeams.join(", ")}>
+          Ít dữ liệu: {c.thinTeams.length === 1 ? c.thinTeams[0] : `${c.thinTeams.length} đội`}
+        </span>
+      ) : null}
+      {c.newTeamPrior ? (
+        <span
+          className={warn}
+          title="Mô hình dùng prior đội mới cho ít nhất một đội — EV kém tin cậy, stake bị giới hạn một nửa"
+        >
+          Prior đội mới
+        </span>
+      ) : null}
+      {pro && c.oddsAgeMinutes !== null && !c.stale ? (
+        <span className={muted} title={`Nguồn odds: ${c.oddsSource ?? "?"}`}>
+          Odds {formatAge(c.oddsAgeMinutes)}
+        </span>
+      ) : null}
+      {pro && c.mlEnabled === false ? (
+        <span className={muted} title="Chỉ Dixon–Coles (LightGBM chưa có cho giải này)">
+          ML tắt
+        </span>
+      ) : null}
+    </>
+  );
+}
+
+export function MatchCard({ match, viewMode, onOpenDetail, onToggleTrack }: MatchCardProps) {
+  const ouWarn = match.difference !== null && Math.abs(match.difference) >= 0.3;
   const evPositive = match.evPct >= 5;
+  const pro = viewMode === "pro";
 
   return (
     <article className="vb-card animate-fade-in p-4 sm:p-5">
@@ -45,6 +88,7 @@ export function MatchCard({ match, onOpenDetail, onToggleTrack }: MatchCardProps
               {match.league}
             </span>
             <span className="vb-chip">{match.leagueLabel}</span>
+            <ConfidenceChips c={match.confidence} pro={pro} />
           </div>
 
           <div className="grid gap-2 sm:grid-cols-[1fr_auto_1fr] sm:items-center">
@@ -71,7 +115,7 @@ export function MatchCard({ match, onOpenDetail, onToggleTrack }: MatchCardProps
                 Kelly khuyến nghị
               </p>
               <p className="mt-1 text-sm font-semibold tabular-nums text-ink">
-                Model {match.kellyPct.toFixed(1)}%
+                {match.kellyPct.toFixed(2)}% bankroll
               </p>
             </div>
             <div>
@@ -91,33 +135,46 @@ export function MatchCard({ match, onOpenDetail, onToggleTrack }: MatchCardProps
           </div>
 
           {/* OU comparison */}
-          <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
-            <p className="text-[10px] uppercase tracking-wider text-ink-faint">
-              So sánh Tài Xỉu (Model vs Nhà cái)
-            </p>
-            <div className="mt-2 flex flex-wrap items-center gap-3 text-sm">
-              <span className="text-ink-muted">
-                Model{" "}
-                <strong className="text-ink">{match.modelOU.toFixed(2)}</strong>
-              </span>
-              <span className="text-slate-700">·</span>
-              <span className="text-ink-muted">
-                NC{" "}
-                <strong className="text-ink">{match.bookieOU.toFixed(2)}</strong>
-              </span>
-              <span
-                className={cn(
-                  "rounded-lg px-2 py-0.5 text-xs font-semibold tabular-nums",
-                  ouWarn
-                    ? "bg-amber-500/15 text-accent-warn"
-                    : "bg-emerald-500/10 text-accent",
-                )}
-              >
-                Độ lệch {match.difference > 0 ? "+" : ""}
-                {match.difference.toFixed(2)} bàn
-              </span>
+          {match.modelOU !== null && match.bookieOU !== null ? (
+            <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+              <p className="text-[10px] uppercase tracking-wider text-ink-faint">
+                So sánh Tài Xỉu (Model vs Nhà cái)
+              </p>
+              <div className="mt-2 flex flex-wrap items-center gap-3 text-sm">
+                <span className="text-ink-muted">
+                  Model <strong className="text-ink">{match.modelOU.toFixed(2)}</strong>
+                </span>
+                <span className="text-slate-700">·</span>
+                <span className="text-ink-muted">
+                  NC <strong className="text-ink">{match.bookieOU.toFixed(2)}</strong>
+                </span>
+                {match.difference !== null ? (
+                  <span
+                    className={cn(
+                      "rounded-lg px-2 py-0.5 text-xs font-semibold tabular-nums",
+                      ouWarn
+                        ? "bg-amber-500/15 text-accent-warn"
+                        : "bg-emerald-500/10 text-accent",
+                    )}
+                  >
+                    Độ lệch {match.difference > 0 ? "+" : ""}
+                    {match.difference.toFixed(2)} bàn
+                  </span>
+                ) : null}
+              </div>
             </div>
-          </div>
+          ) : null}
+
+          {pro && match.aiReasons.length ? (
+            <ul className="space-y-1 text-xs text-ink-muted">
+              {match.aiReasons.slice(0, 2).map((r) => (
+                <li key={r} className="flex gap-1.5">
+                  <span className="text-accent-cyan">›</span>
+                  <span>{r}</span>
+                </li>
+              ))}
+            </ul>
+          ) : null}
         </div>
 
         {/* Actions */}

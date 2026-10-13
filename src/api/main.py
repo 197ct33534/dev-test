@@ -58,6 +58,17 @@ def _webapp_dir() -> Path:
     return target
 
 
+def _dashboard_dist() -> Path | None:
+    """Built React dashboard (``dashboard/dist``), or ``None`` when not built.
+
+    ``DASHBOARD_DIST`` overrides the location (Docker copies the Node build
+    stage output there).
+    """
+    raw = (os.getenv("DASHBOARD_DIST") or "").strip()
+    path = Path(raw) if raw else PROJECT_ROOT / "dashboard" / "dist"
+    return path if (path / "index.html").is_file() else None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Optional APScheduler in lifespan (local / single-worker only).
@@ -102,7 +113,7 @@ def create_app() -> FastAPI:
     app.include_router(root_router)
     api_v1.include_router(analytics_router)
     # Protect /api/v1/* and /api/v2/* with Telegram WebApp initData
-    # (bypass via TELEGRAM_AUTH_DISABLED). /health, /docs, /webapp stay public.
+    # (bypass via TELEGRAM_AUTH_DISABLED). /health, /docs, /webapp, /dashboard stay public.
     app.include_router(
         api_v1,
         dependencies=[Depends(require_telegram_webapp)],
@@ -111,6 +122,16 @@ def create_app() -> FastAPI:
         api_v2,
         dependencies=[Depends(require_telegram_webapp)],
     )
+
+    # React dashboard: static shell is public, its data calls /api/v1 with a
+    # Bearer token (DASHBOARD_API_TOKENS) or Telegram initData.
+    dashboard = _dashboard_dist()
+    if dashboard is not None:
+        app.mount(
+            "/dashboard",
+            StaticFiles(directory=str(dashboard), html=True),
+            name="dashboard",
+        )
 
     webapp = _webapp_dir()
     app.mount(

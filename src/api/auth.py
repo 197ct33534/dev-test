@@ -174,6 +174,42 @@ def verify_telegram_webapp_data(
     return out
 
 
+def dashboard_api_tokens() -> tuple[str, ...]:
+    """Read-only web tokens for the React dashboard (``DASHBOARD_API_TOKENS``).
+
+    Comma-separated; tokens shorter than 16 chars are ignored so a typo like
+    ``DASHBOARD_API_TOKENS=1`` never opens the API.
+    """
+    raw = os.getenv("DASHBOARD_API_TOKENS") or ""
+    out: list[str] = []
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if len(part) < 16:
+            logger.warning("Ignoring DASHBOARD_API_TOKENS entry shorter than 16 chars")
+            continue
+        out.append(part)
+    return tuple(out)
+
+
+def extract_bearer_token(request: Request) -> str | None:
+    """Read ``Authorization: Bearer <token>`` (dashboard web auth)."""
+    auth = (request.headers.get("Authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip() or None
+    return None
+
+
+def _dashboard_token_ok(token: str) -> bool:
+    supplied = token.encode("utf-8")
+    ok = False
+    # Compare against every configured token (no early exit → constant time).
+    for candidate in dashboard_api_tokens():
+        ok |= hmac.compare_digest(candidate.encode("utf-8"), supplied)
+    return ok
+
+
 def extract_init_data(request: Request) -> str | None:
     """Read initData from ``Authorization: tma …`` or ``X-Telegram-Init-Data``."""
     auth = (request.headers.get("Authorization") or "").strip()
@@ -202,6 +238,20 @@ async def require_telegram_webapp(request: Request) -> dict[str, Any] | None:
     if cached is not None:
         return cached
 
+    # Dashboard (browser outside Telegram): static read-only bearer token.
+    # Carries no Telegram user id, so require_admin still denies writes.
+    bearer = extract_bearer_token(request)
+    if bearer is not None:
+        if not _dashboard_token_ok(bearer):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid dashboard token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        parsed_token: dict[str, Any] = {"auth": "dashboard_token"}
+        request.state.telegram_init = parsed_token
+        return parsed_token
+
     token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN missing while Telegram auth is enabled")
@@ -214,7 +264,10 @@ async def require_telegram_webapp(request: Request) -> dict[str, Any] | None:
     if not init_data:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing Telegram initData (Authorization: tma … or X-Telegram-Init-Data)",
+            detail=(
+                "Missing credentials (Authorization: tma <initData>, "
+                "X-Telegram-Init-Data, or Authorization: Bearer <dashboard token>)"
+            ),
             headers={"WWW-Authenticate": "tma"},
         )
 

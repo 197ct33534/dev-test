@@ -28,6 +28,7 @@ git clone <your-repo> /opt/score && cd /opt/score
 cp .env.example .env
 # Edit: DOMAIN, TELEGRAM_BOT_TOKEN, WEBAPP_URL=https://YOUR_DOMAIN/webapp/
 #       ADMIN_TELEGRAM_IDS=<your numeric Telegram user id>
+#       DASHBOARD_API_TOKENS=<random >=16 chars> (React dashboard outside Telegram)
 # Keep APP_ENV=prod and TELEGRAM_AUTH_DISABLED=false (the API refuses to
 # start with auth disabled in prod).
 # Value alerts (telegram_bot): SIGNAL_MIN_EV=5, SIGNAL_MIN_DATA_SCORE=75
@@ -42,13 +43,17 @@ chmod +x deploy.sh
 # or: docker compose build && docker compose up -d
 ```
 
-Open: `http://YOUR_DOMAIN/health` and `http://YOUR_DOMAIN/webapp/`.
+Open: `http://YOUR_DOMAIN/health`, `http://YOUR_DOMAIN/webapp/` and the React
+dashboard at `http://YOUR_DOMAIN/dashboard/` (built in the Dockerfile's Node stage;
+asks for a `DASHBOARD_API_TOKENS` token on first visit outside Telegram).
 `/docs` is hidden in prod (set `ENABLE_DOCS=true` to expose it).
 
 ### Security model
 
 * All `/api/v1/*` and `/api/v2/*` routes require Telegram Mini App `initData`
-  (HMAC + mandatory `auth_date`, max age `TELEGRAM_AUTH_MAX_AGE`).
+  (HMAC + mandatory `auth_date`, max age `TELEGRAM_AUTH_MAX_AGE`) or a read-only
+  dashboard token (`Authorization: Bearer …`, listed in `DASHBOARD_API_TOKENS`).
+  Dashboard tokens carry no Telegram user id, so they can never call write endpoints.
 * Write endpoints (`POST /api/v2/bets/place`, `POST /api/v1/teams/import-url`)
   additionally require the Telegram user id to be in `ADMIN_TELEGRAM_IDS`.
   `bets/place` defaults to `persist=false`; persisted bets must use an

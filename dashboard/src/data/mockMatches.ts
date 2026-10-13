@@ -2,14 +2,17 @@ import { cappedKellyPct, evPct } from "../lib/utils";
 import type { MatchCardData } from "../types";
 
 /**
- * MOCK DATA ONLY — not wired to the FastAPI backend yet.
+ * MOCK DATA — used only when ``VITE_USE_MOCK=true`` (offline UI work).
  *
  * Kickoffs are generated relative to page load (always inside the next 48h)
  * and EV / stake are derived from ``modelProb`` × ``odd`` with the backend
  * stake policy (Kelly fraction 0.10, max 1% bankroll) so numbers stay
  * internally consistent.
  */
-type RawMock = Omit<MatchCardData, "matchTime" | "kellyPct" | "evPct"> & {
+type RawMock = Omit<
+  MatchCardData,
+  "matchTime" | "kellyPct" | "evPct" | "fairOdds" | "aiReasons" | "confidence"
+> & {
   kickoffInHours: number;
 };
 
@@ -197,10 +200,22 @@ export const MOCK_MATCHES: MatchCardData[] = RAW_MOCKS.map(
     matchTime: new Date(LOADED_AT + kickoffInHours * 3_600_000).toISOString(),
     evPct: Number(evPct(m.modelProb, m.odd).toFixed(1)),
     kellyPct: Number(cappedKellyPct(m.modelProb, m.odd).toFixed(2)),
+    fairOdds: 1 / m.modelProb,
+    aiReasons: [],
+    confidence: {
+      oddsSource: "mock",
+      oddsAgeMinutes: 4,
+      stale: false,
+      belowThreshold: false,
+      thinTeams: [],
+      newTeamPrior: false,
+      mlEnabled: null,
+      pSource: null,
+    },
   }),
 );
 
-/** Keys mirror config/leagues.json (backend league codes). */
+/** Keys mirror config/leagues.json (offline fallback; live list: /api/v1/leagues). */
 export const LEAGUE_OPTIONS = [
   { id: "EPL", label: "Premier League" },
   { id: "UWCL", label: "UWCL (Women's Champions League)" },

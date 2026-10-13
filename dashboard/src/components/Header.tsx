@@ -12,6 +12,7 @@ import {
   Wallet,
   CornerDownRight,
   LineChart,
+  RefreshCw,
 } from "lucide-react";
 import { cn } from "../lib/utils";
 import { NAV_ITEMS } from "../data/mockMatches";
@@ -28,14 +29,27 @@ const ICONS = {
   flask: FlaskConical,
 } as const;
 
+/** Feed state shown in the "Cập nhật" badge. */
+export type FeedStatus = "live" | "stale" | "loading" | "error" | "mock";
+
+const STATUS_STYLE: Record<FeedStatus, { dot: string; label: string | null; text: string }> = {
+  live: { dot: "bg-accent", label: null, text: "" },
+  stale: { dot: "bg-accent-warn", label: "Odds cũ", text: "text-accent-warn" },
+  loading: { dot: "bg-slate-500 animate-pulse", label: "Đang tải", text: "text-ink-muted" },
+  error: { dot: "bg-accent-danger", label: "Mất kết nối API", text: "text-accent-danger" },
+  mock: { dot: "bg-accent-warn", label: "Dữ liệu mẫu (mock)", text: "text-accent-warn" },
+};
+
 interface HeaderProps {
   activeNav: NavId;
   onNavChange: (id: NavId) => void;
   viewMode: ViewMode;
   onViewModeChange: (mode: ViewMode) => void;
+  /** "x phút trước" from the API ``generated_at``. */
   updatedAgo: string;
-  /** True while the feed is static sample data (not wired to the API). */
-  isMock?: boolean;
+  status: FeedStatus;
+  refreshing?: boolean;
+  onRefresh?: () => void;
 }
 
 export function Header({
@@ -44,8 +58,11 @@ export function Header({
   viewMode,
   onViewModeChange,
   updatedAgo,
-  isMock = false,
+  status,
+  refreshing = false,
+  onRefresh,
 }: HeaderProps) {
+  const st = STATUS_STYLE[status];
   return (
     <header className="sticky top-0 z-30 border-b border-slate-800/90 bg-canvas/85 backdrop-blur-xl">
       <div className="mx-auto flex max-w-[1600px] items-center gap-4 px-4 py-3 lg:px-6">
@@ -88,18 +105,23 @@ export function Header({
 
         <div className="ml-auto flex items-center gap-2">
           <div className="hidden items-center gap-2 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-1.5 md:flex">
-            <span
-              className={cn(
-                "inline-flex h-2 w-2 rounded-full",
-                isMock ? "bg-accent-warn" : "bg-accent",
-              )}
-            />
+            <span className={cn("inline-flex h-2 w-2 rounded-full", st.dot)} />
             <p className="text-[11px] text-ink-muted">
               Cập nhật: <span className="text-ink">{updatedAgo}</span>
-              {isMock ? (
-                <span className="ml-1 text-accent-warn">Dữ liệu mẫu (mock)</span>
-              ) : null}
+              {st.label ? <span className={cn("ml-1", st.text)}>{st.label}</span> : null}
             </p>
+            {onRefresh ? (
+              <button
+                type="button"
+                onClick={onRefresh}
+                disabled={refreshing}
+                className="text-ink-faint transition hover:text-ink disabled:opacity-60"
+                aria-label="Làm mới feed"
+                title="Làm mới feed"
+              >
+                <RefreshCw className={cn("h-3.5 w-3.5", refreshing && "animate-spin")} />
+              </button>
+            ) : null}
           </div>
 
           <div className="flex rounded-xl border border-slate-800 bg-slate-950/50 p-0.5 text-[11px]">
