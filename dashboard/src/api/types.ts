@@ -61,6 +61,8 @@ export interface LeagueScanMetaOut {
   model_note: string | null;
   ml_enabled: boolean;
   model_source: string | null;
+  /** Legs dropped because EV rested on new-team priors. */
+  excluded_prior?: number;
 }
 
 export interface ValueBetsResponse {
@@ -79,6 +81,7 @@ export interface ValueBetsResponse {
   kelly_fraction: number | null;
   leagues: string[];
   league_meta: LeagueScanMetaOut[];
+  excluded_prior?: number;
   notes: string | null;
 }
 

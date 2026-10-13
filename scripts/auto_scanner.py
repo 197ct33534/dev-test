@@ -310,6 +310,15 @@ def scan_value_bets(
             rows.append(r.to_dict())
         recs = pd.DataFrame(rows)
 
+    # Never alert on EV built from new-team priors (both sides thin, or any
+    # thin side in a cup) — same gate as the API / Streamlit Top-N scan.
+    if not recs.empty:
+        from src.scanner import drop_prior_gated_legs
+
+        recs, n_gated = drop_prior_gated_legs(recs, dc, code)
+        if n_gated:
+            print(f"      Prior gate: dropped {n_gated} legs priced on new-team priors")
+
     # CornerPredictor legs — only when the feed has real corner odds (never
     # price alerts against assumed odds).
     if "Corners" in markets and not fixtures.empty:

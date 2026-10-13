@@ -139,6 +139,9 @@ class LeagueScanMetaOut(BaseModel):
     model_source: str | None = Field(
         default=None, description="pickle | cold_fit | null (no model)"
     )
+    excluded_prior: int = Field(
+        0, description="Legs dropped: EV rested on new-team priors"
+    )
 
 
 class ValueBetsResponse(BaseModel):
@@ -176,6 +179,13 @@ class ValueBetsResponse(BaseModel):
     )
     leagues: list[str] = Field(default_factory=list)
     league_meta: list[LeagueScanMetaOut] = Field(default_factory=list)
+    excluded_prior: int = Field(
+        0,
+        description=(
+            "Legs dropped because both sides (or any side in a cup) were priced "
+            "on new-team priors"
+        ),
+    )
     notes: str | None = None
 
 

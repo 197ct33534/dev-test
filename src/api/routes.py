@@ -82,6 +82,15 @@ async def get_value_bets(
             description="Fractional Kelly multiplier (policy default / ceiling in /api/v1/config)",
         ),
     ] = None,
+    one_per_match: Annotated[
+        bool,
+        Query(
+            description=(
+                "Keep only the best-EV leg per match (correlated legs such as "
+                "1X2 Home and AH Home -0.5). false = research view"
+            ),
+        ),
+    ] = True,
 ) -> ValueBetsResponse:
     """Prefer cached upcoming fixtures + model pickles for a fast response.
 
@@ -98,6 +107,7 @@ async def get_value_bets(
             comp_id=comp_id,
             leagues=leagues,
             kelly_fraction=kelly_fraction,
+            one_per_match=bool(one_per_match),
         )
     except ValueError as exc:
         # Unknown league key / too many leagues.

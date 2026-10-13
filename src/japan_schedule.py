@@ -449,6 +449,20 @@ def evaluate_japan_fixture_picks(
     if odds_1x2 is None and ou is None and ah is None:
         return empty
 
+    # Cup fixtures: a thin side means the price is a new-team prior, not data
+    # (see src.scanner.new_team_prior_gate) — show no pick rather than fake EV.
+    from src.scanner import new_team_prior_gate
+
+    comp = str(series.get("comp_id") or series.get("league_id") or "").upper() or None
+    gate = new_team_prior_gate(model, home, away, league=comp or "J_LEAGUE_CUP")
+    if gate is not None:
+        return {
+            **empty,
+            "text": "— (thiếu dữ liệu đội, không định giá)",
+            "odds_missing": False,
+            "prior_gated": gate,
+        }
+
     rec = ValueBetRecommender(
         model,
         min_ev=float(min_ev),

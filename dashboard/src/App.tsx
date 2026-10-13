@@ -9,6 +9,7 @@ import { TokenGate } from "./components/TokenGate";
 import { toMatchCards } from "./api/adapters";
 import { ApiError, getStoredToken, setStoredToken } from "./api/client";
 import { useApiConfig, useLeagues, useValueBets } from "./api/hooks";
+import type { LeagueScanMetaOut } from "./api/types";
 import { LEAGUE_OPTIONS, MOCK_DATA_UPDATED_AT, MOCK_MATCHES } from "./data/mockMatches";
 import { cappedKellyPct, formatAgo } from "./lib/utils";
 import type { FilterState, MatchCardData, NavId } from "./types";
@@ -246,6 +247,12 @@ export default function App() {
                   “Dưới ngưỡng”).
                 </Banner>
               ) : null}
+              {data?.excluded_prior ? (
+                <Banner tone="info">
+                  Đã loại {data.excluded_prior} kèo vì mô hình thiếu dữ liệu đội
+                  {excludedLeagues(data.league_meta)} — EV dựa trên prior đội mới không đáng tin.
+                </Banner>
+              ) : null}
               {errorMsg && data ? (
                 <Banner tone="warn">Làm mới thất bại: {errorMsg}. Đang hiển thị dữ liệu trước đó.</Banner>
               ) : null}
@@ -304,6 +311,11 @@ export default function App() {
       />
     </div>
   );
+}
+
+function excludedLeagues(meta: LeagueScanMetaOut[]): string {
+  const hit = meta.filter((m) => (m.excluded_prior ?? 0) > 0).map((m) => m.label ?? m.league);
+  return hit.length ? ` (${hit.join(", ")})` : "";
 }
 
 function Banner({ tone, children }: { tone: "warn" | "info"; children: React.ReactNode }) {

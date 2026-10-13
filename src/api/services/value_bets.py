@@ -595,6 +595,7 @@ def scan_value_bets_api(
     comp_id: str | None = None,
     leagues: str | Sequence[str] | None = None,
     kelly_fraction: float | None = None,
+    one_per_match: bool = True,
     bankroll: float = 1000.0,
 ) -> dict[str, Any]:
     """Scan Top-N value bets (mirrors Streamlit Top-20 path).
@@ -606,6 +607,10 @@ def scan_value_bets_api(
     Cold path: may fit Dixon–Coles (slow) and/or fetch fixtures over the network.
     The response carries ``stale=True`` when any league was served from a cache
     older than ``FIXTURES_MAX_AGE_MINUTES`` because the network refresh failed.
+
+    ``one_per_match`` (default) keeps only the best-EV leg per fixture so the
+    feed never lists correlated legs with separate stakes. Legs priced on
+    new-team priors are dropped by the scanner (``excluded_prior``).
     """
     mkt_list = parse_markets(markets)
     # Scanner ignores Corners today (goal markets only); keep in response meta.
@@ -651,6 +656,7 @@ def scan_value_bets_api(
             "model_note": None,
             "ml_enabled": False,
             "model_source": None,
+            "excluded_prior": 0,
         }
         league_meta.append(meta)
         if fx is None or fx.empty:
@@ -667,22 +673,23 @@ def scan_value_bets_api(
             notes.append(f"{lg}:model_error")
             meta["model_note"] = "model_error"
             continue
-        results.append(
-            scan_top_value_bets(
-                fx,
-                dc,
-                ml,
-                w_ml=float(w_ml) if ml is not None else 0.0,
-                min_ev=float(min_ev),
-                kelly_fraction=kf,
-                max_stake_pct=MAX_STAKE_PCT,
-                allowed_markets=goal_markets,
-                top_n=int(max(1, limit)),
-                bankroll=float(bankroll),
-                league=str(lg),
-                filter_vn_window=True,
-            )
+        scan = scan_top_value_bets(
+            fx,
+            dc,
+            ml,
+            w_ml=float(w_ml) if ml is not None else 0.0,
+            min_ev=float(min_ev),
+            kelly_fraction=kf,
+            max_stake_pct=MAX_STAKE_PCT,
+            allowed_markets=goal_markets,
+            top_n=int(max(1, limit)),
+            bankroll=float(bankroll),
+            league=str(lg),
+            filter_vn_window=True,
+            one_per_match=bool(one_per_match),
         )
+        meta["excluded_prior"] = int(scan.excluded_prior)
+        results.append(scan)
 
     if not results:
         return {
@@ -702,6 +709,7 @@ def scan_value_bets_api(
             "kelly_fraction": kf,
             "leagues": list(scan_leagues),
             "league_meta": league_meta,
+            "excluded_prior": sum(int(m["excluded_prior"]) for m in league_meta),
             "notes": (
                 "No cached fixtures and cold network/model path failed or empty. "
                 "Refresh fixtures via Streamlit or auto_scanner first."
@@ -712,7 +720,10 @@ def scan_value_bets_api(
         merged = results[0]
     else:
         merged = merge_top_scan_results(
-            results, top_n=int(max(1, limit)), min_ev=float(min_ev)
+            results,
+            top_n=int(max(1, limit)),
+            min_ev=float(min_ev),
+            one_per_match=bool(one_per_match),
         )
 
     display = merged.display_bets
@@ -736,6 +747,12 @@ def scan_value_bets_api(
         note_txt = (
             (note_txt + "; " if note_txt else "")
             + "Cold path may load/fit models — subsequent calls are faster with DB cache + pickles."
+        )
+    excluded_total = sum(int(m["excluded_prior"]) for m in league_meta)
+    if excluded_total:
+        note_txt = (
+            (note_txt + "; " if note_txt else "")
+            + f"Excluded {excluded_total} legs priced on new-team priors"
         )
     if stale_leagues:
         note_txt = (
@@ -761,5 +778,6 @@ def scan_value_bets_api(
         "kelly_fraction": kf,
         "leagues": list(scan_leagues),
         "league_meta": league_meta,
+        "excluded_prior": excluded_total,
         "notes": note_txt,
     }

@@ -6,6 +6,7 @@ rather than duplicating market math from ``scripts/auto_scanner.py``.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -26,6 +27,8 @@ from src.strategy import (
     select_value_bets,
 )
 from src.timezone_utils import filter_matches_today_tomorrow, format_kickoff_vn, kickoff_to_vn
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_ALLOWED_MARKETS: tuple[str, ...] = ("1X2",)
 
@@ -258,6 +261,9 @@ class TopScanResult:
     window_start_utc: pd.Timestamp | None = None
     window_end_utc: pd.Timestamp | None = None
     odds_missing: bool = False
+    # Legs dropped because their EV rests on new-team priors (see
+    # :func:`new_team_prior_gate`).
+    excluded_prior: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -269,6 +275,7 @@ class TopScanResult:
             "window_start_utc": self.window_start_utc,
             "window_end_utc": self.window_end_utc,
             "odds_missing": self.odds_missing,
+            "excluded_prior": self.excluded_prior,
         }
 
 
@@ -328,6 +335,83 @@ def _fixtures_no_odds_fallback(
     return pd.DataFrame(rows)
 
 
+PRIOR_GATE_BOTH_TEAMS = "both_teams_prior"
+PRIOR_GATE_CUP = "cup_new_team_prior"
+
+
+def new_team_prior_gate(
+    dc_model: Any,
+    home: str,
+    away: str,
+    *,
+    league: str | None,
+) -> str | None:
+    """Reason to refuse pricing a fixture on new-team priors, else ``None``.
+
+    The relative prior (``mean - 0.3``) encodes "a club we have not seen is
+    weaker than the league average" - right for a promoted side, so a single
+    thin team in a domestic league stays (stake capped by the recommender).
+    It breaks when:
+
+    * **both** sides are thin - the price is prior vs prior, no data at all;
+    * the competition is a **cup** - a club with little *cup* history is not
+      weak (a J1 giant drawn against a J2 side), so any thin side makes the
+      1X2 / AH / OU prices meaningless and EV balloons (+20..+45 % observed).
+
+    Models without ``unknown_teams`` (toy / external models) are not gated.
+    """
+    fn = getattr(dc_model, "unknown_teams", None)
+    if not callable(fn):
+        return None
+    try:
+        unknown = list(fn(str(home), str(away)))
+    except Exception:  # noqa: BLE001 - unfitted / exotic model: do not gate
+        return None
+    if not unknown:
+        return None
+    if len(unknown) >= 2:
+        return PRIOR_GATE_BOTH_TEAMS
+    try:
+        from src.league_registry import is_cup_competition
+
+        if is_cup_competition(league):
+            return PRIOR_GATE_CUP
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def drop_prior_gated_legs(
+    df: pd.DataFrame, dc_model: Any, league: str | None
+) -> tuple[pd.DataFrame, int]:
+    """Remove legs whose fixture fails :func:`new_team_prior_gate`.
+
+    Accepts scanner rows (``home`` / ``away``) or raw recommender rows
+    (``home_team`` / ``away_team``). Returns ``(kept, n_dropped)``.
+    """
+    if df is None or df.empty:
+        return df, 0
+    if {"home", "away"} <= set(df.columns):
+        h_col, a_col = "home", "away"
+    elif {"home_team", "away_team"} <= set(df.columns):
+        h_col, a_col = "home_team", "away_team"
+    else:
+        return df, 0
+    cache: dict[tuple[str, str], str | None] = {}
+    keep: list[bool] = []
+    for home, away in zip(df[h_col], df[a_col]):
+        key = (str(home), str(away))
+        if key not in cache:
+            cache[key] = new_team_prior_gate(dc_model, key[0], key[1], league=league)
+        keep.append(cache[key] is None)
+    mask = pd.Series(keep, index=df.index)
+    dropped = int((~mask).sum())
+    if dropped:
+        gated = sorted(f"{h} vs {a} ({r})" for (h, a), r in cache.items() if r)
+        logger.info("prior gate (%s) dropped %d legs: %s", league, dropped, "; ".join(gated))
+    return df.loc[mask].copy(), dropped
+
+
 def scan_top_value_bets(
     fixtures: pd.DataFrame,
     dc_model: DixonColesModel,
@@ -345,8 +429,15 @@ def scan_top_value_bets(
     filter_vn_window: bool = True,
     now: Any | None = None,
     include_started: bool = False,
+    one_per_match: bool = False,
 ) -> TopScanResult:
     """Scan fixtures for Top-N value bets (EV descending).
+
+    ``one_per_match=True`` keeps only the best-EV leg per fixture: 1X2 Home,
+    AH Home -0.5 and Over on one match are correlated, so listing each with
+    its own Kelly stake multiplies exposure (API / alerts). The default keeps
+    every leg for research views. Legs priced on new-team priors are dropped
+    per :func:`new_team_prior_gate` (count in ``excluded_prior``).
 
     Blends Ensemble ``w_ML`` on 1X2 when ``ml_model`` is provided. Filters to
     the VN today+tomorrow window by default; with ``filter_vn_window`` the
@@ -473,22 +564,30 @@ def scan_top_value_bets(
         dc_model=dc_model,
     )
 
-    # Display ranking (Lite / Top-N): sanity → multi-market OK → Top-N by EV%.
-    # Staking caps (1/match · ≤MAX_BETS_PER_DAY) stay in auto_scanner / journal.
+    # EV built on new-team priors is not evidence of value - drop before ranking
+    # (also from the below-threshold fallback, so it never resurfaces).
+    enriched, excluded = drop_prior_gated_legs(enriched, dc_model, league)
+
+    # Display ranking (Lite / Top-N): sanity → (one leg per match) → Top-N by EV%.
+    # Daily caps (≤MAX_BETS_PER_DAY) stay in auto_scanner / journal.
     display_cap = int(max(1, int(top_n)))
-    value_pool = enriched.loc[enriched["ev"] >= float(min_ev)].copy()
-    value = select_value_bets(
-        value_pool,
-        max_per_day=display_cap,
-        already_today=0,
-        allow_multi_picks_per_match=True,
-    )
-    fallback = select_value_bets(
-        enriched,
-        max_per_day=display_cap,
-        already_today=0,
-        allow_multi_picks_per_match=True,
-    )
+    multi = not bool(one_per_match)
+    if enriched.empty:
+        value = fallback = pd.DataFrame()
+    else:
+        value_pool = enriched.loc[enriched["ev"] >= float(min_ev)].copy()
+        value = select_value_bets(
+            value_pool,
+            max_per_day=display_cap,
+            already_today=0,
+            allow_multi_picks_per_match=multi,
+        )
+        fallback = select_value_bets(
+            enriched,
+            max_per_day=display_cap,
+            already_today=0,
+            allow_multi_picks_per_match=multi,
+        )
 
     below = value.empty
     display = value if not below else fallback
@@ -502,6 +601,7 @@ def scan_top_value_bets(
         window_start_utc=win_start,
         window_end_utc=win_end,
         odds_missing=False,
+        excluded_prior=excluded,
     )
 
 
@@ -510,8 +610,12 @@ def merge_top_scan_results(
     *,
     top_n: int = 20,
     min_ev: float = DEFAULT_MIN_EV,
+    one_per_match: bool = False,
 ) -> TopScanResult:
     """Combine per-league :class:`TopScanResult` into one Top-N ranking.
+
+    ``one_per_match`` as in :func:`scan_top_value_bets`; ``excluded_prior``
+    is summed across leagues.
 
     Concatenates candidate rows, applies :func:`select_value_bets` with
     multi-market picks allowed, then keeps at most ``top_n`` by EV descending.
@@ -521,6 +625,8 @@ def merge_top_scan_results(
     win_starts: list[pd.Timestamp] = []
     win_ends: list[pd.Timestamp] = []
     any_odds_missing = False
+    excluded = sum(int(getattr(r, "excluded_prior", 0) or 0) for r in results)
+    multi = not bool(one_per_match)
 
     for res in results:
         if res.window_start_utc is not None:
@@ -550,6 +656,7 @@ def merge_top_scan_results(
             window_start_utc=win_start,
             window_end_utc=win_end,
             odds_missing=any_odds_missing,
+            excluded_prior=excluded,
         )
 
     combined = pd.concat(frames, ignore_index=True)
@@ -562,14 +669,14 @@ def merge_top_scan_results(
         combined,
         max_per_day=display_cap,
         already_today=0,
-        allow_multi_picks_per_match=True,
+        allow_multi_picks_per_match=multi,
     )
     if "ev" in fallback.columns:
         value = select_value_bets(
             fallback.loc[fallback["ev"] >= float(min_ev)].copy(),
             max_per_day=display_cap,
             already_today=0,
-            allow_multi_picks_per_match=True,
+            allow_multi_picks_per_match=multi,
         )
     else:
         value = empty
@@ -598,4 +705,5 @@ def merge_top_scan_results(
         window_start_utc=win_start,
         window_end_utc=win_end,
         odds_missing=odds_missing_out,
+        excluded_prior=excluded,
     )

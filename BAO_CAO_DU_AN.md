@@ -352,6 +352,6 @@ Mục tiêu: không mất tiền vì tín hiệu sai, không lộ hệ thống.
 
 **Phát hiện khi chạy thật (chưa sửa):**
 
-1. Scan Top-N trả **nhiều kèo trên cùng một trận** (ví dụ Yokohama FC vs Urawa có cả AH −0.5 và 1X2 Home) — mục 1.7 (kèo tương quan) chưa áp vào `scan_top_value_bets`.
-2. J.League Cup cho EV +25…+45% trên toàn bộ các trận đều có `new_team_fallback` — mô hình cold-fit thiếu dữ liệu, EV gần như chắc chắn phồng. Dashboard đã gắn nhãn "Prior đội mới", nhưng nên cân nhắc chặn hẳn ở backend.
+1. ~~Scan Top-N trả nhiều kèo trên cùng một trận~~ — **đã sửa**: `scan_top_value_bets` / `merge_top_scan_results` có `one_per_match`; API `/api/v1/value-bets` bật mặc định (`one_per_match=false` để xem toàn bộ). Streamlit Top-20 vẫn giữ nhiều kèo/trận như trước (chế độ nghiên cứu).
+2. ~~EV phồng do prior đội mới~~ — **đã sửa** bằng `new_team_prior_gate` trong `src/scanner.py`: loại kèo khi **cả hai** đội chỉ có prior, hoặc khi **một** đội chỉ có prior trong giải **cúp** (`is_cup`). Lý do: ở cúp, đội ít lịch sử cúp không có nghĩa là yếu (Urawa bị định giá như đội dưới trung bình). Ở giải VĐQG, một đội mới (thăng hạng) vẫn giữ chính sách cũ (trần stake 0,5%). Áp dụng cho API, Streamlit Top-20, scan Telegram, `scripts/auto_scanner.py` và tab Nhật Bản. Số kèo bị loại trả về trong `excluded_prior` và hiện banner trên dashboard. Dữ liệu thật ngày 2026-10-13: cả 56 kèo J.League Cup bị loại; model cúp có 51/59 đội dưới 5 trận. Gốc rễ còn lại: model cúp chỉ fit trên lịch sử cúp; muốn định giá cúp thật thì cần fit trên dữ liệu J1/J2.
 3. `ai_reasons` vẫn in mã đội (`JP_NAGOYA`) thay vì tên hiển thị; mọi đội đều "nghỉ 15 ngày" (nghi giá trị mặc định của rest days).
