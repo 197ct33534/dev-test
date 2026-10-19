@@ -34,6 +34,8 @@ export interface MatchConfidence {
   /** LightGBM blended in (false → Dixon–Coles only). null = unknown. */
   mlEnabled: boolean | null;
   pSource: string | null;
+  /** Backend model note, e.g. dc_pickle+lgbm_pickle / dc_pooled_fitted_cold. */
+  modelNote?: string | null;
 }
 
 export interface MatchCardData {

@@ -48,6 +48,14 @@ function ConfidenceChips({ c, pro }: { c: MatchConfidence; pro: boolean }) {
           Ít dữ liệu: {c.thinTeams.length === 1 ? c.thinTeams[0] : `${c.thinTeams.length} đội`}
         </span>
       ) : null}
+      {c.modelNote?.includes("pooled") ? (
+        <span
+          className={warn}
+          title="Định giá bằng model gộp J1/J2/J3 + cúp, chưa backtest — EV cao chủ yếu là chênh lệch model vs nhà cái, chưa phải edge đã kiểm chứng"
+        >
+          Model gộp JP · chưa kiểm chứng
+        </span>
+      ) : null}
       {c.newTeamPrior ? (
         <span
           className={warn}

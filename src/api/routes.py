@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from src.api.auth import require_admin
 from src.api.schemas import (
     ApiConfigOut,
+    FixturesResponse,
     HealthOut,
     LeagueOut,
     LeaguesResponse,
@@ -113,6 +114,36 @@ async def get_value_bets(
         # Unknown league key / too many leagues.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return ValueBetsResponse(**payload)
+
+
+@api_v1.get(
+    "/fixtures",
+    response_model=FixturesResponse,
+    tags=["value-bets"],
+    summary="Every upcoming match (VN today/tomorrow) with its pricing status",
+)
+async def get_fixtures(
+    leagues: Annotated[
+        str | None,
+        Query(description="Comma-separated league keys (default EPL,UWCL)"),
+    ] = None,
+    min_ev: Annotated[float, Query(description="EV floor in percent")] = DEFAULT_MIN_EV_PCT,
+    markets: Annotated[str | None, Query(description="Comma-separated: 1X2,AH,OU")] = None,
+    kelly_fraction: Annotated[
+        float | None, Query(gt=0.0, le=MAX_KELLY_FRACTION)
+    ] = None,
+) -> FixturesResponse:
+    try:
+        payload = await asyncio.to_thread(
+            vb_svc.list_fixtures_api,
+            leagues=leagues,
+            min_ev_pct=float(min_ev),
+            markets=markets,
+            kelly_fraction=kelly_fraction,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FixturesResponse(**payload)
 
 
 @api_v1.get(

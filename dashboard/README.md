@@ -50,12 +50,14 @@ dashboard trong stage Node riêng (xem `Dockerfile`).
 | Endpoint | Dùng cho |
 |----------|----------|
 | `GET /api/v1/value-bets?leagues=&markets=&min_ev=&kelly_fraction=` | Feed, poll 60 s. Trả `generated_at` và `league_meta` (nguồn odds, tuổi odds, stale, ML bật/tắt) |
+| `GET /api/v1/fixtures?leagues=&min_ev=` | Chế độ **Lịch đấu**: mọi trận trong khung hôm nay/mai kèm odds 1X2, AH, O/U và trạng thái (`value` / `below` / `gated` / `no_odds` / `no_model`) |
 | `GET /api/v1/leagues` | Danh sách giải trong sidebar (`config/leagues.json`) |
 | `GET /api/v1/config` | Chính sách stake: EV tối thiểu, Kelly fraction và trần, trần stake |
 | `GET /api/v1/teams/{id}/profile` | Phong độ 5 trận và H2H trong drawer chi tiết |
 
 EV và stake luôn lấy từ backend (EV theo bảng tất toán cho AH/O-U, Kelly có trần đội
-mới); dashboard không tự tính lại. Đổi Kelly fraction sẽ gọi lại API (debounce 400 ms).
+mới); dashboard không tự tính lại. Giờ thi đấu luôn hiển thị theo giờ VN.
+Mặc định quét mọi giải trong `config/leagues.json`. Đổi Kelly fraction sẽ gọi lại API (debounce 400 ms).
 
 ## Cấu trúc
 

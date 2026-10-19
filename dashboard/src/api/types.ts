@@ -134,6 +134,38 @@ export interface TeamProfileOut {
   past_matches: PastMatchOut[];
 }
 
+export type FixtureStatus = "value" | "below" | "gated" | "no_odds" | "no_model";
+
+export interface FixtureOut {
+  match_id: string;
+  league: string;
+  league_label: string | null;
+  /** UTC ISO with offset. */
+  kickoff: string | null;
+  home: string;
+  away: string;
+  home_display: string | null;
+  away_display: string | null;
+  odds_home: number | null;
+  odds_draw: number | null;
+  odds_away: number | null;
+  bookmaker: string | null;
+  ou_line: number | null;
+  ah_line: number | null;
+  status: FixtureStatus;
+  gate_reason: string | null;
+  best_pick: ValueBetOut | null;
+}
+
+export interface FixturesResponse {
+  fixtures: FixtureOut[];
+  count: number;
+  min_ev_pct: number;
+  leagues: string[];
+  league_meta: LeagueScanMetaOut[];
+  generated_at: string | null;
+}
+
 export interface ValueBetsParams {
   leagues: string[];
   markets: string[];

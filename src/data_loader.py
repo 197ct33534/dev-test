@@ -13,6 +13,7 @@ import os
 import re
 import socket
 import sqlite3
+import threading
 import time
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1915,6 +1916,78 @@ def _fs_event_participant_ids(event: dict) -> tuple[str | None, str | None]:
     return home, away
 
 
+FLASHSCORE_MATCH_URL = "https://www.flashscore.com/match/{event_id}/"
+
+# event_id → (home_pid, away_pid); participant ids never change for an event.
+_FS_PARTICIPANT_CACHE: dict[str, tuple[str, str]] = {}
+_FS_PARTICIPANT_LOCK = threading.Lock()
+
+_FS_SIDE_PID_RE = {
+    side: re.compile(
+        r'"' + side + r'"\s*:\s*\[\s*\{[^{}]*?"eventParticipantId"\s*:\s*"([^"]+)"'
+    )
+    for side in ("home", "away")
+}
+
+
+def clear_flashscore_participant_cache() -> None:
+    """Drop cached event participant ids (tests)."""
+    with _FS_PARTICIPANT_LOCK:
+        _FS_PARTICIPANT_CACHE.clear()
+
+
+def _fs_parse_participants_html(html: str) -> tuple[str | None, str | None]:
+    """``(home_pid, away_pid)`` from a match page's embedded ``participantsData``.
+
+    The page embeds JSON inside a JS string (``\\"`` escaped quotes); both
+    escaped and plain JSON are accepted.
+    """
+    if not html:
+        return None, None
+    text = html.replace('\\"', '"')
+    i = text.find('"participantsData"')
+    if i < 0:
+        return None, None
+    seg = text[i : i + 50_000]
+    home = _FS_SIDE_PID_RE["home"].search(seg)
+    away = _FS_SIDE_PID_RE["away"].search(seg)
+    if not home or not away or home.group(1) == away.group(1):
+        return None, None
+    return home.group(1), away.group(1)
+
+
+def fetch_flashscore_event_participants(event_id: str) -> tuple[str | None, str | None]:
+    """Home / away ``eventParticipantId`` for one Flashscore event (cached).
+
+    The odds GraphQL payload often omits participants and selection labels, so
+    the match page (``participantsData``) is the authoritative source. Returns
+    ``(None, None)`` on failure (callers must then drop sided prices).
+    """
+    eid = str(event_id or "").strip()
+    if not eid:
+        return None, None
+    with _FS_PARTICIPANT_LOCK:
+        hit = _FS_PARTICIPANT_CACHE.get(eid)
+    if hit:
+        return hit
+    try:
+        html = _fetch_text(
+            FLASHSCORE_MATCH_URL.format(event_id=eid),
+            referer="https://www.flashscore.com/",
+            extra_headers={"Accept": "text/html"},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Flashscore match page %s failed: %s", eid, exc)
+        return None, None
+    home, away = _fs_parse_participants_html(html)
+    if home and away:
+        with _FS_PARTICIPANT_LOCK:
+            _FS_PARTICIPANT_CACHE[eid] = (home, away)
+    else:
+        logger.warning("Flashscore match page %s: participantsData not found", eid)
+    return home, away
+
+
 def _fs_1x2_participants(
     market: dict,
     *,
@@ -1927,8 +2000,8 @@ def _fs_1x2_participants(
 
     1. ``eventParticipantId`` against the event's known home/away participant ids;
     2. explicit ``selection`` labels (``HOME`` / ``DRAW`` / ``AWAY``);
-    3. positional fallback (non-null participant ids in feed order = home, away)
-       — logged, since Flashscore does not guarantee selection order.
+    Without either, home / away are unknown and ``(None, draw, None, …)`` is
+    returned — feed order is NOT a valid fallback (the away side is often first).
 
     The draw is always the selection whose ``eventParticipantId`` is null.
     """
@@ -1973,18 +2046,14 @@ def _fs_1x2_participants(
             str(a_id) if a_id is not None else None,
         )
 
+    # No ids and no labels: Flashscore does NOT guarantee selection order (the
+    # away favourite is often listed first), so refuse rather than guess —
+    # a swapped 1X2 / AH silently prices the wrong side.
     if len(sided) >= 2:
-        logger.info(
-            "1X2 home/away mapped positionally (no participant ids; bookmaker=%s)",
+        logger.warning(
+            "1X2 home/away unknown (no participant ids or labels; bookmaker=%s) "
+            "— dropping market",
             market.get("bookmakerId"),
-        )
-        home, away = sided[0], sided[1]
-        return (
-            home,
-            draw,
-            away,
-            str(home["eventParticipantId"]),
-            str(away["eventParticipantId"]),
         )
     return None, draw, None, None, None
 
@@ -2044,8 +2113,8 @@ def _fs_parse_1x2(
     """HOME_DRAW_AWAY selections -> (home, draw, away) decimal odds.
 
     Maps selections by ``eventParticipantId`` (draw = null id) when the event's
-    home/away participant ids are supplied; otherwise falls back to labels or
-    feed order (logged). Triples failing the overround sanity check
+    home/away participant ids are supplied; otherwise by ``HOME``/``AWAY``
+    labels, else NaN (never by feed order). Triples failing the overround sanity check
     (``[1.0, 1.25]``) are rejected as NaN.
     """
     h, d, a, _, _ = _fs_parse_1x2_with_ids(market, home_pid=home_pid, away_pid=away_pid)
@@ -2203,6 +2272,11 @@ def fetch_flashscore_match_odds(
     ev_home, ev_away = _fs_event_participant_ids(event)
     home_pid = str(home_participant_id) if home_participant_id else ev_home
     away_pid = str(away_participant_id) if away_participant_id else ev_away
+    if not (home_pid and away_pid) and (hda or ah):
+        # Odds payload without participants: resolve sides from the match page.
+        page_home, page_away = fetch_flashscore_event_participants(event_id)
+        home_pid = home_pid or page_home
+        away_pid = away_pid or page_away
 
     # Walk bookmakers in preference order until one yields a sane 1X2 triple.
     for bk_id, market in _fs_ordered_markets(hda):

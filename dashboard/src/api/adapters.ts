@@ -125,6 +125,7 @@ export function toMatchCard(
       newTeamPrior: Boolean(bet.new_team_fallback),
       mlEnabled: meta ? meta.ml_enabled : null,
       pSource: bet.p_source,
+      modelNote: meta?.model_note ?? null,
     },
   };
 }

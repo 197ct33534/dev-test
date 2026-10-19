@@ -131,17 +131,63 @@ def _load_joblib(path: Path) -> Any | None:
         return None
 
 
-def _fit_dc(league: str, n_seasons: int, n_train: int, xi: float = DEFAULT_XI) -> DixonColesModel:
-    code = normalize_league(league)
-    history = load_league_data(code, n_seasons=n_seasons, force_refresh=False)
-    train = history.sort_values("Date").tail(int(n_train)).reset_index(drop=True)
-    use_weak = code == "UWCL" or int(len(train)) < 100
+def _fit_dc_frame(
+    train: pd.DataFrame, *, xi: float = DEFAULT_XI, force_weak: bool = False
+) -> DixonColesModel:
+    use_weak = force_weak or int(len(train)) < 100
     # New-team α/δ priors are relative to the fitted league means
     # (``model.new_team_priors()``) — no absolute WEAK_TIER_* constants.
     return DixonColesModel(
         xi=float(xi),
         use_weak_tier_priors=use_weak,
     ).fit(train)
+
+
+def _fit_dc(league: str, n_seasons: int, n_train: int, xi: float = DEFAULT_XI) -> DixonColesModel:
+    code = normalize_league(league)
+    history = load_league_data(code, n_seasons=n_seasons, force_refresh=False)
+    train = history.sort_values("Date").tail(int(n_train)).reset_index(drop=True)
+    return _fit_dc_frame(train, xi=xi, force_weak=code == "UWCL")
+
+
+# Japanese cups mix J1 / J2 / J3 clubs that have only a handful of *cup*
+# matches each: fitted on cup history alone, 51 of 59 clubs were thin and every
+# fixture was priced on new-team priors. Pool every Japanese men's competition
+# so each club is rated from its league form; cup ties between tiers link the
+# tiers, and the league-weight proxy (J1 0.9 / J2 0.75 / J3 0.65) scales the
+# remaining gap.
+JAPAN_POOL: tuple[str, ...] = ("J1", "J2", "J3", "J_LEAGUE_CUP", "EMPERORS_CUP", "ACL")
+POOLED_FIT_COMPETITIONS: dict[str, tuple[str, ...]] = {
+    "J_LEAGUE_CUP": JAPAN_POOL,
+    "EMPERORS_CUP": JAPAN_POOL,
+}
+MIN_POOLED_MATCHES = 150
+
+
+def _read_global_matches(*, comp_id: str | None = None) -> pd.DataFrame:
+    from src.global_db import read_matches_as_legacy
+
+    return read_matches_as_legacy(comp_id=comp_id)
+
+
+def _pooled_history(comps: Sequence[str]) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for comp in comps:
+        try:
+            df = _read_global_matches(comp_id=comp)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("pooled history: %s unavailable (%s)", comp, exc)
+            continue
+        if df is not None and not df.empty:
+            frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+    out = out.dropna(subset=["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"])
+    # A match can be filed under two comp ids (team feed + league feed).
+    out = out.drop_duplicates(subset=["Date", "HomeTeam", "AwayTeam"])
+    return out.sort_values("Date").reset_index(drop=True)
 
 
 def clear_model_cache() -> None:
@@ -247,6 +293,24 @@ def _resolve_models_uncached(code: str) -> tuple[Any, Any | None, float, str]:
             _MODEL_CACHE[code] = result
             _MODEL_CACHE_META[code] = (sig, time.monotonic())
             return result
+
+    pool = POOLED_FIT_COMPETITIONS.get(code)
+    if pool:
+        history = _pooled_history(pool)
+        if len(history) >= MIN_POOLED_MATCHES:
+            dc = _fit_dc_frame(history)
+            result = (
+                maybe_wrap_with_league_weights(dc, code),
+                None,
+                0.0,
+                "dc_pooled_fitted_cold",
+            )
+            _MODEL_CACHE[code] = result
+            _MODEL_CACHE_META[code] = (None, time.monotonic())
+            return result
+        logger.info(
+            "pooled fit for %s skipped: %d matches < %d", code, len(history), MIN_POOLED_MATCHES
+        )
 
     defaults = _LEAGUE_DEFAULTS.get(code, {"n_seasons": 3, "n_train": 800})
     dc = _fit_dc(code, int(defaults["n_seasons"]), int(defaults["n_train"]))
@@ -438,6 +502,25 @@ def _load_fixtures(comp_id: str) -> tuple[pd.DataFrame, str]:
     return meta["df"], src
 
 
+def kickoff_iso_utc(kick: Any) -> str | None:
+    """Kickoff as an explicit-UTC ISO string (``…+00:00``).
+
+    Fixture kickoffs are naive UTC by project convention; emitting them without
+    an offset makes browsers parse them as *local* time (a 17:00 VN match showed
+    as 10:00).
+    """
+    if kick is None:
+        return None
+    try:
+        ts = pd.Timestamp(kick)
+    except (TypeError, ValueError):
+        return _safe_str(kick)
+    if pd.isna(ts):
+        return None
+    ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+    return ts.isoformat()
+
+
 def _display_name(raw: str | None) -> str | None:
     """Friendly club name for stable codes (``JP_NAGOYA`` → ``Nagoya Grampus``)."""
     if not raw:
@@ -490,16 +573,7 @@ def _row_to_bet(row: dict[str, Any] | pd.Series) -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             competition = lg
 
-    kick = d.get("kickoff")
-    kick_s = None
-    if kick is not None:
-        try:
-            if hasattr(kick, "isoformat"):
-                kick_s = kick.isoformat()
-            else:
-                kick_s = str(kick)
-        except Exception:  # noqa: BLE001
-            kick_s = str(kick)
+    kick_s = kickoff_iso_utc(d.get("kickoff"))
 
     return {
         "pick": pick,
@@ -780,4 +854,169 @@ def scan_value_bets_api(
         "league_meta": league_meta,
         "excluded_prior": excluded_total,
         "notes": note_txt,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fixture schedule (every match in the VN window, with or without a pick)
+# ---------------------------------------------------------------------------
+
+FIXTURE_STATUS_VALUE = "value"  # best leg EV >= threshold
+FIXTURE_STATUS_BELOW = "below"  # priced, best leg below threshold
+FIXTURE_STATUS_GATED = "gated"  # new-team prior gate — not priced
+FIXTURE_STATUS_NO_ODDS = "no_odds"
+FIXTURE_STATUS_NO_MODEL = "no_model"
+
+
+def _fx_float(row: pd.Series, *cols: str) -> float | None:
+    for c in cols:
+        if c in row.index:
+            v = _safe_float(row.get(c))
+            if v is not None:
+                return v
+    return None
+
+
+def list_fixtures_api(
+    *,
+    leagues: str | Sequence[str] | None = None,
+    min_ev_pct: float = 5.0,
+    markets: str | Sequence[str] | None = None,
+    kelly_fraction: float | None = None,
+) -> dict[str, Any]:
+    """Every upcoming fixture in the VN today/tomorrow window, with a status.
+
+    Unlike :func:`scan_value_bets_api` (picks only), this lists matches that
+    have no pick too, so the UI can show *why*: ``value`` / ``below`` (best
+    leg under the EV floor) / ``gated`` (new-team prior, see
+    :func:`src.scanner.new_team_prior_gate`) / ``no_odds`` / ``no_model``.
+    """
+    from src.scanner import _match_id_from_row, new_team_prior_gate
+    from src.timezone_utils import filter_matches_today_tomorrow
+
+    generated_at = _utc_now().isoformat()
+    mkt_list = parse_markets(markets)
+    goal_markets = tuple(m for m in mkt_list if m != "Corners") or ("1X2",)
+    min_ev = float(min_ev_pct) / 100.0
+    if min_ev <= 0:
+        min_ev = float(DEFAULT_MIN_EV)
+    kf = float(DEFAULT_KELLY_FRACTION) if kelly_fraction is None else float(kelly_fraction)
+    kf = max(0.0, min(kf, float(MAX_KELLY_FRACTION)))
+    scan_leagues = parse_leagues(leagues) or list(DEFAULT_SCAN_LEAGUES)
+
+    fixtures_out: list[dict[str, Any]] = []
+    league_meta: list[dict[str, Any]] = []
+
+    for lg in scan_leagues:
+        fx_meta = load_fixtures_with_meta(lg)
+        fx = fx_meta["df"]
+        if fx is not None and not fx.empty and "Kickoff" in fx.columns:
+            fx = filter_matches_today_tomorrow(fx, kickoff_col="Kickoff", exclude_started=True)
+        meta: dict[str, Any] = {
+            "league": str(lg),
+            "label": _league_label_safe(lg),
+            "fixtures_source": str(fx_meta["source"]),
+            "stale": bool(fx_meta.get("stale")),
+            "odds_age_minutes": _safe_float(fx_meta.get("age_minutes")),
+            "fixtures": 0 if fx is None else int(len(fx)),
+            "model_note": None,
+            "ml_enabled": False,
+            "model_source": None,
+            "excluded_prior": 0,
+        }
+        league_meta.append(meta)
+        if fx is None or fx.empty:
+            continue
+
+        dc = ml = None
+        w_ml = 0.0
+        try:
+            dc, ml, w_ml, model_note = _resolve_models(lg)
+            meta["model_note"] = model_note
+            meta.update(_model_flags(model_note))
+        except Exception:  # noqa: BLE001
+            logger.exception("model resolve failed for %s", lg)
+            meta["model_note"] = "model_error"
+
+        best: dict[str, dict[str, Any]] = {}
+        if dc is not None:
+            try:
+                scan = scan_top_value_bets(
+                    fx,
+                    dc,
+                    ml,
+                    w_ml=float(w_ml) if ml is not None else 0.0,
+                    min_ev=float(min_ev),
+                    kelly_fraction=kf,
+                    max_stake_pct=MAX_STAKE_PCT,
+                    allowed_markets=goal_markets,
+                    top_n=max(1, len(fx)),
+                    league=str(lg),
+                    filter_vn_window=True,
+                    one_per_match=True,
+                )
+                meta["excluded_prior"] = int(scan.excluded_prior)
+                pool = scan.fallback_bets
+                if pool is not None and not pool.empty and "match_id" in pool.columns:
+                    for _, r in pool.iterrows():
+                        if r.get("ev") is None or pd.isna(r.get("ev")):
+                            continue
+                        best.setdefault(str(r["match_id"]), _row_to_bet(r))
+            except Exception:  # noqa: BLE001
+                logger.exception("fixture scan failed for %s", lg)
+
+        for _, row in fx.iterrows():
+            home = str(row.get("HomeTeam") or "")
+            away = str(row.get("AwayTeam") or "")
+            mid = _match_id_from_row(row, home, away)
+            odds_h = _fx_float(row, "OddsH", "B365H")
+            odds_d = _fx_float(row, "OddsD", "B365D")
+            odds_a = _fx_float(row, "OddsA", "B365A")
+            pick = best.get(mid)
+            gate = new_team_prior_gate(dc, home, away, league=lg) if dc is not None else None
+            if dc is None:
+                status = FIXTURE_STATUS_NO_MODEL
+            elif gate is not None:
+                status = FIXTURE_STATUS_GATED
+            elif pick is not None:
+                ev = pick.get("ev")
+                status = (
+                    FIXTURE_STATUS_VALUE
+                    if ev is not None and ev >= min_ev
+                    else FIXTURE_STATUS_BELOW
+                )
+            elif odds_h is None and _fx_float(row, "OddsOver", "B365AHH") is None:
+                status = FIXTURE_STATUS_NO_ODDS
+            else:
+                status = FIXTURE_STATUS_BELOW
+            fixtures_out.append(
+                {
+                    "match_id": mid,
+                    "league": str(lg),
+                    "league_label": meta["label"],
+                    "kickoff": kickoff_iso_utc(row.get("Kickoff")),
+                    "home": home,
+                    "away": away,
+                    "home_display": _display_name(home),
+                    "away_display": _display_name(away),
+                    "odds_home": odds_h,
+                    "odds_draw": odds_d,
+                    "odds_away": odds_a,
+                    "bookmaker": _safe_str(row.get("OddsBookmaker")),
+                    "ou_line": _fx_float(row, "OU_Line"),
+                    "ah_line": _fx_float(row, "AHh"),
+                    "status": status,
+                    "gate_reason": gate,
+                    "best_pick": pick if status in (FIXTURE_STATUS_VALUE, FIXTURE_STATUS_BELOW) else None,
+                }
+            )
+
+    fixtures_out.sort(key=lambda f: (f["kickoff"] or "", f["league"], f["home"]))
+    return {
+        "fixtures": fixtures_out,
+        "count": len(fixtures_out),
+        "min_ev_pct": float(min_ev_pct),
+        "leagues": list(scan_leagues),
+        "league_meta": league_meta,
+        "generated_at": generated_at,
     }

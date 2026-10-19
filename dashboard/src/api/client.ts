@@ -1,5 +1,6 @@
 import type {
   ApiConfigOut,
+  FixturesResponse,
   LeaguesResponse,
   TeamProfileOut,
   ValueBetsParams,
@@ -77,19 +78,21 @@ async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   return (await res.json()) as T;
 }
 
-export function buildValueBetsQuery(p: ValueBetsParams): string {
+export function buildValueBetsQuery(p: ValueBetsParams, withLimit = true): string {
   const q = new URLSearchParams();
   if (p.leagues.length) q.set("leagues", p.leagues.join(","));
   if (p.markets.length) q.set("markets", p.markets.join(","));
   q.set("min_ev", String(p.minEvPct));
   q.set("kelly_fraction", String(p.kellyFraction));
-  q.set("limit", String(p.limit ?? 50));
+  if (withLimit) q.set("limit", String(p.limit ?? 50));
   return q.toString();
 }
 
 export const api = {
   valueBets: (p: ValueBetsParams, signal?: AbortSignal) =>
     getJson<ValueBetsResponse>(`/api/v1/value-bets?${buildValueBetsQuery(p)}`, signal),
+  fixtures: (p: ValueBetsParams, signal?: AbortSignal) =>
+    getJson<FixturesResponse>(`/api/v1/fixtures?${buildValueBetsQuery(p, false)}`, signal),
   leagues: (signal?: AbortSignal) => getJson<LeaguesResponse>("/api/v1/leagues", signal),
   config: (signal?: AbortSignal) => getJson<ApiConfigOut>("/api/v1/config", signal),
   teamProfile: (team: string, signal?: AbortSignal) =>

@@ -114,10 +114,12 @@ def test_parse_1x2_by_participant_id_ignores_order() -> None:
     assert dl._fs_parse_1x2(market, home_pid="pH", away_pid="pA") == (1.5, 4.2, 6.5)
 
 
-def test_parse_1x2_positional_fallback_finds_null_draw() -> None:
-    # Draw (null id) in the middle: old code would have returned draw as away.
+def test_parse_1x2_without_ids_does_not_guess_from_order() -> None:
+    # Feed order is not reliable (away favourite often first — J.League Cup
+    # 2026-10-14 regression), so no ids + no labels → no prices.
     market = _hda(16, "1.50", "4.20", "6.50", order=("H", "D", "A"))
-    assert dl._fs_parse_1x2(market) == (1.5, 4.2, 6.5)
+    h, d, a = dl._fs_parse_1x2(market)
+    assert pd.isna(h) and pd.isna(d) and pd.isna(a)
 
 
 def test_parse_1x2_rejects_bad_overround() -> None:
@@ -183,6 +185,10 @@ def test_match_odds_bet365_flagged(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         dl, "_fetch_json", lambda *a, **k: _payload(markets, participants=False)
     )
+    # Sides come from the match page when the odds payload has no participants.
+    page = '"participantsData":{"home":[{"id":"t1","eventParticipantId":"pH"}],'         '"away":[{"id":"t2","eventParticipantId":"pA"}]}'
+    monkeypatch.setattr(dl, "_fetch_text", lambda *a, **k: page)
+    dl.clear_flashscore_participant_cache()
     out = dl.fetch_flashscore_match_odds("EVT2")
     assert out["OddsBookmaker"] == "bet365"
     assert out["OddsIsBet365"] is True

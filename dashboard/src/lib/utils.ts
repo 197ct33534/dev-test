@@ -4,13 +4,24 @@ export function cn(...inputs: ClassValue[]) {
   return clsx(inputs);
 }
 
+/** Product time zone: every kickoff is shown in Vietnam time. */
+export const DISPLAY_TZ = "Asia/Ho_Chi_Minh";
+
+const KICKOFF_FMT = new Intl.DateTimeFormat("en-GB", {
+  timeZone: DISPLAY_TZ,
+  day: "2-digit",
+  month: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+});
+
+/** "dd/mm HH:MM" in Vietnam time (API kickoffs are UTC ISO with offset). */
 export function formatKickoff(iso: string): string {
   const d = new Date(iso);
-  const dd = String(d.getDate()).padStart(2, "0");
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mi = String(d.getMinutes()).padStart(2, "0");
-  return `${dd}/${mm} ${hh}:${mi}`;
+  if (Number.isNaN(d.getTime())) return "—";
+  const parts = Object.fromEntries(KICKOFF_FMT.formatToParts(d).map((p) => [p.type, p.value]));
+  return `${parts.day}/${parts.month} ${parts.hour}:${parts.minute}`;
 }
 
 export function formatPct(n: number, digits = 1): string {

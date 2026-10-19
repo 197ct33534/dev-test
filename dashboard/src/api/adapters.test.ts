@@ -206,3 +206,12 @@ describe("buildValueBetsQuery", () => {
     expect(q.get("limit")).toBe("50");
   });
 });
+
+describe("formatKickoff", () => {
+  it("renders Vietnam time regardless of the browser zone", async () => {
+    const { formatKickoff } = await import("../lib/utils");
+    expect(formatKickoff("2026-10-14T10:00:00+00:00")).toBe("14/10 17:00");
+    expect(formatKickoff("2026-10-14T18:30:00+00:00")).toBe("15/10 01:30");
+    expect(formatKickoff("garbage")).toBe("—");
+  });
+});

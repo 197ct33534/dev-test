@@ -249,3 +249,38 @@ class ApiConfigOut(BaseModel):
     markets: list[str]
     fixtures_max_age_minutes: float
     server_time: str
+
+
+class FixtureOut(BaseModel):
+    """One upcoming match in the VN window, priced or not."""
+
+    match_id: str
+    league: str
+    league_label: str | None = None
+    kickoff: str | None = Field(default=None, description="UTC ISO with offset")
+    home: str
+    away: str
+    home_display: str | None = None
+    away_display: str | None = None
+    odds_home: float | None = None
+    odds_draw: float | None = None
+    odds_away: float | None = None
+    bookmaker: str | None = None
+    ou_line: float | None = None
+    ah_line: float | None = None
+    status: str = Field(
+        ..., description="value | below | gated | no_odds | no_model"
+    )
+    gate_reason: str | None = Field(
+        default=None, description="both_teams_prior | cup_new_team_prior"
+    )
+    best_pick: ValueBetOut | None = None
+
+
+class FixturesResponse(BaseModel):
+    fixtures: list[FixtureOut]
+    count: int
+    min_ev_pct: float
+    leagues: list[str] = Field(default_factory=list)
+    league_meta: list[LeagueScanMetaOut] = Field(default_factory=list)
+    generated_at: str | None = None

@@ -16,6 +16,17 @@ export function useValueBets(params: ValueBetsParams, enabled = true) {
   });
 }
 
+export function useFixtures(params: ValueBetsParams, enabled = true) {
+  return useQuery({
+    queryKey: ["fixtures", params],
+    queryFn: ({ signal }) => api.fixtures(params, signal),
+    enabled,
+    refetchInterval: VALUE_BETS_POLL_MS,
+    staleTime: 30_000,
+    placeholderData: keepPreviousData,
+  });
+}
+
 export function useLeagues(enabled = true) {
   return useQuery({
     queryKey: ["leagues"],
